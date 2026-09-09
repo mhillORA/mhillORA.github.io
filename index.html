@@ -1186,6 +1186,14 @@
                 return this.request('/site-survey-responses');
             }
 
+            async getSiteSurveyResponsesForSite(siteId) {
+                return this.request(`/site-survey-responses?siteId=${encodeURIComponent(siteId)}`);
+            }
+
+            async getSiteSurveyAssignmentsForSite(siteId) {
+                return this.request(`/site-survey-assignments?siteId=${encodeURIComponent(siteId)}`);
+            }
+
             async createSiteSurveyResponse(response) {
                 return this.request('/site-survey-responses', {
                     method: 'POST',
@@ -2753,8 +2761,9 @@
 
         const siteSurveySectionsHtml = (siteId) => {
             const latestBySurvey = latestSurveyResponsesBySurvey(siteId);
+            const ids = siteIdsForSurveyLookup(siteId);
             const pending = (allSiteSurveyAssignments || []).filter(
-                a => a && a.siteId === siteId && String(a.status || '').toLowerCase() !== 'submitted'
+                a => a && ids.has(a.siteId) && String(a.status || '').toLowerCase() !== 'submitted'
             );
 
             if (!latestBySurvey.length && !pending.length) {
@@ -2776,9 +2785,10 @@
                 const when = r.submittedAt
                     ? new Date(r.submittedAt).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
                     : (r.createdAt ? new Date(r.createdAt).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : 'N/A');
-                const title = (allSiteSurveyDefinitions || []).find(d => d.id === r.surveyId)?.title || r.surveyId || 'Survey';
+                const title = formatSiteSurveyDefinitionTitle(r.surveyId);
                 const answerCount = surveyAnswerCount(r);
                 const roleLabel = formatSiteSurveyRoleLabel(r.targetRole);
+                const isGf = r.surveyId === 'survey-general-feasibility' || r.surveyId === 'survey-general-feasibility-short';
                 const openFirst = idx === 0 ? ' open' : '';
 
                 return `
@@ -2787,6 +2797,7 @@
                             <div class="min-w-0 flex-1">
                                 <div class="flex items-center gap-2 flex-wrap">
                                     <span class="font-semibold text-gray-900 dark:text-gray-100">${escapeHtml(title)}</span>
+                                    ${isGf ? `<span class="text-[10px] px-2 py-0.5 rounded-full bg-teal-100 text-teal-800 dark:bg-teal-900/40 dark:text-teal-200">Site profile</span>` : ''}
                                     ${surveyScoreBadgeHtml(r)}
                                     ${r._resubmitCount ? `<span class="text-[11px] px-2 py-0.5 rounded-full bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-200">Updated ${r._resubmitCount}×</span>` : ''}
                                 </div>
@@ -2851,6 +2862,11 @@
         const latestSurveyResponsesBySurvey = (siteId) => {
             const ids = siteIdsForSurveyLookup(siteId);
             const grouped = new Map();
+            const gfRank = (surveyId) => {
+                if (surveyId === 'survey-general-feasibility') return 0;
+                if (surveyId === 'survey-general-feasibility-short') return 1;
+                return 2;
+            };
             (allSiteSurveyResponses || [])
                 .filter(r => r && ids.has(r.siteId) && !r._archived)
                 .slice()
@@ -2859,7 +2875,178 @@
                     const key = `${r.surveyId || r.id}::${String(r.targetRole || '').toLowerCase()}`;
                     if (!grouped.has(key)) grouped.set(key, r);
                 });
-            return Array.from(grouped.values());
+            return Array.from(grouped.values()).sort((a, b) => {
+                const gr = gfRank(a.surveyId) - gfRank(b.surveyId);
+                if (gr !== 0) return gr;
+                return String(b.submittedAt || b.createdAt || '').localeCompare(String(a.submittedAt || a.createdAt || ''));
+            });
+        };
+
+        /** Merge API rows into in-memory caches (by id). Used after site-scoped refresh. */
+        const upsertSurveyCacheRows = (targetArrName, rows) => {
+            const list = Array.isArray(rows) ? rows : [];
+            if (!list.length) return;
+            const current = targetArrName === 'responses' ? (allSiteSurveyResponses || []) : (allSiteSurveyAssignments || []);
+            const byId = new Map(current.filter(Boolean).map((r) => [r.id, r]));
+            list.forEach((row) => {
+                if (row && row.id) byId.set(row.id, row);
+            });
+            const next = Array.from(byId.values());
+            if (targetArrName === 'responses') allSiteSurveyResponses = next;
+            else allSiteSurveyAssignments = next;
+        };
+
+        /** Pull latest assignments + responses for one site so Site Profile isn't stuck on stale boot cache. */
+        const refreshSiteSurveyDataForSite = async (siteId) => {
+            if (!siteId || !apiService) return;
+            try {
+                const [responses, assignments] = await Promise.all([
+                    apiService.getSiteSurveyResponsesForSite(siteId).catch(() => null),
+                    apiService.getSiteSurveyAssignmentsForSite(siteId).catch(() => null),
+                ]);
+                if (Array.isArray(responses)) upsertSurveyCacheRows('responses', responses);
+                if (Array.isArray(assignments)) upsertSurveyCacheRows('assignments', assignments);
+            } catch (err) {
+                console.warn('refreshSiteSurveyDataForSite failed', err);
+            }
+        };
+
+        const formatSiteSurveyDefinitionTitle = (surveyId) => {
+            const def = (allSiteSurveyDefinitions || []).find(d => d && d.id === surveyId);
+            if (def?.title) return def.title;
+            if (surveyId === 'survey-general-feasibility') return 'General Feasibility (Long)';
+            if (surveyId === 'survey-general-feasibility-short') return 'General Feasibility (Short)';
+            return surveyId || 'Survey';
+        };
+
+        /**
+         * Merge newest answers across all live site responses into the GF question set
+         * (Long + Short). Newest filled value wins per question id / library id / label.
+         */
+        const buildLatestSiteFeasibilityProfile = (siteId) => {
+            const ids = siteIdsForSurveyLookup(siteId);
+            const responses = (allSiteSurveyResponses || [])
+                .filter((r) => r && !r._archived && ids.has(r.siteId))
+                .slice()
+                .sort((a, b) => String(b.submittedAt || b.updatedAt || b.createdAt || '')
+                    .localeCompare(String(a.submittedAt || a.updatedAt || a.createdAt || '')));
+
+            const longDef = (allSiteSurveyDefinitions || []).find((d) => d && d.id === 'survey-general-feasibility');
+            const shortDef = (allSiteSurveyDefinitions || []).find((d) => d && d.id === 'survey-general-feasibility-short');
+            const seenQ = new Set();
+            const questions = [];
+            const rememberQ = (q) => {
+                if (!q) return;
+                const qid = String(q.id || '');
+                const lib = String(q.libraryQuestionId || '');
+                const lab = normalizeSurveyDeltaLabel(q.label || q.title);
+                const key = qid || (lib ? `lib:${lib}` : '') || (lab ? `label:${lab}` : '');
+                if (!key || seenQ.has(key)) return;
+                seenQ.add(key);
+                if (qid) seenQ.add(qid);
+                if (lib) seenQ.add(`lib:${lib}`);
+                if (lab) seenQ.add(`label:${lab}`);
+                questions.push(q);
+            };
+            asSurveyList(longDef?.questions).forEach(rememberQ);
+            asSurveyList(shortDef?.questions).forEach(rememberQ);
+
+            const byId = new Map();
+            const byLib = new Map();
+            const byLabel = new Map();
+            responses.forEach((resp) => {
+                const when = resp.submittedAt || resp.updatedAt || resp.createdAt || '';
+                asSurveyList(resp.answers).forEach((a) => {
+                    const val = readSurveyAnswerValue(a);
+                    if (!val) return;
+                    const entry = {
+                        value: val,
+                        type: a.type || 'text',
+                        label: a.label || a.title || '',
+                        questionId: String(a.questionId ?? a.id ?? ''),
+                        libraryQuestionId: a.libraryQuestionId ? String(a.libraryQuestionId) : '',
+                        surveyId: resp.surveyId,
+                        responseId: resp.id,
+                        submittedAt: when,
+                    };
+                    const put = (map, key) => {
+                        if (!key || map.has(key)) return;
+                        map.set(key, entry);
+                    };
+                    put(byId, entry.questionId);
+                    put(byLib, entry.libraryQuestionId);
+                    put(byLabel, normalizeSurveyDeltaLabel(entry.label));
+                });
+            });
+
+            const resolve = (q) => {
+                const qid = String(q.id || '');
+                const lib = q.libraryQuestionId ? String(q.libraryQuestionId) : '';
+                const lab = normalizeSurveyDeltaLabel(q.label || q.title);
+                return (qid && byId.get(qid))
+                    || (lib && byLib.get(lib))
+                    || (lab && byLabel.get(lab))
+                    || null;
+            };
+
+            const rows = questions.map((q) => {
+                const hit = resolve(q);
+                return {
+                    questionId: q.id,
+                    label: q.label || q.title || q.id,
+                    type: q.type || hit?.type || 'text',
+                    value: hit?.value || '',
+                    surveyId: hit?.surveyId || null,
+                    submittedAt: hit?.submittedAt || null,
+                    filled: !!(hit && hit.value),
+                };
+            }).filter((r) => r.filled);
+
+            const lastAt = rows
+                .map((r) => r.submittedAt)
+                .filter(Boolean)
+                .sort((a, b) => String(b).localeCompare(String(a)))[0] || (responses[0]?.submittedAt || null);
+
+            return { rows, lastAt, responseCount: responses.length, questionCount: questions.length };
+        };
+
+        const siteFeasibilityProfileHtml = (siteId) => {
+            const profile = buildLatestSiteFeasibilityProfile(siteId);
+            if (!profile.rows.length) {
+                return `
+                    <div class="rounded-xl border border-dashed border-gray-200 dark:border-gray-600 bg-gray-50/50 dark:bg-gray-900/20 p-4">
+                        <div class="text-sm font-semibold text-gray-800 dark:text-gray-100">Feasibility profile</div>
+                        <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">No General Feasibility answers on file yet. Send Long or Short to populate this site profile.</p>
+                    </div>`;
+            }
+            const when = profile.lastAt
+                ? new Date(profile.lastAt).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
+                : '—';
+            const cards = profile.rows.map((r) => {
+                const val = formatSurveyAnswerValue(r.value);
+                const type = String(r.type || 'text').toLowerCase();
+                const isLong = type === 'textarea' || val.length > 100 || (val.includes(',') && val.split(',').length > 6);
+                const src = r.surveyId ? formatSiteSurveyDefinitionTitle(r.surveyId) : '';
+                return `
+                    <div class="survey-answer-card${isLong ? ' span-full' : ''}">
+                        <div class="survey-answer-q">${escapeHtml(r.label)}</div>
+                        <div class="survey-answer-a">${renderSurveyAnswerValueHtml(r.value, type)}</div>
+                        ${src ? `<div class="text-[10px] text-gray-400 dark:text-gray-500 mt-1">From ${escapeHtml(src)}</div>` : ''}
+                    </div>`;
+            }).join('');
+            return `
+                <div class="rounded-xl border border-teal-200 dark:border-teal-900/50 bg-white dark:bg-gray-800 overflow-hidden">
+                    <div class="px-4 py-3 border-b border-teal-100 dark:border-teal-900/40 flex flex-wrap items-center justify-between gap-2 bg-teal-50/60 dark:bg-teal-950/20">
+                        <div>
+                            <div class="text-sm font-semibold text-teal-900 dark:text-teal-100">Feasibility profile</div>
+                            <div class="text-xs text-teal-800/80 dark:text-teal-200/70 mt-0.5">Most recent answers across Long + Short (and matching library questions)</div>
+                        </div>
+                        <div class="text-xs text-teal-800 dark:text-teal-200">${profile.rows.length} fields · updated ${escapeHtml(when)}</div>
+                    </div>
+                    <div class="p-4">
+                        <div class="survey-answers-grid">${cards}</div>
+                    </div>
+                </div>`;
         };
 
         const FEASIBILITY_STALE_DAYS = 90;
@@ -4272,8 +4459,9 @@
         };
 
         const siteSurveyStatusHtml = (siteId) => {
-            const assignments = (allSiteSurveyAssignments || []).filter(a => a && a.siteId === siteId);
-            const responses = (allSiteSurveyResponses || []).filter(r => r && r.siteId === siteId);
+            const ids = siteIdsForSurveyLookup(siteId);
+            const assignments = (allSiteSurveyAssignments || []).filter(a => a && ids.has(a.siteId));
+            const responses = (allSiteSurveyResponses || []).filter(r => r && ids.has(r.siteId) && !r._archived);
             const pending = assignments.filter(a => String(a.status || '').toLowerCase() !== 'submitted').length;
             const latest = latestSurveyResponsesBySurvey(siteId)[0];
             const pill = latest
@@ -4447,11 +4635,7 @@
                 ? studiesAtSite.map(st => escapeHtml(st.title || st.id)).join(', ')
                 : '';
 
-            const siteAssignments = (allSiteSurveyAssignments || []).filter(a => a && a.siteId === siteId);
-            const responses = (allSiteSurveyResponses || [])
-                .filter(r => r && r.siteId === siteId && !r._archived)
-                .slice()
-                .sort((a, b) => String(b.submittedAt || b.createdAt || '').localeCompare(String(a.submittedAt || a.createdAt || '')));
+            const siteAssignments = (allSiteSurveyAssignments || []).filter(a => a && siteIdsForSurveyLookup(siteId).has(a.siteId));
             const latestBySurvey = latestSurveyResponsesBySurvey(siteId);
             const surveyAnswerTotal = latestBySurvey.reduce((n, r) => n + surveyAnswerCount(r), 0);
             const scoredResponses = latestBySurvey.filter(r => r.score && typeof r.score.pct === 'number');
@@ -4519,6 +4703,7 @@
                                         ${siteDetailField('Studies', studyListHtml)}
                                     </dl>
                                 </div>
+                                ${siteFeasibilityProfileHtml(siteId)}
                                 ${legacySiteHistoryHtml(siteId)}
                             </div>
 
@@ -7377,7 +7562,7 @@
                     const siteSurvey = siteSurveyStatusHtml(site.id);
                     const legacyStats = getArtemisSiteLegacyStats(site.id);
                     const latestTitle = siteSurvey.latest
-                        ? ((allSiteSurveyDefinitions || []).find(d => d.id === siteSurvey.latest.surveyId)?.title || 'Survey')
+                        ? formatSiteSurveyDefinitionTitle(siteSurvey.latest.surveyId)
                         : '';
 
                     return `
@@ -12221,7 +12406,10 @@
                 const initialTab = viewSiteDetailsBtn.getAttribute('data-site-tab') || 'overview';
                 if (siteId) {
                     (async () => {
-                        await refreshArtemisLegacySiteIndex();
+                        await Promise.all([
+                            refreshArtemisLegacySiteIndex(),
+                            refreshSiteSurveyDataForSite(siteId),
+                        ]);
                         createSiteDetailsModal(siteId, { initialTab });
                     })();
                 }
