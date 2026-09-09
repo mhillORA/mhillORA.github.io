@@ -42,7 +42,7 @@ Top nav: primary work tabs + **History** dropdown (past studies / past sites / f
 
 - **Past sites** (History) — Overview / **Surveys** / **Site profile**; promote to live Site; filter by indication/TA
 - **Feasibility surveys** (History) — list survey definitions → open one → site responses accordion
-- **Comms** — predefined surveys library with Clone + Send; Send Survey shows **prior answers** for selected sites before send
+- **Feasibility** — predefined surveys library with Clone + Send; Send Survey shows **prior answers** for selected sites before send
 - **Reporting → History** — funnel KPIs + feasibility-by-indication (same as Historical funnel in History menu)
 - **Past studies** (History) — list → open study → site table + edit metadata
 - **Dashboard** — needs-attention strip + live ops charts + legacy overview panel

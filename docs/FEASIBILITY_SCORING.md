@@ -12,8 +12,8 @@ This guide is the operating manual for the **per-site feasibility loop**:
 
 | Artifact | Where | Purpose |
 |----------|--------|---------|
-| Scored survey template | Comms → New / Edit survey | Weights, knockouts, pass thresholds |
-| Secure site link | Comms → Send survey | Prefill + draft + resubmit |
+| Scored survey template | Feasibility → New / Edit survey | Weights, knockouts, pass thresholds |
+| Secure site link | Feasibility → Send survey | Prefill + draft + resubmit |
 | Ranked board | Reporting → Feasibility | Pass / Fail / Borderline / Unscored |
 | **Site Ops HTML** | Reporting → **Site Ops HTML** button | Hand to leadership / Site Ops |
 
@@ -21,7 +21,7 @@ This guide is the operating manual for the **per-site feasibility loop**:
 
 ## 1. Configure a scored questionnaire
 
-1. Open **Comms** → create or **edit** a survey (or **Clone** a predefined template).
+1. Open **Feasibility** → create or **edit** a survey (or **Clone** a predefined template).
 2. In **Feasibility scoring (Site Ops)** set:
    - **Pass threshold (%)** — default `70`
    - **Borderline threshold (%)** — default `50` (must be ≤ pass)
@@ -50,7 +50,7 @@ Unanswered weighted questions are **excluded** from the denominator (same as bef
 
 ## 2. Send per site (with prior answers)
 
-1. **Comms** → **Send survey** (or Send from a site’s Surveys tab).
+1. **Feasibility** → **Send survey** (or Send from a site’s Surveys tab).
 2. Pick template, roles, sites.
 3. Review **Previous answers for selected sites** on the right before sending.
 4. Send secure links. Sites open `site-survey.html?t=…` only — no internal ids.

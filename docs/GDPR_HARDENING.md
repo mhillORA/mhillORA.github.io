@@ -40,7 +40,7 @@ Implemented:
    - `POST /api/privacy/retention/purge-archived` — delete `_archived` survey responses older than N days
    - `GET /api/privacy/audit` — recent privacy audit events
 3. **`privacy-audit-log` Cosmos container** (created on first use, partition `/id`)
-4. **Comms → Privacy tools** panel to run export / erase / purge from the logged-in ARTEMIS UI
+4. **Feasibility → Privacy tools** panel to run export / erase / purge from the logged-in ARTEMIS UI
 
 Env knobs:
 
@@ -106,7 +106,7 @@ See also `docs/SITE_SURVEY_SECURITY.md`.
 ## Quick test plan
 
 1. Open a survey link → notice visible; submit still works  
-2. Comms → Privacy tools → export by a known response email → JSON download  
+2. Feasibility → Privacy tools → export by a known response email → JSON download  
 3. Erase with `confirm` → responses redacted; audit row appears  
 4. Create an archived response older than retention → purge removes it  
 5. If `PRIVACY_OPS_KEY` set → requests without header return 401  

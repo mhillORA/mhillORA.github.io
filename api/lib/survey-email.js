@@ -228,7 +228,7 @@ function opsNotifyCopy({ siteName, surveyTitle, roleLabel, status }) {
         `Site: ${siteName || '—'}\n` +
         `Survey: ${surveyTitle || '—'}\n` +
         `Role: ${roleLabel || '—'}\n` +
-        `\nOpen ARTEMIS → Comms / Reporting to review.\n`;
+        `\nOpen ARTEMIS → Feasibility / Reporting to review.\n`;
     return { subject, text };
 }
 

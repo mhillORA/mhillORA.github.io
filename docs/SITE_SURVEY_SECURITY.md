@@ -4,7 +4,7 @@ ARTEMIS site feasibility surveys collect **site-staff PII** (names, emails, oper
 
 ## Flow
 
-1. Ops picks a survey template + sites + roles (PI / Coordinator) in **Comms → Send Survey**.
+1. Ops picks a survey template + sites + roles (PI / Coordinator) in **Feasibility → Send Survey**.
 2. API mints a unique opaque invite token per site+role, stores only `tokenHash`, emails (or returns) `site-survey.html?t=…`.
 3. Respondent opens the link → `GET /api/public/site-survey?t=…` returns questions + **prefill from latest live response** (and any draft).
 4. Save draft / Submit → `POST /api/public/site-survey` → Cosmos `site-survey-responses` (+ archive on resubmit).
@@ -51,8 +51,8 @@ Legacy links `?assignmentId=` are rejected on the public page — use **Resend**
 - `api/lib/survey-email.js` — webhook delivery + copy
 - `api/survey-secure-routes.js` — public + send + notifications
 - `site-survey.html` — respondent UI
-- Comms / Reporting in `index.html`
+- Feasibility / Reporting in `index.html`
 
 ## Reporting
 
-Use **Reporting → Feasibility** for per-question distributions and site drill-down (existing `buildFeasibilityQuestionReport`). Comms **Responses** lists latest submissions; activity feed flags new submits.
+Use **Reporting → Feasibility** for per-question distributions and site drill-down (existing `buildFeasibilityQuestionReport`). Feasibility **Responses** lists latest submissions; activity feed flags new submits.
