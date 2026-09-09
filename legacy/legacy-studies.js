@@ -1481,11 +1481,6 @@
           <h4 class="font-semibold text-gray-900 dark:text-white mb-2">PIs seen here</h4>
           <p class="text-sm text-gray-700 dark:text-gray-300 break-words">${escapeHtml(pis.join(', ') || '—')}</p>
         </div>
-
-        <div>
-          <h4 class="font-semibold text-gray-900 dark:text-white mb-2">Every study × group row</h4>
-          ${siteOutcomesTableHtml(outcomes, { showStudy: true })}
-        </div>
         </div>
 
         <div data-legacy-site-panel="surveys" class="hidden space-y-4">
@@ -1894,11 +1889,6 @@
         <div>
           <h4 class="font-semibold text-gray-900 dark:text-white mb-2">By site (rolled up)</h4>
           ${siteRollupTableHtml(outcomes)}
-        </div>
-
-        <div>
-          <h4 class="font-semibold text-gray-900 dark:text-white mb-2">Every site × group row</h4>
-          ${siteOutcomesTableHtml(outcomes)}
         </div>
       </div>`;
 
@@ -2697,10 +2687,6 @@
                       <tbody>${studyParts}</tbody>
                     </table>
                   </div>
-                  <div>
-                    <div class="text-sm font-medium mb-1">Site × group detail</div>
-                    ${siteOutcomesTableHtml(rows, { showStudy: true })}
-                  </div>
                 </div>
               </details>`;
             })
@@ -2731,10 +2717,6 @@
               <div class="pt-2">
                 <div class="text-sm font-medium mb-1">By site (unique under this study)</div>
                 ${siteRollupTableHtml(rows)}
-              </div>
-              <div>
-                <div class="text-sm font-medium mb-1">Site × group detail</div>
-                ${siteOutcomesTableHtml(rows)}
               </div>
             </div>
           </details>`;
