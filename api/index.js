@@ -2328,15 +2328,50 @@ app.http('users', {
             };
         }
 
+        // SWA / Functions sometimes routes GET /users/me here as id="me" instead of usersMe.
+        // Resolve Entra principal → Cosmos user instead of reading item id "me".
+        if (String(id || '').toLowerCase() === 'me' && (method === 'GET' || method === 'POST')) {
+            try {
+                const principal = signedInUserFromRequest(request);
+                if (!principal || (!principal.entraId && !principal.email)) {
+                    return {
+                        status: 401,
+                        jsonBody: { error: 'Not signed in via Entra / SWA Easy Auth' },
+                        headers: { 'Content-Type': 'application/json' }
+                    };
+                }
+                const user = await findOrCreateUserFromPrincipal(principal, context);
+                return {
+                    status: 200,
+                    jsonBody: user,
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            } catch (error) {
+                context.log.error('users/{id=me} fallback error:', error);
+                return {
+                    status: 500,
+                    jsonBody: { error: 'Failed to resolve signed-in user' },
+                    headers: { 'Content-Type': 'application/json' }
+                };
+            }
+        }
+
         try {
             switch (method) {
                 case 'GET':
                     // Cosmos DB requires both id and partitionKey - in this case, id is the partition key
-                    const { resource } = await container.item(id, id).read(); 
-                    if (!resource) return { status: 404, jsonBody: { error: 'User not found' } };
-                    // Don't return password hash
-                    const { password: pwd, ...userWithoutPassword } = resource;
-                    return { jsonBody: userWithoutPassword };
+                    try {
+                        const { resource } = await container.item(id, id).read();
+                        if (!resource) return { status: 404, jsonBody: { error: 'User not found' } };
+                        // Don't return password hash
+                        const { password: pwd, ...userWithoutPassword } = resource;
+                        return { jsonBody: userWithoutPassword };
+                    } catch (readErr) {
+                        if (isLikelyMissingCosmosContainer(readErr) || readErr?.code === 404 || readErr?.statusCode === 404) {
+                            return { status: 404, jsonBody: { error: 'User not found' } };
+                        }
+                        throw readErr;
+                    }
                 
                 case 'PUT':
                     const requestBody = await request.json();
