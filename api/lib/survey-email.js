@@ -155,7 +155,7 @@ async function deliverViaSendGrid({ to, subject, text, html }) {
             },
             body: JSON.stringify({
                 personalizations: [{ to: [{ email: to }] }],
-                from: { email: from, name: process.env.SURVEY_EMAIL_FROM_NAME || 'ORA Clinical ARTEMIS' },
+                from: { email: from, name: process.env.SURVEY_EMAIL_FROM_NAME || 'Ora Clinical' },
                 subject,
                 content: [
                     { type: 'text/plain', value: text },
