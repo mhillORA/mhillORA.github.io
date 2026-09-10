@@ -126,6 +126,12 @@ function publicQuestionsFromList(questions) {
             fromGeneralFeasibility: q._fromGeneralFeasibility === true,
             sensitivity: q.sensitivity === 'pii' || q.sensitivity === 'phi' ? q.sensitivity : 'none',
             defaultValue: q.defaultValue,
+            // Section / paging metadata for the public multi-page form
+            category: q.category || q.section || undefined,
+            section: q.section || q.category || undefined,
+            help: q.help || q.context || q.description || undefined,
+            maxStars: q.maxStars || q.max || undefined,
+            docxNum: typeof q.docxNum === 'number' ? q.docxNum : undefined,
         };
     });
 }
