@@ -258,6 +258,32 @@ const toLocalDateKey = (value) => {
     return `${y}-${m}-${day}`;
 };
 
+/** Normalize YYYY-MM-DD from report form or prior generate. */
+const normalizeReportDateInput = (value) => {
+    const s = String(value || '').trim().slice(0, 10);
+    return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null;
+};
+
+/** Prefer live Reporting form dates so Export respects fields even before/without re-Generate. */
+const getReportDateRange = () => {
+    const form = document.getElementById('report-filter-form');
+    const startDate = normalizeReportDateInput(form?.querySelector('[name="startDate"]')?.value)
+        || normalizeReportDateInput(state.lastReportDateStart);
+    const endDate = normalizeReportDateInput(form?.querySelector('[name="endDate"]')?.value)
+        || normalizeReportDateInput(state.lastReportDateEnd);
+    return { startDate, endDate };
+};
+
+/** Local calendar-day compare — avoids UTC off-by-one making date filters look inert. */
+const isTimestampInReportDateRange = (raw, startDate, endDate) => {
+    if (!startDate && !endDate) return true;
+    const key = toLocalDateKey(raw);
+    if (!key) return false;
+    if (startDate && key < startDate) return false;
+    if (endDate && key > endDate) return false;
+    return true;
+};
+
 let msalInstance = null;
 let nasaEntraEnabled = false;
 let nasaInternalEmailDomains = ['oraclinical.com'];
@@ -5782,8 +5808,15 @@ const getReportingHTML = () => {
                     <input type="checkbox" name="surveyCompleted" id="surveyCompleted" class="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500">
                     <label for="surveyCompleted" class="text-sm text-gray-700 dark:text-gray-300">Survey Completed</label>
                 </div>
-                <input type="date" name="startDate" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"/>
-                <input type="date" name="endDate" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"/>
+                <div>
+                    <label for="report-start-date" class="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Survey from</label>
+                    <input type="date" id="report-start-date" name="startDate" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"/>
+                </div>
+                <div>
+                    <label for="report-end-date" class="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Survey to</label>
+                    <input type="date" id="report-end-date" name="endDate" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"/>
+                </div>
+                <p class="text-xs text-gray-500 dark:text-gray-400 col-span-full">Date range filters by <strong>survey completion date</strong> for Generate Report and Export Survey Results.</p>
                 <button type="submit" class="bg-blue-600 text-white rounded-md h-10 col-span-full lg:col-span-2">Generate Report</button>
             </form>
         </div>
@@ -12818,24 +12851,15 @@ document.addEventListener('submit', async (e) => {
             if (data.surveyOutcome !== 'all') {
                 filteredPatients = filteredPatients.filter(p => p.surveyResults?.some(sr => sr.outcome === data.surveyOutcome));
             }
-            if (data.startDate || data.endDate) {
-                state.lastReportDateStart = data.startDate || null;
-                state.lastReportDateEnd = data.endDate || null;
-                const inRange = (raw) => {
-                    if (!raw) return false;
-                    const t = new Date(raw);
-                    if (Number.isNaN(t.getTime())) return false;
-                    if (data.startDate && t < new Date(data.startDate + 'T00:00:00')) return false;
-                    if (data.endDate && t > new Date(data.endDate + 'T23:59:59')) return false;
-                    return true;
-                };
+            const reportStart = normalizeReportDateInput(data.startDate);
+            const reportEnd = normalizeReportDateInput(data.endDate);
+            state.lastReportDateStart = reportStart;
+            state.lastReportDateEnd = reportEnd;
+            if (reportStart || reportEnd) {
+                // Date fields = survey completion window (Export Survey Results / UAT-130)
                 filteredPatients = filteredPatients.filter(p =>
-                    (p.appointment && inRange(p.appointment.time)) ||
-                    (p.surveyResults || []).some(sr => inRange(sr.completedAt))
+                    (p.surveyResults || []).some(sr => isTimestampInReportDateRange(sr.completedAt, reportStart, reportEnd))
                 );
-            } else {
-                state.lastReportDateStart = null;
-                state.lastReportDateEnd = null;
             }
             state.lastReportData = filteredPatients;
             const exportBtn = document.getElementById('export-csv-btn');
@@ -13668,21 +13692,23 @@ const exportSurveysToCSV = () => {
             showNotification("Please generate a report before exporting survey results.", "info");
             return;
         }
+        const { startDate, endDate } = getReportDateRange();
+        state.lastReportDateStart = startDate;
+        state.lastReportDateEnd = endDate;
         const headers = ["PatientID", "PatientName", "SurveyTitle", "CompletionDate", "Outcome", "Question", "Answer"];
         const csvRows = [headers.join(',')];
         for (const p of patients) {
             if (p.surveyResults && p.surveyResults.length > 0) {
                 for (const result of p.surveyResults) {
+                    if (!isTimestampInReportDateRange(result.completedAt, startDate, endDate)) continue;
                     const completedAt = result.completedAt ? new Date(result.completedAt) : null;
-                    if (state.lastReportDateStart && completedAt && completedAt < new Date(state.lastReportDateStart + 'T00:00:00')) continue;
-                    if (state.lastReportDateEnd && completedAt && completedAt > new Date(state.lastReportDateEnd + 'T23:59:59')) continue;
                     if (result.answers && result.answers.length > 0) {
                         for (const answer of result.answers) {
                             csvRows.push([
                                 `"${p.id}"`,
                                 `"${p.firstName} ${p.lastName}"`,
                                 `"${(result.surveyTitle || '').replace(/"/g, '""')}"`,
-                                `"${completedAt ? completedAt.toISOString() : ''}"`,
+                                `"${completedAt && !Number.isNaN(completedAt.getTime()) ? completedAt.toISOString() : ''}"`,
                                 `"${(result.outcome || 'N/A').replace(/"/g, '""')}"`,
                                 `"${(answer.question || '').replace(/"/g, '""')}"`,
                                 `"${(answer.answer || '').replace(/"/g, '""')}"`
@@ -13693,7 +13719,7 @@ const exportSurveysToCSV = () => {
                             `"${p.id}"`,
                             `"${p.firstName} ${p.lastName}"`,
                             `"${(result.surveyTitle || '').replace(/"/g, '""')}"`,
-                            `"${completedAt ? completedAt.toISOString() : ''}"`,
+                            `"${completedAt && !Number.isNaN(completedAt.getTime()) ? completedAt.toISOString() : ''}"`,
                             `"${(result.outcome || 'N/A').replace(/"/g, '""')}"`,
                             `"N/A"`,
                             `"N/A"`
@@ -13703,7 +13729,10 @@ const exportSurveysToCSV = () => {
             }
         }
         if (csvRows.length <= 1) {
-            showNotification("No survey results found for the patients in the current report.", "info");
+            const rangeNote = (startDate || endDate)
+                ? ` in ${startDate || '…'} → ${endDate || '…'}`
+                : '';
+            showNotification("No survey results found for the patients in the current report" + rangeNote + ".", "info");
             return;
         }
         const csvString = csvRows.join('\r\n');
@@ -13718,7 +13747,10 @@ const exportSurveysToCSV = () => {
         document.body.appendChild(link);
         try {
             link.click();
-            showNotification(`CSV generated. Download '${filename}' should begin.`, "success");
+            const rangeNote = (startDate || endDate)
+                ? ` (${startDate || '…'} → ${endDate || '…'})`
+                : '';
+            showNotification(`CSV generated${rangeNote}. Download '${filename}' should begin.`, "success");
         } catch (clickError) {
             console.error("Error triggering download link click:", clickError);
             showNotification("Could not trigger download. Please check browser console.", "error");
