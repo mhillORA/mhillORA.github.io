@@ -14,16 +14,10 @@ const {
     normalizeGeneralFeasibilityVariant,
     isGeneralFeasibilitySurveyId,
 } = require('./survey-compare');
-const { GF_OLD_QID_TO_LIB, GF_OLD_LABEL_TO_LIB } = require('./gf-question-bridges');
+const { GF_OLD_QID_TO_LIB, GF_OLD_LABEL_TO_LIB, resolveGfBridgeLibraryId } = require('./gf-question-bridges');
 
 function resolveStoredAnswerLibraryId(a) {
-    const qid = String(a?.questionId ?? a?.id ?? '');
-    const lib = String(a?.libraryQuestionId || '');
-    if (lib) return lib;
-    if (qid && GF_OLD_QID_TO_LIB[qid]) return GF_OLD_QID_TO_LIB[qid];
-    const lab = normalizeQuestionLabel(a?.label || a?.title);
-    if (lab && GF_OLD_LABEL_TO_LIB[lab]) return GF_OLD_LABEL_TO_LIB[lab];
-    return '';
+    return resolveGfBridgeLibraryId(a);
 }
 
 function sortByIsoDesc(rows, keys) {
