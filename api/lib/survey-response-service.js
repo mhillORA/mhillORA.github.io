@@ -122,15 +122,15 @@ function buildSiteRecordPrefill(questions, site, { coordinatorStaff = null, piSt
     };
 
     const byQid = {
-        gf_15_research-contact: byLib['ql-coord-name'],
-        gf_16_poc-email: byLib['ql-coord-email'],
-        gsf_009_primary-research-point-of-contact-phone-number: byLib['ql-coord-phone'],
-        gf_17_poc-role: byLib['ql-primary-contact-role'],
-        gf_02_site-name: byLib['ql-site-name'],
-        gf_03_address: byLib['ql-site-address'],
-        gf_04_phone: byLib['ql-site-phone'],
-        gf_07_investigator-1: byLib['ql-pi-name'],
-        gf_09_inv-1-email: byLib['ql-pi-email'],
+        'gf_15_research-contact': byLib['ql-coord-name'],
+        'gf_16_poc-email': byLib['ql-coord-email'],
+        'gsf_009_primary-research-point-of-contact-phone-number': byLib['ql-coord-phone'],
+        'gf_17_poc-role': byLib['ql-primary-contact-role'],
+        'gf_02_site-name': byLib['ql-site-name'],
+        'gf_03_address': byLib['ql-site-address'],
+        'gf_04_phone': byLib['ql-site-phone'],
+        'gf_07_investigator-1': byLib['ql-pi-name'],
+        'gf_09_inv-1-email': byLib['ql-pi-email'],
     };
 
     const labelHints = [
