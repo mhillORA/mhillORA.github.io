@@ -284,6 +284,118 @@ const isTimestampInReportDateRange = (raw, startDate, endDate) => {
     return true;
 };
 
+const patientHasActivityInReportDateRange = (patient, startDate, endDate) => {
+    if (!startDate && !endDate) return true;
+    if ((patient.surveyResults || []).some(sr => isTimestampInReportDateRange(sr.completedAt, startDate, endDate))) return true;
+    if (patient.appointment && isTimestampInReportDateRange(patient.appointment.time, startDate, endDate)) return true;
+    const appts = typeof getPatientAppointments === 'function' ? getPatientAppointments(patient) : (patient.appointments || []);
+    if ((appts || []).some(a => a && isTimestampInReportDateRange(a.time, startDate, endDate))) return true;
+    if ((patient.enrollments || []).some(e => isTimestampInReportDateRange(e.enrolledDate || e.assignedAt, startDate, endDate))) return true;
+    if (isTimestampInReportDateRange(patient.createdAt || patient.lastUpdated, startDate, endDate)) return true;
+    return false;
+};
+
+const getReportSourceOptions = () => {
+    const defaults = ['Facebook', 'Instagram', 'Reddit', 'Site', 'Marketing', 'Email', 'subject-import'];
+    const fromData = (state.patients || []).map(p => String(p.source || '').trim()).filter(Boolean);
+    return [...new Set([...defaults, ...fromData])].sort((a, b) => a.localeCompare(b));
+};
+
+/** Shared Reporting filters — used by Generate Report (and tests). */
+const applyReportFilters = (raw = {}, options = {}) => {
+    const studyId = raw.studyId && raw.studyId !== 'all' ? String(raw.studyId) : null;
+    const siteId = raw.siteId && raw.siteId !== 'all' ? String(raw.siteId) : null;
+    const status = raw.status && raw.status !== 'all' ? String(raw.status) : null;
+    const source = raw.source && raw.source !== 'all' ? String(raw.source) : null;
+    const schedulingStatus = raw.schedulingStatus && raw.schedulingStatus !== 'all' ? String(raw.schedulingStatus) : null;
+    const surveyOutcome = raw.surveyOutcome && raw.surveyOutcome !== 'all' ? String(raw.surveyOutcome) : null;
+    const minAge = raw.minAge !== undefined && raw.minAge !== null && String(raw.minAge).trim() !== ''
+        ? parseInt(raw.minAge, 10) : null;
+    const maxAge = raw.maxAge !== undefined && raw.maxAge !== null && String(raw.maxAge).trim() !== ''
+        ? parseInt(raw.maxAge, 10) : null;
+    const surveyCompleted = options.surveyCompleted === true
+        || raw.surveyCompleted === true
+        || raw.surveyCompleted === 'on'
+        || raw.surveyCompleted === 'true';
+    const startDate = normalizeReportDateInput(raw.startDate);
+    const endDate = normalizeReportDateInput(raw.endDate);
+
+    let list = filterPatientsForCurrentUser(state.patients || []);
+    if (studyId) list = list.filter(p => patientBelongsToStudy(p, studyId));
+    if (siteId) list = list.filter(p => patientBelongsToSite(p, siteId));
+    if (status) list = list.filter(p => p.status === status);
+    if (source) list = list.filter(p => p.source === source);
+    if (Number.isFinite(minAge)) list = list.filter(p => p.age != null && p.age >= minAge);
+    if (Number.isFinite(maxAge)) list = list.filter(p => p.age != null && p.age <= maxAge);
+    if (schedulingStatus === 'scheduled') list = list.filter(p => !!p.appointment);
+    if (schedulingStatus === 'not-scheduled') list = list.filter(p => !p.appointment);
+    if (surveyCompleted) list = list.filter(p => p.surveyResults && p.surveyResults.length > 0);
+    if (surveyOutcome) list = list.filter(p => p.surveyResults?.some(sr => sr.outcome === surveyOutcome));
+    if (startDate || endDate) list = list.filter(p => patientHasActivityInReportDateRange(p, startDate, endDate));
+
+    return { patients: list, startDate, endDate, studyId, siteId };
+};
+
+const renderReportResults = (filteredPatients, meta = {}) => {
+    const exportBtn = document.getElementById('export-csv-btn');
+    const exportSurveysBtn = document.getElementById('export-surveys-btn');
+    const exportFive9Btn = document.getElementById('export-five9-btn');
+    const resultsBody = document.getElementById('report-results-body');
+    const metricsContainer = document.getElementById('report-metrics');
+    if (!resultsBody) return;
+
+    if (filteredPatients.length > 0) {
+        resultsBody.innerHTML = filteredPatients.map(p => {
+            const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
+            const lastSurvey = p.surveyResults && p.surveyResults.length > 0 ? p.surveyResults[p.surveyResults.length - 1] : null;
+            const outcome = lastSurvey ? lastSurvey.outcome : 'N/A';
+            const outcomeColor = outcome === 'Pass' ? 'text-green-500' : outcome === 'Fail' ? 'text-red-500' : '';
+            return `
+                <tr>
+                    <td class="px-6 py-4 whitespace-nowrap">${phiName(p)}</td>
+                    <td class="px-6 py-4 whitespace-nowrap">${phi(p.age != null ? String(p.age) : 'N/A')}</td>
+                    <td class="px-6 py-4 whitespace-nowrap">${p.status || 'N/A'}</td>
+                    <td class="px-6 py-4 whitespace-nowrap">${currentEnrollment ? state.studies.find(s => s.id === currentEnrollment.studyId)?.title || 'N/A' : 'N/A'}</td>
+                    <td class="px-6 py-4 whitespace-nowrap">${currentEnrollment ? state.sites.find(s => s.id === currentEnrollment.siteId)?.name || 'N/A' : 'N/A'}</td>
+                    <td class="px-6 py-4 whitespace-nowrap">${p.appointment ? phi(new Date(p.appointment.time).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })) : 'Not Scheduled'}</td>
+                    <td class="px-6 py-4 whitespace-nowrap font-semibold ${outcomeColor}">${outcome}</td>
+                </tr>
+            `;
+        }).join('');
+        if (exportBtn) exportBtn.disabled = false;
+        if (exportSurveysBtn) exportSurveysBtn.disabled = false;
+        if (exportFive9Btn) exportFive9Btn.disabled = false;
+    } else {
+        resultsBody.innerHTML = `<tr><td colspan="7" class="text-center text-gray-500 dark:text-gray-400 py-8">No patients match the selected criteria.</td></tr>`;
+        if (exportBtn) exportBtn.disabled = true;
+        if (exportSurveysBtn) exportSurveysBtn.disabled = true;
+        if (exportFive9Btn) exportFive9Btn.disabled = true;
+    }
+
+    if (metricsContainer) {
+        const total = filteredPatients.length;
+        const withAge = filteredPatients.filter(p => p.age != null && !Number.isNaN(Number(p.age)));
+        const avgAge = withAge.length
+            ? (withAge.reduce((sum, p) => sum + Number(p.age), 0) / withAge.length).toFixed(1)
+            : 'N/A';
+        const scheduled = filteredPatients.filter(p => p.appointment).length;
+        const studyId = meta.studyId || null;
+        const studyRosterCount = studyId
+            ? filterPatientsForCurrentUser(state.patients || []).filter(p => patientBelongsToStudy(p, studyId)).length
+            : null;
+        const dateNote = (meta.startDate || meta.endDate)
+            ? `<p class="text-xs text-gray-500 mt-1">${meta.startDate || '…'} → ${meta.endDate || '…'}</p>`
+            : '';
+        metricsContainer.innerHTML = `
+            <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md text-center"><p class="text-sm text-gray-500 dark:text-gray-400">Total Patients</p><p class="text-2xl font-bold dark:text-white">${total}</p>${studyRosterCount != null ? `<p class="text-xs text-gray-500 mt-1">${studyRosterCount} on study roster</p>` : ''}${dateNote}</div>
+            <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md text-center"><p class="text-sm text-gray-500 dark:text-gray-400">Average Age</p><p class="text-2xl font-bold dark:text-white">${avgAge}</p></div>
+            <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md text-center"><p class="text-sm text-gray-500 dark:text-gray-400">Scheduled</p><p class="text-2xl font-bold dark:text-white">${scheduled}</p></div>
+            <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md text-center"><p class="text-sm text-gray-500 dark:text-gray-400">Not Scheduled</p><p class="text-2xl font-bold dark:text-white">${total - scheduled}</p></div>
+        `;
+    }
+    if (typeof lucide !== 'undefined') lucide.createIcons();
+};
+
 let msalInstance = null;
 let nasaEntraEnabled = false;
 let nasaInternalEmailDomains = ['oraclinical.com'];
@@ -694,6 +806,7 @@ let state = {
     lastReportData: [], // To store data for CSV export
     lastReportDateStart: null,
     lastReportDateEnd: null,
+    lastReportMeta: null,
     currentSurveyState: null,
     currentPatientProfileTab: 'details', // 'details' or 'contactLog' or 'surveyHistory' or 'visitDetails'
     selectedStudyId: null, // For the studies dropdown selector
@@ -3868,6 +3981,13 @@ const renderContent = () => {
     };
     mainContent.innerHTML = contentMap[state.activeTab]();
     // Post-render actions for specific tabs
+    if (state.activeTab === 'reporting' && Array.isArray(state.lastReportData)) {
+        renderReportResults(state.lastReportData, state.lastReportMeta || {
+            studyId: null,
+            startDate: state.lastReportDateStart,
+            endDate: state.lastReportDateEnd
+        });
+    }
     if (state.activeTab === 'crcDashboard') {
         // CRC Dashboard shows today's appointments
         renderDashboardCharts();
@@ -5804,36 +5924,56 @@ const loadBulkJobs = async () => {
 };
 
 const getReportingHTML = () => {
-    const sources = ['Facebook', 'Instagram', 'Reddit', 'Site', 'Marketing', 'Email'];
+    const sources = getReportSourceOptions();
+    const savedStart = normalizeReportDateInput(state.lastReportDateStart) || '';
+    const savedEnd = normalizeReportDateInput(state.lastReportDateEnd) || '';
     return `
         <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200 mb-6">Reporting & Analytics</h2>
         <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md mb-8">
             <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300 mb-4">Report Filters</h3>
-            <form id="report-filter-form" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 items-center">
-                <select name="studyId" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="all">All Studies</option>${state.studies.filter(isActualStudy).map(s => `<option value="${s.id}">${s.title}</option>`).join('')}</select>
-                <select name="siteId" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="all">All Sites</option>${state.sites.map(s => `<option value="${s.id}">${s.name}</option>`).join('')}</select>
-                <select name="status" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="all">All Statuses</option>${['Candidate', 'Enrolled', 'Pre-Screening', 'Screen Fail'].map(s => `<option value="${s}">${s}</option>`).join('')}</select>
-                <select name="source" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="all">All Sources</option>${sources.map(s => `<option value="${s}">${s}</option>`).join('')}</select>
-                <select name="schedulingStatus" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="all">All Scheduling Statuses</option><option value="scheduled">Scheduled</option><option value="not-scheduled">Not Scheduled</option></select>
-                <select name="surveyOutcome" class="p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="all">All Survey Outcomes</option><option value="Pass">Pass</option><option value="Fail">Fail</option></select>
+            <form id="report-filter-form" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 items-end">
+                <div>
+                    <label class="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Study</label>
+                    <select name="studyId" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="all">All Studies</option>${state.studies.filter(isActualStudy).map(s => `<option value="${s.id}">${s.title}</option>`).join('')}</select>
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Site</label>
+                    <select name="siteId" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="all">All Sites</option>${state.sites.map(s => `<option value="${s.id}">${s.name}</option>`).join('')}</select>
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Status</label>
+                    <select name="status" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="all">All Statuses</option>${['Candidate', 'Enrolled', 'Pre-Screening', 'Screen Fail', 'Completed'].map(s => `<option value="${s}">${s}</option>`).join('')}</select>
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Source</label>
+                    <select name="source" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="all">All Sources</option>${sources.map(s => `<option value="${escapeHtmlPhi(s)}">${escapeHtmlPhi(s)}</option>`).join('')}</select>
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Scheduling</label>
+                    <select name="schedulingStatus" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="all">All Scheduling Statuses</option><option value="scheduled">Scheduled</option><option value="not-scheduled">Not Scheduled</option></select>
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Survey outcome</label>
+                    <select name="surveyOutcome" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><option value="all">All Survey Outcomes</option><option value="Pass">Pass</option><option value="Fail">Fail</option></select>
+                </div>
                 <div class="flex items-center gap-2">
                     <input type="number" name="minAge" placeholder="Min Age" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"/>
                     <span>-</span>
                     <input type="number" name="maxAge" placeholder="Max Age" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"/>
                 </div>
-                <div class="flex items-center gap-2">
+                <div class="flex items-center gap-2 pb-2">
                     <input type="checkbox" name="surveyCompleted" id="surveyCompleted" class="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500">
                     <label for="surveyCompleted" class="text-sm text-gray-700 dark:text-gray-300">Survey Completed</label>
                 </div>
                 <div>
-                    <label for="report-start-date" class="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Survey from</label>
-                    <input type="date" id="report-start-date" name="startDate" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"/>
+                    <label for="report-start-date" class="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">From date</label>
+                    <input type="date" id="report-start-date" name="startDate" value="${savedStart}" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"/>
                 </div>
                 <div>
-                    <label for="report-end-date" class="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Survey to</label>
-                    <input type="date" id="report-end-date" name="endDate" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"/>
+                    <label for="report-end-date" class="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">To date</label>
+                    <input type="date" id="report-end-date" name="endDate" value="${savedEnd}" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"/>
                 </div>
-                <p class="text-xs text-gray-500 dark:text-gray-400 col-span-full">Date range filters by <strong>survey completion date</strong> for Generate Report and Export Survey Results.</p>
+                <p class="text-xs text-gray-500 dark:text-gray-400 col-span-full">Dates: <strong>Generate Report</strong> includes patients with a survey, visit, enrollment, or record update in range. <strong>Export Survey Results</strong> filters survey rows by completion date only. Leave dates blank for the full study roster.</p>
                 <button type="submit" class="bg-blue-600 text-white rounded-md h-10 col-span-full lg:col-span-2">Generate Report</button>
             </form>
         </div>
@@ -12836,102 +12976,13 @@ document.addEventListener('submit', async (e) => {
             break;
         }
         case 'report-filter-form': {
-            let filteredPatients = [...filterPatientsForCurrentUser(state.patients)];
-            // Apply filters
-            if (data.studyId !== 'all') {
-                filteredPatients = filteredPatients.filter(p => patientBelongsToStudy(p, data.studyId));
-            }
-            if (data.siteId !== 'all') {
-                filteredPatients = filteredPatients.filter(p => patientBelongsToSite(p, data.siteId));
-            }
-            if (data.status !== 'all') {
-                filteredPatients = filteredPatients.filter(p => p.status === data.status);
-            }
-            if (data.source !== 'all') {
-                filteredPatients = filteredPatients.filter(p => p.source === data.source);
-            }
-            if (data.minAge) {
-                filteredPatients = filteredPatients.filter(p => p.age >= parseInt(data.minAge));
-            }
-            if (data.maxAge) {
-                filteredPatients = filteredPatients.filter(p => p.age <= parseInt(data.maxAge));
-            }
-            if (data.schedulingStatus === 'scheduled') {
-                filteredPatients = filteredPatients.filter(p => p.appointment);
-            }
-            if (data.schedulingStatus === 'not-scheduled') {
-                filteredPatients = filteredPatients.filter(p => !p.appointment);
-            }
-            if (form.querySelector('[name="surveyCompleted"]').checked) {
-                filteredPatients = filteredPatients.filter(p => p.surveyResults && p.surveyResults.length > 0);
-            }
-            if (data.surveyOutcome !== 'all') {
-                filteredPatients = filteredPatients.filter(p => p.surveyResults?.some(sr => sr.outcome === data.surveyOutcome));
-            }
-            const reportStart = normalizeReportDateInput(data.startDate);
-            const reportEnd = normalizeReportDateInput(data.endDate);
-            state.lastReportDateStart = reportStart;
-            state.lastReportDateEnd = reportEnd;
-            if (reportStart || reportEnd) {
-                // Generate Report: any study activity in range (survey, visit, enrollment, or created)
-                // Export Survey Results still filters by survey completion only.
-                filteredPatients = filteredPatients.filter(p => {
-                    if ((p.surveyResults || []).some(sr => isTimestampInReportDateRange(sr.completedAt, reportStart, reportEnd))) return true;
-                    if (p.appointment && isTimestampInReportDateRange(p.appointment.time, reportStart, reportEnd)) return true;
-                    if ((typeof getPatientAppointments === 'function' ? getPatientAppointments(p) : (p.appointments || []))
-                        .some(a => isTimestampInReportDateRange(a.time, reportStart, reportEnd))) return true;
-                    if ((p.enrollments || []).some(e => isTimestampInReportDateRange(e.enrolledDate || e.assignedAt, reportStart, reportEnd))) return true;
-                    if (isTimestampInReportDateRange(p.createdAt || p.lastUpdated, reportStart, reportEnd)) return true;
-                    return false;
-                });
-            }
-            state.lastReportData = filteredPatients;
-            const exportBtn = document.getElementById('export-csv-btn');
-            const exportSurveysBtn = document.getElementById('export-surveys-btn');
-            const exportFive9Btn = document.getElementById('export-five9-btn');
-            const resultsBody = document.getElementById('report-results-body');
-            if(filteredPatients.length > 0) {
-                resultsBody.innerHTML = filteredPatients.map(p => {
-                    const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
-                    const lastSurvey = p.surveyResults && p.surveyResults.length > 0 ? p.surveyResults[p.surveyResults.length - 1] : null;
-                    const outcome = lastSurvey ? lastSurvey.outcome : 'N/A';
-                    const outcomeColor = outcome === 'Pass' ? 'text-green-500' : outcome === 'Fail' ? 'text-red-500' : '';
-                    return `
-                        <tr>
-                            <td class="px-6 py-4 whitespace-nowrap">${phiName(p)}</td>
-                            <td class="px-6 py-4 whitespace-nowrap">${phi(p.age != null ? String(p.age) : 'N/A')}</td>
-                            <td class="px-6 py-4 whitespace-nowrap">${p.status || 'N/A'}</td>
-                            <td class="px-6 py-4 whitespace-nowrap">${currentEnrollment ? state.studies.find(s => s.id === currentEnrollment.studyId)?.title || 'N/A' : 'N/A'}</td>
-                            <td class="px-6 py-4 whitespace-nowrap">${currentEnrollment ? state.sites.find(s => s.id === currentEnrollment.siteId)?.name || 'N/A' : 'N/A'}</td>
-                            <td class="px-6 py-4 whitespace-nowrap">${p.appointment ? phi(new Date(p.appointment.time).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' })) : 'Not Scheduled'}</td>
-                            <td class="px-6 py-4 whitespace-nowrap font-semibold ${outcomeColor}">${outcome}</td>
-                        </tr>
-                    `;
-                }).join('');
-                if (exportBtn) exportBtn.disabled = false;
-                if (exportSurveysBtn) exportSurveysBtn.disabled = false;
-                if (exportFive9Btn) exportFive9Btn.disabled = false;
-            } else {
-                resultsBody.innerHTML = `<tr><td colspan="7" class="text-center text-gray-500 dark:text-gray-400 py-8">No patients match the selected criteria.</td></tr>`;
-                if (exportBtn) exportBtn.disabled = true;
-                if (exportSurveysBtn) exportSurveysBtn.disabled = true;
-                if (exportFive9Btn) exportFive9Btn.disabled = true;
-            }
-            // Calculate and display metrics
-            const metricsContainer = document.getElementById('report-metrics');
-            const total = filteredPatients.length;
-            const avgAge = total > 0 ? (filteredPatients.reduce((sum, p) => sum + (p.age || 0), 0) / filteredPatients.filter(p => p.age).length).toFixed(1) : 'N/A';
-            const scheduled = filteredPatients.filter(p => p.appointment).length;
-            const studyRosterCount = (data.studyId && data.studyId !== 'all')
-                ? (state.patients || []).filter(p => patientBelongsToStudy(p, data.studyId)).length
-                : null;
-            metricsContainer.innerHTML = `
-                <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md text-center"><p class="text-sm text-gray-500 dark:text-gray-400">Total Patients</p><p class="text-2xl font-bold dark:text-white">${total}</p>${studyRosterCount != null ? `<p class="text-xs text-gray-500 mt-1">${studyRosterCount} on study roster</p>` : ''}</div>
-                <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md text-center"><p class="text-sm text-gray-500 dark:text-gray-400">Average Age</p><p class="text-2xl font-bold dark:text-white">${avgAge}</p></div>
-                <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md text-center"><p class="text-sm text-gray-500 dark:text-gray-400">Scheduled</p><p class="text-2xl font-bold dark:text-white">${scheduled}</p></div>
-                <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md text-center"><p class="text-sm text-gray-500 dark:text-gray-400">Not Scheduled</p><p class="text-2xl font-bold dark:text-white">${total - scheduled}</p></div>
-            `;
-            lucide.createIcons();
+            const surveyCompleted = !!form.querySelector('[name="surveyCompleted"]')?.checked;
+            const result = applyReportFilters(data, { surveyCompleted });
+            state.lastReportDateStart = result.startDate;
+            state.lastReportDateEnd = result.endDate;
+            state.lastReportData = result.patients;
+            state.lastReportMeta = { studyId: result.studyId, siteId: result.siteId, startDate: result.startDate, endDate: result.endDate };
+            renderReportResults(result.patients, state.lastReportMeta);
             break;
         }
         case 'edit-past-enrollment-form': {
