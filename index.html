@@ -3332,50 +3332,185 @@
 
         const findAnswerForQuestion = (response, question) => {
             const answers = asSurveyList(response?.answers);
-            const qid = question?.id;
-            const a = answers.find(x => x && (x.questionId === qid || String(x.questionId) === String(qid)
-                || (x.label && question?.label && String(x.label).trim() === String(question.label).trim())));
+            const qid = question?.id != null ? String(question.id) : '';
+            const libId = question?.libraryQuestionId ? String(question.libraryQuestionId) : '';
+            const qLabel = normalizeSurveyDeltaLabel(question?.label || question?.title);
+            let a = answers.find((x) => x && qid && String(x.questionId ?? x.id ?? '') === qid);
+            if (!a && libId) {
+                a = answers.find((x) => x && (
+                    String(x.libraryQuestionId || '') === libId
+                    || String(x.questionId ?? '') === libId
+                ));
+            }
+            if (!a && qLabel) {
+                a = answers.find((x) => x && normalizeSurveyDeltaLabel(x.label || x.title) === qLabel);
+            }
             if (!a) return { skipped: true, value: '' };
             if (a.skipped && (a.value == null || String(a.value).trim() === '')) return { skipped: true, value: '' };
-            const value = normalizeSponsorAnswerValue(a.value, question);
+            const raw = a.value != null ? a.value : readSurveyAnswerValue(a);
+            const value = normalizeSponsorAnswerValue(raw, question);
             if (!value) return { skipped: true, value: '' };
             return { skipped: false, value };
+        };
+
+        /**
+         * Merge newest filled answers for a site onto a question list (id → library → label).
+         * Used so Reporting/export shows what sites already answered even when the new GF
+         * template reused library questions under new question ids.
+         */
+        const buildMergedFeasibilityAnswersForSite = (siteId, questions, { preferSurveyId = '', preferRole = 'all', crossSurvey = true } = {}) => {
+            const ids = siteIdsForSurveyLookup(siteId);
+            const roleFilter = String(preferRole || 'all').trim().toLowerCase();
+            const preferSid = String(preferSurveyId || '');
+            let responses = (allSiteSurveyResponses || [])
+                .filter((r) => r && !r._archived && ids.has(r.siteId));
+            if (!crossSurvey && preferSid) {
+                responses = responses.filter((r) => r.surveyId === preferSid);
+            }
+            if (roleFilter && roleFilter !== 'all') {
+                responses = responses.filter((r) => String(r.targetRole || '').toLowerCase() === roleFilter);
+            }
+            responses = responses.slice().sort((a, b) => {
+                const aPref = preferSid && a.surveyId === preferSid ? 0 : 1;
+                const bPref = preferSid && b.surveyId === preferSid ? 0 : 1;
+                if (aPref !== bPref) return aPref - bPref;
+                return String(b.submittedAt || b.updatedAt || b.createdAt || '')
+                    .localeCompare(String(a.submittedAt || a.updatedAt || a.createdAt || ''));
+            });
+
+            const byId = new Map();
+            const byLib = new Map();
+            const byLabel = new Map();
+            const put = (map, key, entry) => {
+                if (!key || map.has(key)) return;
+                map.set(key, entry);
+            };
+            responses.forEach((resp) => {
+                asSurveyList(resp.answers).forEach((a) => {
+                    const val = readSurveyAnswerValue(a);
+                    if (!val) return;
+                    const entry = {
+                        value: val,
+                        type: a.type || 'text',
+                        label: a.label || a.title || '',
+                        questionId: String(a.questionId ?? a.id ?? ''),
+                        libraryQuestionId: a.libraryQuestionId ? String(a.libraryQuestionId) : '',
+                        surveyId: resp.surveyId,
+                        responseId: resp.id,
+                        submittedAt: resp.submittedAt || resp.updatedAt || resp.createdAt || '',
+                        targetRole: resp.targetRole,
+                        score: resp.score,
+                    };
+                    put(byId, entry.questionId, entry);
+                    put(byLib, entry.libraryQuestionId, entry);
+                    put(byLabel, normalizeSurveyDeltaLabel(entry.label), entry);
+                });
+            });
+
+            const answers = [];
+            let latestWhen = '';
+            let latestRole = '';
+            let latestScore = null;
+            let latestResponseId = null;
+            let filled = 0;
+            asSurveyList(questions).forEach((q) => {
+                const qid = String(q?.id || '');
+                if (!qid) return;
+                const lib = q.libraryQuestionId ? String(q.libraryQuestionId) : '';
+                const lab = normalizeSurveyDeltaLabel(q.label || q.title);
+                const hit = (qid && byId.get(qid))
+                    || (lib && byLib.get(lib))
+                    || (lab && byLabel.get(lab))
+                    || null;
+                if (!hit) return;
+                filled += 1;
+                answers.push({
+                    questionId: qid,
+                    libraryQuestionId: lib || hit.libraryQuestionId || undefined,
+                    label: q.label || q.title || hit.label,
+                    type: q.type || hit.type || 'text',
+                    value: hit.value,
+                });
+                if (hit.submittedAt && hit.submittedAt > latestWhen) {
+                    latestWhen = hit.submittedAt;
+                    latestRole = hit.targetRole || latestRole;
+                    latestScore = hit.score || latestScore;
+                    latestResponseId = hit.responseId || latestResponseId;
+                }
+            });
+
+            const primary = responses.find((r) => preferSid && r.surveyId === preferSid) || responses[0] || null;
+            return {
+                answers,
+                filled,
+                when: latestWhen || primary?.submittedAt || primary?.createdAt || '',
+                targetRole: latestRole || primary?.targetRole || '',
+                score: (preferSid && primary?.surveyId === preferSid ? primary.score : null) || latestScore || primary?.score || null,
+                responseId: (preferSid && primary?.surveyId === preferSid ? primary.id : null) || latestResponseId || primary?.id || `merged-${siteId}`,
+                primaryResponse: primary,
+                responseCount: responses.length,
+            };
         };
 
         const buildFeasibilityQuestionReport = (surveyId, targetRole = 'all') => {
             const def = (allSiteSurveyDefinitions || []).find(d => d && d.id === surveyId) || null;
             const questions = asSurveyList(def?.questions);
             const roleFilter = String(targetRole || 'all').trim().toLowerCase();
+            const isGf = surveyId === 'survey-general-feasibility'
+                || surveyId === 'survey-general-feasibility-short';
 
-            let responses = (allSiteSurveyResponses || []).filter(r =>
-                r && !r._archived && r.surveyId === surveyId
-            );
-            if (roleFilter && roleFilter !== 'all') {
-                responses = responses.filter(r => String(r.targetRole || '').toLowerCase() === roleFilter);
-            }
+            // All sites that ever answered something we can map onto this survey's questions.
+            const siteIdSet = new Set();
+            (allSiteSurveyResponses || []).forEach((r) => {
+                if (!r || r._archived || !r.siteId) return;
+                if (roleFilter && roleFilter !== 'all'
+                    && String(r.targetRole || '').toLowerCase() !== roleFilter) return;
+                if (isGf || r.surveyId === surveyId) siteIdSet.add(r.siteId);
+            });
+            // Canonicalize legacy aliases → live site id when possible
+            const canonicalSites = new Set();
+            siteIdSet.forEach((sid) => {
+                const live = (allSites || []).find((s) => s && (
+                    s.id === sid
+                    || (Array.isArray(s.legacySiteIds) && s.legacySiteIds.includes(sid))
+                    || s.promotedFromLegacySiteId === sid
+                ));
+                canonicalSites.add(live?.id || sid);
+            });
 
-            const bySite = new Map();
-            responses
-                .slice()
-                .sort((a, b) => String(b.submittedAt || b.createdAt || '').localeCompare(String(a.submittedAt || a.createdAt || '')))
-                .forEach(r => {
-                    if (!r.siteId) return;
-                    if (!bySite.has(r.siteId)) bySite.set(r.siteId, r);
+            const siteRows = [];
+            canonicalSites.forEach((siteId) => {
+                const merged = buildMergedFeasibilityAnswersForSite(siteId, questions, {
+                    preferSurveyId: surveyId,
+                    preferRole: roleFilter,
+                    crossSurvey: isGf,
                 });
-
-            const siteRows = Array.from(bySite.entries()).map(([siteId, response]) => {
+                if (!merged.filled) return;
+                const response = {
+                    id: merged.responseId,
+                    siteId,
+                    surveyId,
+                    targetRole: merged.targetRole,
+                    submittedAt: merged.when,
+                    createdAt: merged.when,
+                    answers: merged.answers,
+                    score: merged.score,
+                    _mergedFromPrior: true,
+                    _sourceResponseCount: merged.responseCount,
+                };
                 const outcome = resolveScoreOutcome(response?.score, def);
                 const pct = typeof response?.score?.pct === 'number' ? response.score.pct : null;
                 const knockouts = Array.isArray(response?.score?.knockouts) ? response.score.knockouts : [];
-                return {
+                siteRows.push({
                     siteId,
-                    siteName: resolveSponsorSiteDisplayName(siteId, response),
+                    siteName: resolveSponsorSiteDisplayName(siteId, merged.primaryResponse || response),
                     response,
-                    when: response.submittedAt || response.createdAt || '',
+                    when: merged.when || '',
                     outcome,
                     pct,
                     knockouts,
-                };
+                    answeredCount: merged.filled,
+                });
             });
 
             const outcomeRank = { pass: 0, borderline: 1, fail: 2, unscored: 3 };
@@ -3565,7 +3700,7 @@
                 return `<div class="text-sm text-gray-500 dark:text-gray-400 py-6 text-center">This survey has no questions.</div>`;
             }
             if (!report.siteRows.length) {
-                return `<div class="text-sm text-gray-500 dark:text-gray-400 py-6 text-center">No responses yet for this survey${feasibilityReportRole !== 'all' ? ` (${escapeHtml(formatSiteSurveyRoleLabel(feasibilityReportRole))})` : ''}.</div>`;
+                return `<div class="text-sm text-gray-500 dark:text-gray-400 py-6 text-center">No answered feasibility fields on file yet${feasibilityReportRole !== 'all' ? ` (${escapeHtml(formatSiteSurveyRoleLabel(feasibilityReportRole))})` : ''}.</div>`;
             }
 
                 const distHtml = report.questionStats.map((stat, idx) => {
@@ -3654,7 +3789,7 @@
                 <h4 class="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">Answer distributions</h4>
                 <div class="space-y-3 mb-6">${distHtml}</div>
                 <h4 class="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">Site × question matrix</h4>
-                <p class="text-xs text-gray-500 dark:text-gray-400 mb-2">Latest response per site (ranked by outcome). Use Export CSV for full cell values.</p>
+                <p class="text-xs text-gray-500 dark:text-gray-400 mb-2">One row per site with any known answers (prior Long/Short mapped by library id / label). Use Export everyone for the full spreadsheet.</p>
                 <div class="overflow-x-auto border border-gray-200 dark:border-gray-700 rounded-lg">
                     <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
                         <thead class="bg-gray-50 dark:bg-gray-700"><tr>${matrixHead}</tr></thead>
@@ -3693,24 +3828,26 @@
                 const lines = [];
                 if (mode === 'long') {
                     lines.push(['Generated', new Date().toISOString()].map(csvEscapeCell).join(','));
-                    lines.push(['Site', 'SiteId', 'Role', 'SubmittedAt', 'Question', 'Answer'].map(csvEscapeCell).join(','));
+                    lines.push(['Site', 'SiteId', 'Role', 'SubmittedAt', 'AnsweredCount', 'Question', 'Answer'].map(csvEscapeCell).join(','));
                     report.siteRows.forEach(row => {
                         report.questions.forEach(q => {
-                            const { value } = findAnswerForQuestion(row.response, q);
+                            const { value, skipped } = findAnswerForQuestion(row.response, q);
+                            if (skipped || !value) return;
                             lines.push([
                                 row.siteName,
                                 row.siteId,
                                 formatSiteSurveyRoleLabel(row.response.targetRole),
                                 row.when || '',
+                                row.answeredCount ?? '',
                                 q.label || q.id || '',
                                 value
                             ].map(csvEscapeCell).join(','));
                         });
                     });
-                    downloadCsvText(`feasibility_${safeTitle}_long_${generatedStamp}.csv`, lines.join('\n'));
+                    downloadCsvText(`feasibility_${safeTitle}_answered_${generatedStamp}.csv`, lines.join('\n'));
                 } else {
                     lines.push(['Generated', new Date().toISOString()].map(csvEscapeCell).join(','));
-                    const headers = ['Site', 'SiteId', 'Role', 'SubmittedAt', ...report.questions.map(q => q.label || q.id || '')];
+                    const headers = ['Site', 'SiteId', 'Role', 'SubmittedAt', 'AnsweredCount', ...report.questions.map(q => q.label || q.id || '')];
                     lines.push(headers.map(csvEscapeCell).join(','));
                     report.siteRows.forEach(row => {
                         const cells = report.questions.map(q => findAnswerForQuestion(row.response, q).value);
@@ -3719,12 +3856,16 @@
                             row.siteId,
                             formatSiteSurveyRoleLabel(row.response.targetRole),
                             row.when || '',
+                            row.answeredCount ?? cells.filter(Boolean).length,
                             ...cells
                         ].map(csvEscapeCell).join(','));
                     });
-                    downloadCsvText(`feasibility_${safeTitle}_matrix_${generatedStamp}.csv`, lines.join('\n'));
+                    downloadCsvText(`feasibility_${safeTitle}_everyone_${generatedStamp}.csv`, lines.join('\n'));
                 }
-                showNotification('Feasibility CSV downloaded.', 'success');
+                showNotification(
+                    `Exported ${report.siteRows.length} site${report.siteRows.length === 1 ? '' : 's'} × ${report.questions.length} questions.`,
+                    'success'
+                );
             } catch (err) {
                 console.error(err);
                 showNotification('Failed to export feasibility CSV.', 'error');
@@ -5983,7 +6124,7 @@
                                     <div>
                                         <label class="block text-sm font-medium text-gray-800 dark:text-gray-100">Data type (collection)</label>
                                         <select name="q_type_${idx}" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2">
-                                            ${['select','radio','multiselect','text','textarea','number','date'].map(t => `<option value="${t}" ${qType===t?'selected':''}>${typeLabels[t] || t}</option>`).join('')}
+                                            ${['select','radio','multiselect','rating','text','textarea','number','date'].map(t => `<option value="${t}" ${qType===t?'selected':''}>${typeLabels[t] || t}</option>`).join('')}
                                         </select>
                                         <p class="text-[11px] text-gray-500 dark:text-gray-400 mt-1">Controls how answers are stored and compared across surveys.</p>
                                     </div>
@@ -6881,7 +7022,7 @@
 
                                     <h3 class="text-lg font-semibold text-gray-800 dark:text-gray-200">Sponsor feasibility pack</h3>
 
-                                    <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Answer distributions and site × question matrix. Export a polished pack for sponsors.</p>
+                                    <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">All sites with answers on file — including prior Long/Short responses mapped onto the current question set. Export CSV for everyone, or a polished pack for sponsors.</p>
 
                                 </div>
 
@@ -6911,15 +7052,17 @@
 
                                     </label>
 
+                                    <button type="button" id="feasibility-export-everyone-btn" class="px-3 py-2 rounded-md text-white text-sm hover:opacity-90" style="background-color:#1B2A4A">Export everyone (CSV)</button>
+
+                                    <button type="button" id="feasibility-export-long-btn" class="px-3 py-2 rounded-md border border-gray-300 dark:border-gray-600 text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700">Answered only (long)</button>
+
                                     <button type="button" id="feasibility-sponsor-pdf-btn" class="px-3 py-2 rounded-md text-white text-sm hover:opacity-90" style="background-color:#0F6E56">Sponsor PDF</button>
 
                                     <button type="button" id="feasibility-sponsor-excel-btn" class="px-3 py-2 rounded-md border border-gray-300 dark:border-gray-600 text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700">Sponsor Excel</button>
 
                                     <button type="button" id="feasibility-ops-html-btn-toolbar" class="px-3 py-2 rounded-md border border-[#1B2A4A] text-sm text-[#1B2A4A] dark:text-indigo-200 hover:bg-gray-50 dark:hover:bg-gray-700">Site Ops HTML</button>
 
-                                    <button type="button" id="feasibility-export-wide-btn" class="px-3 py-2 rounded-md border border-gray-300 dark:border-gray-600 text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700">CSV</button>
-
-                                    <button type="button" id="feasibility-export-long-btn" class="px-3 py-2 rounded-md border border-gray-300 dark:border-gray-600 text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700">Long CSV</button>
+                                    <button type="button" id="feasibility-export-wide-btn" class="px-3 py-2 rounded-md border border-gray-300 dark:border-gray-600 text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700">CSV (selected)</button>
 
                                 </div>
 
@@ -12230,11 +12373,18 @@
             if (e.target.id === 'export-surveys-btn') {
                 exportSurveysToCSV();
             }
+            if (e.target.id === 'feasibility-export-everyone-btn') {
+                exportFeasibilitySurveyCsv({
+                    surveyId: 'survey-general-feasibility',
+                    mode: 'wide',
+                    targetRole: 'all'
+                });
+            }
             if (e.target.id === 'feasibility-export-wide-btn') {
                 const surveySel = document.getElementById('feasibility-survey-select');
                 const roleSel = document.getElementById('feasibility-role-select');
                 exportFeasibilitySurveyCsv({
-                    surveyId: surveySel?.value || feasibilityReportSurveyId,
+                    surveyId: surveySel?.value || feasibilityReportSurveyId || 'survey-general-feasibility',
                     mode: 'wide',
                     targetRole: roleSel?.value || feasibilityReportRole
                 });
@@ -12243,9 +12393,9 @@
                 const surveySel = document.getElementById('feasibility-survey-select');
                 const roleSel = document.getElementById('feasibility-role-select');
                 exportFeasibilitySurveyCsv({
-                    surveyId: surveySel?.value || feasibilityReportSurveyId,
+                    surveyId: surveySel?.value || feasibilityReportSurveyId || 'survey-general-feasibility',
                     mode: 'long',
-                    targetRole: roleSel?.value || feasibilityReportRole
+                    targetRole: roleSel?.value || feasibilityReportRole || 'all'
                 });
             }
             if (e.target.id === 'feasibility-sponsor-excel-btn' || e.target.id === 'comms-sponsor-excel-btn') {
