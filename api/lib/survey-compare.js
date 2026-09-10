@@ -11,27 +11,23 @@ const GENERAL_FEASIBILITY_SURVEY_IDS = new Set([
 
 /** Compact GF uses the same question ids as Long so prefill/deltas stay aligned. */
 const GENERAL_FEASIBILITY_SHORT_QUESTION_IDS = [
+    'gf_01_date-of-response',
     'gf_02_site-name',
-    'gf_03_address',
-    'gf_04_phone',
-    'gf_05_practice-setting',
-    'gf_06_investigators',
-    'gf_07_investigator-1',
-    'gf_08_inv-1-credentials',
-    'gf_09_inv-1-email',
-    'gf_10_inv-1-specialties',
-    'gf_11_experience-yrs',
+    'gf_00_name',
+    'gsf_005_respondent-email',
     'gf_15_research-contact',
     'gf_16_poc-email',
     'gf_17_poc-role',
-    'gf_18_site-coordinators',
+    'gf_03_address',
+    'gf_05_practice-setting',
     'gf_19_research-experience',
     'gf_20_please-indicate-the-types-of-ophthalmic-studies-your-sit',
+    'gf_06_investigators',
+    'gsf_028_which-ophthalmic-indications-does-your-site-mana',
     'gf_25_equipment',
     'gf_29_central-irb',
     'gf_30_contracting-contact',
-    'gf_31_trials-last-12-mo',
-    'gf_32_enrolled-last-12-mo',
+    'gsf_091_contracting-budgeting-contact-email',
 ];
 
 function normalizeGeneralFeasibilityVariant(raw) {
