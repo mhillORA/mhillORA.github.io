@@ -105,7 +105,12 @@ function mergeAnswers(incoming, priorAnswers) {
         if (!hasValue) {
             const prev = oldAnswerMap.get(String(a.questionId ?? ''));
             if (prev && !prev.skipped && String(prev.value ?? '').trim() !== '') {
-                return { ...a, value: prev.value, _keptFromPrior: true };
+                return {
+                    ...a,
+                    value: prev.value,
+                    confirmed: a.confirmed ?? prev.confirmed,
+                    _keptFromPrior: true,
+                };
             }
         }
         return a;

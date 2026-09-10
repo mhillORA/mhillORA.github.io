@@ -166,7 +166,10 @@ def infer_type_and_options(header: str, values: list[str | None]):
     if uniq and all(u.lower() in YES_NO for u in uniq):
         return "select", ["Yes", "No"]
     maxlen = max((len(v) for v in filled), default=0)
-    if any(k in h for k in ("equipment", "patient identification", "sponsor", "specialt", "practice setting", "types of ophthalmic")):
+    if any(k in h for k in ("equipment",)):
+        # Options come from Monday multi-select; keep catalog in update_gf_equipment_multiselect.py
+        return "multiselect", []
+    if any(k in h for k in ("patient identification", "sponsor", "specialt", "practice setting", "types of ophthalmic")):
         return "textarea", []
     if filled and maxlen > 90:
         return "textarea", []

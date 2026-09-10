@@ -537,14 +537,21 @@ function registerSurveySecureRoutes(app, deps) {
             if (questions.length) {
                 const byId = new Map(answers.map((a) => [String(a.questionId), a]));
                 const missing = [];
+                const unconfirmed = [];
                 for (const q of questions) {
                     // Default required; branching rows marked skipped when not qualified
                     if (q.required === false) continue;
                     const a = byId.get(String(q.id));
                     if (a?.skipped) continue;
                     const val = a?.value ?? a?.answer ?? a?.answerText;
-                    if (val == null || String(val).trim() === '') {
+                    const empty = val == null
+                        || (Array.isArray(val) ? val.length === 0 : String(val).trim() === '');
+                    if (empty) {
                         missing.push(q.label || q.id);
+                        continue;
+                    }
+                    if (!a?.confirmed) {
+                        unconfirmed.push(q.label || q.id);
                     }
                 }
                 if (missing.length) {
@@ -553,6 +560,16 @@ function registerSurveySecureRoutes(app, deps) {
                         jsonBody: {
                             error: 'Please complete required questions',
                             missing,
+                        },
+                        headers: corsHeaders(),
+                    };
+                }
+                if (unconfirmed.length) {
+                    return {
+                        status: 400,
+                        jsonBody: {
+                            error: 'Please confirm each answer is correct',
+                            unconfirmed,
                         },
                         headers: corsHeaders(),
                     };

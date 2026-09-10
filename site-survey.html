@@ -197,6 +197,37 @@
       background: #fff;
     }
 
+    .check-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 6px;
+      padding: 10px 12px;
+      background: var(--gray-50);
+      border: 1px solid var(--gray-300);
+      border-radius: 5px;
+    }
+    @media (min-width: 720px) {
+      .check-grid { grid-template-columns: 1fr 1fr; }
+    }
+    .check-grid label {
+      display: flex; gap: 8px; align-items: flex-start;
+      font-size: 12.5px; color: var(--navy); line-height: 1.4;
+      cursor: pointer;
+    }
+    .check-grid input[type="checkbox"] {
+      margin-top: 2px; flex-shrink: 0; width: 15px; height: 15px;
+    }
+    .q-confirm {
+      display: flex; gap: 8px; align-items: flex-start;
+      margin-top: 10px; padding: 8px 10px;
+      border: 1px dashed var(--gray-300); border-radius: 5px;
+      background: #fff;
+      font-size: 12px; color: var(--gray-600); line-height: 1.4;
+      cursor: pointer;
+    }
+    .q-confirm input { margin-top: 2px; flex-shrink: 0; width: 14px; height: 14px; }
+    .q-confirm strong { color: var(--navy); font-weight: 600; }
+
     .hint-box {
       font-size: 12px; color: var(--gray-500); margin-top: 8px;
       padding: 10px 12px; background: var(--gray-50); border-radius: 8px;
@@ -355,9 +386,34 @@
       return form.querySelector(`[name="${String(name).replace(/"/g, '\\"')}"]`);
     }
 
+    function parseMultiDefaults(defaultVal) {
+      if (Array.isArray(defaultVal)) {
+        return defaultVal.map((x) => String(x || '').trim()).filter(Boolean);
+      }
+      const raw = String(defaultVal ?? '').trim();
+      if (!raw) return [];
+      return raw.split(',').map((x) => x.trim()).filter(Boolean);
+    }
+
     function fieldControl(q, id, defaultVal, reqNative, reqDeferred) {
       const type = (q.type || 'text').toLowerCase();
       const val = defaultVal ?? '';
+      if (type === 'multiselect' || type === 'checkboxes' || type === 'checkbox') {
+        const opts = Array.isArray(q.options) ? q.options : [];
+        const selected = new Set(parseMultiDefaults(val));
+        const reqAttr = (reqNative || reqDeferred)
+          ? 'data-required-when-visible="true" data-multiselect="true"'
+          : 'data-multiselect="true"';
+        return `<div class="check-grid" role="group" aria-label="${escapeHtml(q.label || id)}" ${reqAttr} data-qid-group="${escapeHtml(id)}">
+          ${opts.map((o, oi) => {
+            const v = typeof o === 'string' ? o : (o.value ?? o.label ?? '');
+            const lbl = typeof o === 'string' ? o : (o.label ?? o.value ?? '');
+            const cid = `${id}__opt_${oi}`;
+            const checked = selected.has(String(v)) ? 'checked' : '';
+            return `<label for="${escapeHtml(cid)}"><input id="${escapeHtml(cid)}" type="checkbox" name="${escapeHtml(id)}" value="${escapeHtml(v)}" ${checked} /> <span>${escapeHtml(lbl)}</span></label>`;
+          }).join('') || '<div class="hint-box">No equipment options configured.</div>'}
+        </div>`;
+      }
       if (type === 'textarea') {
         return `<textarea id="${escapeHtml(id)}" name="${escapeHtml(id)}" rows="3" ${reqNative} ${reqDeferred} placeholder="Your answer">${escapeHtml(val)}</textarea>`;
       }
@@ -388,21 +444,49 @@
         let show = true;
         if (dep) {
           const want = row.getAttribute('data-show-if-equals') ?? '';
-          const ctrl = qsByName(form, dep);
-          show = String(ctrl?.value || '').trim() === String(want).trim();
+          const multi = form.querySelector(`[data-qid-group="${CSS.escape ? CSS.escape(dep) : dep}"]`);
+          let current = '';
+          if (multi) {
+            current = [...form.querySelectorAll(`input[type="checkbox"][name="${CSS.escape ? CSS.escape(dep) : dep}"]:checked`)]
+              .map((el) => el.value)
+              .join(', ');
+          } else {
+            const ctrl = qsByName(form, dep);
+            current = String(ctrl?.value || '').trim();
+          }
+          show = current === String(want).trim();
         }
         row.classList.toggle('hidden', !show);
         row.querySelectorAll('[data-required-when-visible="true"]').forEach((input) => {
+          if (input.type === 'checkbox' || input.getAttribute('data-multiselect') === 'true') return;
           input.required = show;
         });
       });
       updateProgress(form);
     }
 
+    function readQuestionValue(form, q, id) {
+      const type = (q.type || 'text').toLowerCase();
+      if (type === 'multiselect' || type === 'checkboxes' || type === 'checkbox') {
+        const checked = [...form.querySelectorAll(`input[type="checkbox"][name="${CSS.escape ? CSS.escape(id) : id.replace(/"/g, '\\"')}"]:checked`)]
+          .map((el) => String(el.value || '').trim())
+          .filter(Boolean);
+        return checked.join(', ');
+      }
+      const fd = new FormData(form);
+      const v = fd.get(id);
+      return v == null ? '' : String(v);
+    }
+
     function updateProgress(form) {
       const rows = [...form.querySelectorAll('.q')].filter((r) => !r.classList.contains('hidden'));
       const filled = rows.filter((r) => {
-        const field = r.querySelector('[name]');
+        const qid = r.getAttribute('data-qid');
+        const multi = r.querySelector('[data-multiselect="true"]');
+        if (multi) {
+          return r.querySelectorAll(`input[type="checkbox"][name="${CSS.escape ? CSS.escape(qid) : qid}"]:checked`).length > 0;
+        }
+        const field = r.querySelector(`[name="${CSS.escape ? CSS.escape(qid) : qid}"]`);
         return field && String(field.value || '').trim() !== '';
       }).length;
       const pct = rows.length ? Math.round((filled / rows.length) * 100) : 0;
@@ -413,11 +497,11 @@
     }
 
     function collectAnswers(form, questions) {
-      const fd = new FormData(form);
       return questions.map((q, idx) => {
         const id = q.id || `q_${idx}`;
         const row = form.querySelector(`.q[data-qid="${CSS.escape ? CSS.escape(id) : id}"]`);
         const visible = row ? !row.classList.contains('hidden') : true;
+        const confirmEl = row?.querySelector(`input[name="${CSS.escape ? CSS.escape(id + '__confirmed') : id + '__confirmed'}"]`);
         return {
           questionId: id,
           label: q.label || q.title || `Question ${idx + 1}`,
@@ -425,7 +509,8 @@
           libraryQuestionId: q.libraryQuestionId || undefined,
           sensitivity: q.sensitivity || 'none',
           skipped: !visible,
-          value: visible ? fd.get(id) : null,
+          value: visible ? readQuestionValue(form, q, id) : null,
+          confirmed: visible ? !!confirmEl?.checked : false,
         };
       });
     }
@@ -485,8 +570,8 @@
       el.intro.hidden = false;
       el.intro.className = 'intro';
       el.intro.innerHTML = hasPrior
-        ? `Fields below are <strong>prefilled from prior answers</strong> when we have them on file. Change only what is out of date, then submit. Branching questions appear only when you qualify.`
-        : `Complete the questions below. All visible questions are required. Save a draft anytime — you can return with this same secure link before it expires.`;
+        ? `Fields below are <strong>prefilled from prior answers</strong> when we have them on file. Change only what is out of date, <strong>confirm each field</strong>, then submit. Branching questions appear only when you qualify.`
+        : `Complete the questions below. All visible questions are required. Confirm each answer is correct before submit. Save a draft anytime — you can return with this same secure link before it expires.`;
 
       const expiryBanner = (() => {
         if (!assignment.expiresAt) return '';
@@ -539,11 +624,16 @@
         const { reqHtml, reqNative, reqDeferred } = reqBits(q);
         const help = q.help || q.context || q.description || '';
         const gf = q.fromGeneralFeasibility ? '<div class="q-context">General Feasibility</div>' : '';
+        const confirmId = `${qid}__confirmed`;
         return `<div class="question q" data-qid="${escapeHtml(qid)}" ${logicAttrs(q)}>
           <div class="q-text">${escapeHtml(label)}${reqHtml}</div>
           ${gf}
           ${help ? `<div class="q-context">${escapeHtml(help)}</div>` : ''}
           ${fieldControl(q, qid, pre, reqNative, reqDeferred)}
+          <label class="q-confirm" for="${escapeHtml(confirmId)}">
+            <input id="${escapeHtml(confirmId)}" type="checkbox" name="${escapeHtml(confirmId)}" data-confirm-for="${escapeHtml(qid)}" />
+            <span><strong>Confirm</strong> this information is correct</span>
+          </label>
         </div>`;
       }).join('');
 
@@ -586,26 +676,59 @@
       const submitBtn = document.getElementById('submit-btn');
 
       syncLogic(form);
-      form.addEventListener('input', () => syncLogic(form));
-      form.addEventListener('change', () => syncLogic(form));
+      form.addEventListener('input', (e) => {
+        const t = e.target;
+        if (t && t.matches && t.matches('input:not([data-confirm-for]), select, textarea')) {
+          const row = t.closest('.q');
+          const confirmEl = row?.querySelector('input[data-confirm-for]');
+          if (confirmEl) confirmEl.checked = false;
+        }
+        syncLogic(form);
+      });
+      form.addEventListener('change', (e) => {
+        const t = e.target;
+        if (t && t.matches && t.matches('input:not([data-confirm-for]), select, textarea')) {
+          const row = t.closest('.q');
+          const confirmEl = row?.querySelector('input[data-confirm-for]');
+          if (confirmEl) confirmEl.checked = false;
+        }
+        syncLogic(form);
+      });
 
       const post = async (action) => {
         formError.innerHTML = '';
         syncLogic(form);
         if (action === 'submit') {
           const missing = [];
+          const unconfirmed = [];
           form.querySelectorAll('.q').forEach((row) => {
             if (row.classList.contains('hidden')) return;
-            const field = row.querySelector('[name]');
-            if (!field) return;
-            const need = field.required || field.getAttribute('data-required-when-visible') === 'true';
-            if (need && !String(field.value || '').trim()) {
-              const label = row.querySelector('.q-text')?.textContent || field.name;
-              missing.push(label.replace('*', '').trim());
+            const qid = row.getAttribute('data-qid');
+            const label = (row.querySelector('.q-text')?.textContent || qid || '').replace('*', '').trim();
+            const multi = row.querySelector('[data-multiselect="true"]');
+            if (multi && multi.getAttribute('data-required-when-visible') === 'true') {
+              const n = row.querySelectorAll(`input[type="checkbox"][name="${CSS.escape ? CSS.escape(qid) : qid}"]:checked`).length;
+              if (!n) missing.push(label);
+            } else {
+              const field = row.querySelector(`[name="${CSS.escape ? CSS.escape(qid) : qid}"]`);
+              if (!field) return;
+              const need = field.required || field.getAttribute('data-required-when-visible') === 'true';
+              if (need && !String(field.value || '').trim()) missing.push(label);
             }
+            const confirmEl = row.querySelector('input[data-confirm-for]');
+            if (confirmEl && !confirmEl.checked) unconfirmed.push(label);
           });
           if (missing.length) {
             formError.innerHTML = banner('Please complete required questions', missing.join('\n'), 'warn');
+            formError.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            return;
+          }
+          if (unconfirmed.length) {
+            formError.innerHTML = banner(
+              'Please confirm each answer',
+              'Check “Confirm this information is correct” on every visible question before submit.\n' + unconfirmed.join('\n'),
+              'warn'
+            );
             formError.scrollIntoView({ behavior: 'smooth', block: 'center' });
             return;
           }
