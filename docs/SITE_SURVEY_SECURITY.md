@@ -28,7 +28,7 @@ Legacy links `?assignmentId=` are rejected on the public page — use **Resend**
 
 | Variable | Purpose |
 |----------|---------|
-| `SURVEY_TOKEN_PEPPER` | Pepper for token hashing (falls back to `PRIVACY_OPS_KEY` / `COSMOS_KEY`) |
+| `SURVEY_TOKEN_PEPPER` | Pepper for token hashing (falls back to `PRIVACY_OPS_KEY` only — not `COSMOS_KEY`) |
 | `SURVEY_EMAIL_FROM` | From mailbox for Graph/SendGrid (see `docs/SURVEY_EMAIL_SETUP.md`) |
 | `AZURE_CLIENT_ID` / client secret | Graph `Mail.Send` (app permission + admin consent) |
 | `SENDGRID_API_KEY` | Optional SendGrid instead of Graph |
@@ -42,7 +42,8 @@ Legacy links `?assignmentId=` are rejected on the public page — use **Resend**
 - Mint: 32-byte `base64url` secret
 - Store: `SHA-256(pepper:raw)` as `tokenHash`, plus `tokenPrefix` for ops display
 - Raw token returned **once** at send/resend; rotate on resend
-- `expiresAt` default 30 days; `revokedAt` supported
+- `expiresAt` default **30 days** (ops can set 1–365 on send); soft advisory after that, hard cut at **expiresAt + 7 days**
+- `revokedAt` supported (immediate 410)
 
 ## Files
 

@@ -12,9 +12,12 @@ const {
     hashSurveyToken,
     defaultExpiresAt,
     isExpired,
+    isPastHardExpiry,
+    clampExpiresInDays,
     redactAssignment,
     buildInviteUrl,
     DEFAULT_TTL_DAYS,
+    EXPIRY_GRACE_DAYS,
 } = require('./lib/survey-tokens');
 const {
     answersToPrefillMap,
@@ -174,14 +177,23 @@ async function findAssignmentByToken(getContainer, rawToken) {
             { enableCrossPartitionQuery: true }
         )
         .fetchAll();
-    return resources && resources[0] ? resources[0] : null;
+    if (!resources || !resources.length) return null;
+    // Prefer newest invite if any duplicate hashes ever exist
+    return sortByIsoDesc(resources, ['inviteCreatedAt', 'updatedAt', 'createdAt'])[0];
 }
 
 function assertTokenUsable(assignment) {
     if (!assignment) return { status: 404, error: 'Invalid or unknown survey link.' };
-    if (assignment.revokedAt) return { status: 410, error: 'This survey link was revoked. Ask operations for a new link.' };
-    if (isExpired(assignment.expiresAt)) {
-        return { status: 410, error: 'This survey link has expired. Ask operations to resend.' };
+    if (assignment.revokedAt) {
+        return { status: 410, error: 'This survey link was revoked. Ask operations for a new link.' };
+    }
+    // Soft expiry at expiresAt is advisory. Hard cut = expiresAt + EXPIRY_GRACE_DAYS.
+    // Sites mid-form (or late to open) keep working until the hard cut; then Resend.
+    if (isPastHardExpiry(assignment.expiresAt, EXPIRY_GRACE_DAYS)) {
+        return {
+            status: 410,
+            error: 'This survey link has expired. Ask operations to resend a new link.',
+        };
     }
     return null;
 }
@@ -517,6 +529,9 @@ function registerSurveySecureRoutes(app, deps) {
             const questions = definition
                 ? await resolvePublicSurveyQuestions(getContainer, definition, {
                       generalFeasibilityVariant: assignment.generalFeasibilityVariant || 'long',
+                  }).catch((err) => {
+                      console.warn('public submit question resolve failed', err?.message || err);
+                      return [];
                   })
                 : [];
             if (questions.length) {
@@ -648,7 +663,7 @@ function registerSurveySecureRoutes(app, deps) {
                     ? body.targetRoles
                     : [body?.targetRole || 'pi'];
                 const targetRoles = [...new Set(rolesRaw.map(normalizeRole).filter(Boolean))];
-                const expiresInDays = body?.expiresInDays || DEFAULT_TTL_DAYS;
+                const expiresInDays = clampExpiresInDays(body?.expiresInDays ?? DEFAULT_TTL_DAYS);
                 const baseUrl = String(body?.baseUrl || '').replace(/\/$/, '');
                 const sendEmail = body?.sendEmail !== false;
                 const operator =
@@ -845,13 +860,13 @@ function registerSurveySecureRoutes(app, deps) {
                 assignment.lastSentAt = now;
                 assignment.sendCount = (assignment.sendCount || 0) + 1;
                 if (body.expiresInDays) {
-                    assignment.expiresAt = defaultExpiresAt(body.expiresInDays);
+                    assignment.expiresAt = defaultExpiresAt(clampExpiresInDays(body.expiresInDays));
                 } else if (!assignment.expiresAt || isExpired(assignment.expiresAt)) {
                     assignment.expiresAt = defaultExpiresAt(DEFAULT_TTL_DAYS);
                 }
 
                 const { inviteUrl } = attachInviteToken(assignment, {
-                    expiresInDays: body.expiresInDays,
+                    expiresInDays: clampExpiresInDays(body.expiresInDays || DEFAULT_TTL_DAYS),
                     baseUrl,
                 });
                 // attachInviteToken always sets expiresAt — preserve if we set above

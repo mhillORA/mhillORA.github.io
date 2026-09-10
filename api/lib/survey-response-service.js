@@ -386,8 +386,14 @@ async function resolvePublicSurveyQuestions(getContainer, definition, opts = {})
     }
     let genQs = [];
     if (variant !== 'none') {
-        const genDef = await loadGeneralFeasibilityDefinition(getContainer, variant);
-        genQs = Array.isArray(genDef?.questions) ? genDef.questions : [];
+        try {
+            const genDef = await loadGeneralFeasibilityDefinition(getContainer, variant);
+            genQs = Array.isArray(genDef?.questions) ? genDef.questions : [];
+        } catch (err) {
+            // Never blank the whole survey if GF template is missing/broken
+            console.warn('resolvePublicSurveyQuestions GF load failed', err?.message || err);
+            genQs = [];
+        }
     }
     const merged = mergeGeneralFeasibilityQuestions(studyQs, genQs, {
         studySurveyId: definition?.id,
@@ -464,7 +470,12 @@ async function writeSurveyResponse(deps, { assignment, answers, email, displayNa
             _resubmitCount: (prior._resubmitCount || 0) + 1,
             score: reScore !== null ? reScore : body.score ?? prior.score ?? null,
         };
-        if (validateSurveyResponsesSchema) validateSurveyResponsesSchema(updated);
+        try {
+            if (validateSurveyResponsesSchema) validateSurveyResponsesSchema(updated);
+        } catch (schemaErr) {
+            // Never block a site submit on schema nitpicks — keep answers on file
+            console.warn('survey response schema warning (resubmit)', schemaErr?.message || schemaErr);
+        }
         const { resource } = await rspC.items.upsert(updated);
 
         const asgSubmitted = {
@@ -484,7 +495,11 @@ async function writeSurveyResponse(deps, { assignment, answers, email, displayNa
     }
 
     const created = { ...body, id: generateId(), createdAt: now };
-    if (validateSurveyResponsesSchema) validateSurveyResponsesSchema(created);
+    try {
+        if (validateSurveyResponsesSchema) validateSurveyResponsesSchema(created);
+    } catch (schemaErr) {
+        console.warn('survey response schema warning (create)', schemaErr?.message || schemaErr);
+    }
     const { resource } = await rspC.items.create(created);
 
     const asgFirst = {
