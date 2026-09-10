@@ -356,7 +356,10 @@ function buildPublicPayload({
     const publicQuestions = publicQuestionsFromList(qList);
     return {
         siteDisplayName: siteName,
-        privacyContact: process.env.PRIVACY_CONTACT_EMAIL || null,
+        privacyContact:
+            process.env.PRIVACY_CONTACT_EMAIL ||
+            process.env.SURVEY_EMAIL_FROM ||
+            'siteprofiles@oraclinical.com',
         assignment: {
             status,
             targetRole: assignment.targetRole,

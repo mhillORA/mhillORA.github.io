@@ -103,11 +103,14 @@
 
     .intro {
       background: var(--teal-light); border-radius: 10px;
-      padding: 14px 18px; margin-bottom: 28px;
+      padding: 16px 18px; margin-bottom: 28px;
       font-size: 13px; color: var(--teal-dark); line-height: 1.55;
       border-left: 3px solid var(--teal);
     }
+    .intro p { margin: 0 0 10px; }
+    .intro p:last-child { margin-bottom: 0; }
     .intro strong { font-weight: 600; }
+    .intro-contact a { color: var(--navy); font-weight: 600; text-decoration: underline; }
 
     .banner {
       border-radius: 10px; padding: 14px 18px; margin-bottom: 20px;
@@ -441,15 +444,15 @@
       <div class="status-chip" id="status-chip">Loading</div>
     </div>
 
-    <div id="study-bar" class="study-bar" hidden></div>
     <div id="intro" hidden></div>
+    <div id="study-bar" class="study-bar" hidden></div>
     <div id="content"></div>
 
     <aside class="privacy" id="privacy-notice" hidden>
       <strong>Privacy.</strong>
       This form collects site-staff feasibility information for Ora Clinical operations.
       Answers are tied to your unique invitation link. Do not include patient names, MRNs, or other patient identifiers.
-      For access or deletion requests, contact <span id="privacy-contact">your Ora operations contact</span>
+      For access or deletion requests, contact <span id="privacy-contact">siteprofiles@oraclinical.com</span>
       and reference your confirmation code after submit.
     </aside>
     <div class="footer">Ora Clinical Research — Confidential</div>
@@ -678,24 +681,60 @@
       });
     }
 
+    function readLogicCurrent(form, dep) {
+      const esc = CSS.escape ? CSS.escape(dep) : dep;
+      const multi = form.querySelector(`[data-qid-group="${esc}"]`);
+      if (multi) {
+        return [...form.querySelectorAll(`input[type="checkbox"][name="${esc}"]:checked`)]
+          .map((el) => String(el.value || '').trim())
+          .filter(Boolean);
+      }
+      const radios = [...form.querySelectorAll(`input[type="radio"][name="${esc}"]:checked`)];
+      if (radios.length) {
+        return radios.map((el) => String(el.value || '').trim()).filter(Boolean);
+      }
+      const ctrl = qsByName(form, dep);
+      const v = String(ctrl?.value || '').trim();
+      return v ? [v] : [];
+    }
+
+    function evalShowIf(form, row) {
+      const dep = row.getAttribute('data-show-if-qid');
+      if (!dep) return true;
+      const selected = readLogicCurrent(form, dep);
+      const selectedLower = selected.map((s) => s.toLowerCase());
+      const equals = row.getAttribute('data-show-if-equals');
+      const includes = row.getAttribute('data-show-if-includes');
+      const includesAny = row.getAttribute('data-show-if-includes-any');
+      const notOnly = row.getAttribute('data-show-if-not-only');
+      const notEmpty = row.getAttribute('data-show-if-not-empty') === 'true';
+
+      // Prefer explicit operators; fall back to equals for legacy attrs.
+      if (includes != null && includes !== '') {
+        return selectedLower.includes(String(includes).trim().toLowerCase());
+      }
+      if (includesAny != null && includesAny !== '') {
+        const wants = String(includesAny).split('||').map((s) => s.trim().toLowerCase()).filter(Boolean);
+        return wants.some((w) => selectedLower.includes(w));
+      }
+      if (notOnly != null && notOnly !== '') {
+        const exclude = String(notOnly).trim().toLowerCase();
+        return selectedLower.some((s) => s !== exclude);
+      }
+      if (notEmpty) {
+        return selected.length > 0;
+      }
+      if (equals != null) {
+        // Exact match for single-value; for multi, joined string equality kept for back-compat
+        if (selected.length <= 1) return (selected[0] || '') === String(equals).trim();
+        return selected.join(', ') === String(equals).trim();
+      }
+      return true;
+    }
+
     function syncLogic(form) {
       form.querySelectorAll('.q').forEach((row) => {
-        const dep = row.getAttribute('data-show-if-qid');
-        let show = true;
-        if (dep) {
-          const want = row.getAttribute('data-show-if-equals') ?? '';
-          const multi = form.querySelector(`[data-qid-group="${CSS.escape ? CSS.escape(dep) : dep}"]`);
-          let current = '';
-          if (multi) {
-            current = [...form.querySelectorAll(`input[type="checkbox"][name="${CSS.escape ? CSS.escape(dep) : dep}"]:checked`)]
-              .map((el) => el.value)
-              .join(', ');
-          } else {
-            const ctrl = qsByName(form, dep);
-            current = String(ctrl?.value || '').trim();
-          }
-          show = current === String(want).trim();
-        }
+        const show = evalShowIf(form, row);
         row.classList.toggle('hidden', !show);
         row.querySelectorAll('[data-required-when-visible="true"]').forEach((input) => {
           if (input.type === 'checkbox' || input.getAttribute('data-multiselect') === 'true') return;
@@ -774,20 +813,26 @@
       el.bar.hidden = true;
     }
 
+    const DEFAULT_PRIVACY_CONTACT = 'siteprofiles@oraclinical.com';
+    const DEFAULT_SURVEY_BLURB = [
+      "This feasibility assessment is designed to help Ora understand your site's overall research capabilities, patient population, and operational readiness to support current and future clinical trials. It also includes questions that help us assess your site's approach to diversity, equity, and inclusion in clinical research, including the resources and support services available to enroll and retain a broad range of patients.",
+      'Your responses allow us to better align our studies with the most appropriate sites and identify areas where additional support may be helpful, ultimately improving trial efficiency, patient access, and representativeness across our research programs.',
+      'Thank you for your time and effort in completing this survey. If you have any questions or run into any issues, please contact siteprofiles@oraclinical.com.',
+    ].join('\n\n');
+
     function renderSurvey(payload) {
       const { survey, assignment, siteDisplayName, prefill, hasPrior, alreadySubmitted, privacyContact } = payload;
       const questions = Array.isArray(survey.questions) ? survey.questions : [];
       const defaults = prefill || {};
+      const contactEmail = String(privacyContact || DEFAULT_PRIVACY_CONTACT).trim() || DEFAULT_PRIVACY_CONTACT;
 
       el.title.textContent = survey.title || 'Site survey';
-      el.desc.textContent = survey.description
-        || (hasPrior
-          ? 'Answers from prior surveys are filled in. Update anything that changed and complete the rest.'
-          : 'Please complete the questions below for your site.');
+      el.desc.textContent = hasPrior
+        ? 'Answers from prior surveys are filled in when on file. Confirm those, update anything that changed, and complete the rest.'
+        : 'Please complete the questions below for your site.';
       el.meta.hidden = false;
       el.meta.innerHTML = `
         <span><strong>Site:</strong> ${escapeHtml(siteDisplayName)}</span>
-        <span><strong>Role:</strong> ${escapeHtml(roleLabel(assignment.targetRole))}</span>
         ${assignment.expiresAt ? `<span><strong>Expires:</strong> ${escapeHtml(new Date(assignment.expiresAt).toLocaleDateString())}</span>` : ''}
         ${survey.includesGeneralFeasibility ? `<span><strong>Includes:</strong> General Feasibility</span>` : ''}
       `;
@@ -796,27 +841,31 @@
         alreadySubmitted || hasPrior ? 'warn' : ''
       );
 
-      el.bar.hidden = false;
-      el.bar.innerHTML = `
-        <div>
-          <div class="study-item-label">Site</div>
-          <div class="study-item-value">${escapeHtml(siteDisplayName)}</div>
-        </div>
-        <div>
-          <div class="study-item-label">Audience</div>
-          <div class="study-item-value">${escapeHtml(roleLabel(assignment.targetRole))}</div>
-        </div>
-        <div>
-          <div class="study-item-label">Status</div>
-          <div class="study-item-value">${escapeHtml(alreadySubmitted ? 'Previously submitted' : hasPrior ? 'Prefilled' : 'New response')}</div>
-        </div>
-      `;
-
+      // DOCX / survey intro blurb at the top of the form
+      const rawBlurb = String(survey.introBlurb || survey.description || '').trim();
+      const useDefaultGfBlurb = !rawBlurb
+        || /auto-prepended|10 Sep 2026|question IDs preserved/i.test(rawBlurb)
+        || survey.id === 'survey-general-feasibility'
+        || survey.id === 'survey-general-feasibility-short';
+      const blurbText = useDefaultGfBlurb ? DEFAULT_SURVEY_BLURB : rawBlurb;
+      const blurbHtml = blurbText
+        .split(/\n\n+/)
+        .map((p) => p.trim())
+        .filter(Boolean)
+        .map((p) => `<p>${escapeHtml(p)}</p>`)
+        .join('');
       el.intro.hidden = false;
       el.intro.className = 'intro';
-      el.intro.innerHTML = hasPrior
-        ? `This survey is split into sections. Fields are <strong>prefilled from prior answers</strong> when on file — confirm those, update anything that changed, and complete blanks as you go.`
-        : `This survey is split into sections. Complete each page, then continue. All visible questions are required. Save a draft anytime — you can return with this same secure link before it expires.`;
+      el.intro.innerHTML = `
+        ${blurbHtml}
+        <p class="intro-contact">Questions or issues? Email <a href="mailto:${escapeHtml(contactEmail)}">${escapeHtml(contactEmail)}</a>.</p>
+        <p>${hasPrior
+          ? 'This survey is split into sections. Fields are <strong>prefilled from prior answers</strong> when on file — confirm those, update anything that changed, and complete blanks as you go.'
+          : 'This survey is split into sections. Complete each page, then continue. All visible questions are required. Save a draft anytime — you can return with this same secure link before it expires.'}</p>
+      `;
+
+      el.bar.hidden = true;
+      el.bar.innerHTML = '';
 
       const expiryBanner = (() => {
         if (!assignment.expiresAt) return '';
@@ -841,15 +890,30 @@
         return '';
       })();
 
-      if (privacyContact) el.contact.textContent = privacyContact;
+      el.contact.textContent = contactEmail;
       el.privacy.hidden = false;
 
       const logicAttrs = (q) => {
-        const logicQ = q.logic?.showIf?.questionId ? String(q.logic.showIf.questionId) : '';
-        const logicEq = q.logic?.showIf?.equals != null ? String(q.logic.showIf.equals) : '';
-        return logicQ
-          ? `data-show-if-qid="${escapeHtml(logicQ)}" data-show-if-equals="${escapeHtml(logicEq)}"`
-          : '';
+        const showIf = q.logic?.showIf;
+        const logicQ = showIf?.questionId ? String(showIf.questionId) : '';
+        if (!logicQ) return '';
+        const parts = [`data-show-if-qid="${escapeHtml(logicQ)}"`];
+        if (showIf.equals != null && showIf.equals !== '') {
+          parts.push(`data-show-if-equals="${escapeHtml(String(showIf.equals))}"`);
+        }
+        if (showIf.includes != null && showIf.includes !== '') {
+          parts.push(`data-show-if-includes="${escapeHtml(String(showIf.includes))}"`);
+        }
+        if (Array.isArray(showIf.includesAny) && showIf.includesAny.length) {
+          parts.push(`data-show-if-includes-any="${escapeHtml(showIf.includesAny.map(String).join('||'))}"`);
+        }
+        if (showIf.notOnly != null && showIf.notOnly !== '') {
+          parts.push(`data-show-if-not-only="${escapeHtml(String(showIf.notOnly))}"`);
+        }
+        if (showIf.notEmpty === true) {
+          parts.push('data-show-if-not-empty="true"');
+        }
+        return parts.join(' ');
       };
 
       const reqBits = (q) => {
