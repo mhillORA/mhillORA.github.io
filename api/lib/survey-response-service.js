@@ -14,6 +14,17 @@ const {
     normalizeGeneralFeasibilityVariant,
     isGeneralFeasibilitySurveyId,
 } = require('./survey-compare');
+const { GF_OLD_QID_TO_LIB, GF_OLD_LABEL_TO_LIB } = require('./gf-question-bridges');
+
+function resolveStoredAnswerLibraryId(a) {
+    const qid = String(a?.questionId ?? a?.id ?? '');
+    const lib = String(a?.libraryQuestionId || '');
+    if (lib) return lib;
+    if (qid && GF_OLD_QID_TO_LIB[qid]) return GF_OLD_QID_TO_LIB[qid];
+    const lab = normalizeQuestionLabel(a?.label || a?.title);
+    if (lab && GF_OLD_LABEL_TO_LIB[lab]) return GF_OLD_LABEL_TO_LIB[lab];
+    return '';
+}
 
 function sortByIsoDesc(rows, keys) {
     const list = Array.isArray(rows) ? rows.slice() : [];
@@ -79,7 +90,8 @@ function buildPrefillMapForQuestions(questions, responseList, { preferRole } = {
                     (a) =>
                         answerIsFilled(a) &&
                         (String(a.libraryQuestionId || '') === libId ||
-                            String(a.questionId ?? '') === libId)
+                            String(a.questionId ?? '') === libId ||
+                            resolveStoredAnswerLibraryId(a) === libId)
                 );
             }
             if (!found && norm) {
