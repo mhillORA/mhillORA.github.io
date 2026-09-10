@@ -136,6 +136,26 @@ function publicQuestionsFromList(questions) {
     });
 }
 
+/** Group questions into ordered section pages for the public form. */
+function buildSurveyPages(questions) {
+    const list = Array.isArray(questions) ? questions : [];
+    const pages = [];
+    list.forEach((q, idx) => {
+        const key = String(q.category || q.section || '').trim() || 'Questions';
+        if (!pages.length || pages[pages.length - 1].key !== key) {
+            pages.push({
+                key,
+                title: key.replace(/^SECTION\s+\d+\s*:\s*/i, '').trim() || key,
+                questionIds: [],
+                indexes: [],
+            });
+        }
+        pages[pages.length - 1].questionIds.push(q.id || `q_${idx}`);
+        pages[pages.length - 1].indexes.push(idx);
+    });
+    return pages;
+}
+
 function publicQuestions(def) {
     return publicQuestionsFromList(def?.questions);
 }
@@ -290,6 +310,7 @@ function buildPublicPayload({
         Boolean(assignment.draftAnswers?.length) ||
         Object.keys(crossPrefill).length > 0;
     const status = String(assignment.status || '').toLowerCase();
+    const publicQuestions = publicQuestionsFromList(qList);
     return {
         siteDisplayName: siteName,
         privacyContact: process.env.PRIVACY_CONTACT_EMAIL || null,
@@ -306,7 +327,8 @@ function buildPublicPayload({
             id: definition.id,
             title: definition.title || 'Site survey',
             description: definition.description || '',
-            questions: publicQuestionsFromList(qList),
+            questions: publicQuestions,
+            pages: buildSurveyPages(publicQuestions),
             includesGeneralFeasibility:
                 !isGeneralFeasibilitySurveyId(definition.id) &&
                 normalizeGeneralFeasibilityVariant(assignment?.generalFeasibilityVariant) !== 'none',
