@@ -12233,17 +12233,19 @@ document.addEventListener('submit', async (e) => {
             else answers.push(entry);
             state.currentSurveyState.history.push(currentQuestionIndex);
             const endSurvey = async (outcome) => {
+                const eligibility = evaluateSurveyEligibility(survey, answers);
+                const inferred = inferOverallStatusFromSurvey(outcome, answers);
+                const study = state.studies.find(s => s.id === survey.studyId || String(s.id) === String(survey.studyId));
+                const studyTitle = study?.title || study?.name || resolveStudyTitle(survey.studyId) || '';
                 const surveyResult = {
                     surveyId: survey.id,
                     surveyTitle: survey.title,
+                    studyId: survey.studyId || null,
+                    studyTitle: studyTitle || '',
                     completedAt: new Date().toISOString(),
                     answers: answers,
                     outcome: outcome
                 };
-                const eligibility = evaluateSurveyEligibility(survey, answers);
-                const inferred = inferOverallStatusFromSurvey(outcome, answers);
-                const study = state.studies.find(s => s.id === survey.studyId);
-                const studyTitle = study?.title || study?.name || '';
                 const updates = {
                     surveyResults: [...(patient.surveyResults || []), surveyResult],
                     surveyDrafts: (patient.surveyDrafts || []).filter(d => d.surveyId !== survey.id),
@@ -13870,6 +13872,18 @@ const exportToCSV = () => {
         showNotification("Failed to export report. See console for details.", "error");
     }
 };
+const resolveSurveyStudyName = (patient, result) => {
+    if (result?.studyTitle) return String(result.studyTitle);
+    const fromResultId = result?.studyId != null ? resolveStudyTitle(result.studyId) : '';
+    if (fromResultId) return fromResultId;
+    const surveyDef = (state.surveys || []).find(s => s && (s.id === result?.surveyId || String(s.id) === String(result?.surveyId)));
+    if (surveyDef?.studyId != null) {
+        const title = resolveStudyTitle(surveyDef.studyId);
+        if (title) return title;
+    }
+    return getPatientStudySiteLabelsForExport(patient).studyName || 'N/A';
+};
+
 const exportSurveysToCSV = () => {
     try {
         const patients = state.lastReportData;
@@ -13880,34 +13894,39 @@ const exportSurveysToCSV = () => {
         const { startDate, endDate } = getReportDateRange();
         state.lastReportDateStart = startDate;
         state.lastReportDateEnd = endDate;
-        const headers = ["PatientID", "PatientName", "SurveyTitle", "CompletionDate", "Outcome", "Question", "Answer"];
+        const q = (v) => '"' + String(v ?? '').replace(/"/g, '""') + '"';
+        const headers = ["PatientID", "PatientName", "StudyName", "SurveyTitle", "CompletionDate", "Outcome", "Question", "Answer"];
         const csvRows = [headers.join(',')];
         for (const p of patients) {
             if (p.surveyResults && p.surveyResults.length > 0) {
                 for (const result of p.surveyResults) {
                     if (!isTimestampInReportDateRange(result.completedAt, startDate, endDate)) continue;
                     const completedAt = result.completedAt ? new Date(result.completedAt) : null;
+                    const studyName = resolveSurveyStudyName(p, result);
+                    const completedStr = completedAt && !Number.isNaN(completedAt.getTime()) ? completedAt.toISOString() : '';
                     if (result.answers && result.answers.length > 0) {
                         for (const answer of result.answers) {
                             csvRows.push([
-                                `"${p.id}"`,
-                                `"${p.firstName} ${p.lastName}"`,
-                                `"${(result.surveyTitle || '').replace(/"/g, '""')}"`,
-                                `"${completedAt && !Number.isNaN(completedAt.getTime()) ? completedAt.toISOString() : ''}"`,
-                                `"${(result.outcome || 'N/A').replace(/"/g, '""')}"`,
-                                `"${(answer.question || '').replace(/"/g, '""')}"`,
-                                `"${(answer.answer || '').replace(/"/g, '""')}"`
+                                q(p.id),
+                                q(`${p.firstName || ''} ${p.lastName || ''}`.trim()),
+                                q(studyName),
+                                q(result.surveyTitle || ''),
+                                q(completedStr),
+                                q(result.outcome || 'N/A'),
+                                q(answer.question || ''),
+                                q(answer.answer || '')
                             ].join(','));
                         }
                     } else {
                         csvRows.push([
-                            `"${p.id}"`,
-                            `"${p.firstName} ${p.lastName}"`,
-                            `"${(result.surveyTitle || '').replace(/"/g, '""')}"`,
-                            `"${completedAt && !Number.isNaN(completedAt.getTime()) ? completedAt.toISOString() : ''}"`,
-                            `"${(result.outcome || 'N/A').replace(/"/g, '""')}"`,
-                            `"N/A"`,
-                            `"N/A"`
+                            q(p.id),
+                            q(`${p.firstName || ''} ${p.lastName || ''}`.trim()),
+                            q(studyName),
+                            q(result.surveyTitle || ''),
+                            q(completedStr),
+                            q(result.outcome || 'N/A'),
+                            q('N/A'),
+                            q('N/A')
                         ].join(','));
                     }
                 }
@@ -13926,7 +13945,10 @@ const exportSurveysToCSV = () => {
         const link = document.createElement("a");
         link.setAttribute("href", url);
         const date = new Date().toISOString().split('T')[0];
-        const filename = `survey_results_${date}.csv`;
+        const studySlug = state.lastReportMeta?.studyId
+            ? (resolveStudyTitle(state.lastReportMeta.studyId) || 'study').replace(/[^\w\-]+/g, '_').slice(0, 40)
+            : 'all_studies';
+        const filename = `survey_results_${studySlug}_${date}.csv`;
         link.setAttribute("download", filename);
         link.style.visibility = 'hidden';
         document.body.appendChild(link);
