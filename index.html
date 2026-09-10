@@ -10256,6 +10256,7 @@ document.addEventListener('click', async (e) => {
             case 'export-csv': exportToCSV(); break;
             case 'export-surveys-csv': exportSurveysToCSV(); break;
             case 'export-five9-csv': exportFive9CSV(); break;
+            case 'clear-report-filters': clearReportFilters(); break;
             case 'export-participants': exportParticipants(); break;
             case 'combine-duplicates': {
                 try {
@@ -13765,6 +13766,45 @@ const exportFive9CSV = () => {
         showNotification('Five9 export failed.', 'error');
     }
 };
+const resolveStudyTitle = (studyId) => {
+    if (studyId == null || studyId === '') return '';
+    const sid = String(studyId);
+    const study = (state.studies || []).find(s => String(s.id) === sid);
+    return (study && (study.title || study.name)) || sid;
+};
+
+const resolveSiteName = (siteId) => {
+    if (siteId == null || siteId === '') return '';
+    const sid = String(siteId);
+    const site = (state.sites || []).find(s => String(s.id) === sid);
+    return (site && site.name) || sid;
+};
+
+/** Best-effort study/site labels for report CSV (enrollment → appointment → report filter). */
+const getPatientStudySiteLabelsForExport = (patient) => {
+    const current = (patient.enrollments || []).find(e => e && e.status === 'current');
+    const anyEnrollment = current || (patient.enrollments || []).find(e => e && e.studyId);
+    const appt = patient.appointment || (typeof getPatientAppointments === 'function'
+        ? getPatientAppointments(patient)[0]
+        : (patient.appointments || [])[0]);
+    const reportStudyId = state.lastReportMeta?.studyId || null;
+    const reportSiteId = state.lastReportMeta?.siteId || null;
+
+    let studyId = anyEnrollment?.studyId || appt?.studyId || patient.studyId || patient.currentStudyId || null;
+    let siteId = anyEnrollment?.siteId || appt?.siteId || patient.homeSiteId || patient.siteId || patient.currentSiteId || null;
+
+    // If the report was scoped to one study and this patient belongs to it, prefer that name
+    if (reportStudyId && patientBelongsToStudy(patient, reportStudyId)) studyId = reportStudyId;
+    if (reportSiteId && patientBelongsToSite(patient, reportSiteId)) siteId = reportSiteId;
+
+    return {
+        studyName: resolveStudyTitle(studyId) || 'N/A',
+        siteName: resolveSiteName(siteId) || 'N/A',
+        studyId: studyId != null ? String(studyId) : '',
+        siteId: siteId != null ? String(siteId) : '',
+    };
+};
+
 const exportToCSV = () => {
     try {
         const patients = state.lastReportData;
@@ -13772,31 +13812,41 @@ const exportToCSV = () => {
             showNotification("Please generate a report before exporting.", "info");
             return;
         }
-        const headers = Object.keys(patientTemplate());
-        headers.splice(headers.indexOf('surveyResults'), 1); // remove complex object
-        headers.splice(headers.indexOf('appointment'), 1);
-        headers.splice(headers.indexOf('enrollments'), 1);
-        headers.push("appointmentDate", "currentStudy", "currentSite");
+        const skip = new Set(['surveyResults', 'appointment', 'appointments', 'enrollments', 'surveyDrafts',
+            'contactLogs', 'completedVisits', 'visitLogs', 'tasks', 'consentRecords', 'communications',
+            'waitlist', 'auditTrail', 'medications', 'tags', 'race']);
+        const baseHeaders = Object.keys(patientTemplate()).filter(h => !skip.has(h));
+        // Put human-readable study/site names near the front of the export
+        const headers = [
+            'firstName', 'lastName', 'globalId', 'screeningNumber', 'status', 'overallStatus',
+            'studyName', 'siteName', 'appointmentDate', 'source', 'registryStatus', 'therapeuticArea',
+            ...baseHeaders.filter(h => !['firstName', 'lastName', 'globalId', 'screeningNumber', 'status', 'overallStatus', 'source', 'registryStatus', 'therapeuticArea'].includes(h)),
+            'studyId', 'siteId',
+        ];
         const csvRows = [headers.join(',')];
         for (const p of patients) {
+            const labels = getPatientStudySiteLabelsForExport(p);
             const row = headers.map(header => {
                 let value;
-                const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
                 if (header === 'appointmentDate') {
-                    value = p.appointment ? new Date(p.appointment.time).toISOString() : '';
-                } else if (header === 'currentStudy') {
-                    value = currentEnrollment ? state.studies.find(s => s.id === currentEnrollment.studyId)?.title || 'N/A' : 'N/A';
-                } else if (header === 'currentSite') {
-                    value = currentEnrollment ? state.sites.find(s => s.id === currentEnrollment.siteId)?.name || 'N/A' : 'N/A';
+                    value = p.appointment?.time ? new Date(p.appointment.time).toISOString() : '';
+                } else if (header === 'studyName') {
+                    value = labels.studyName;
+                } else if (header === 'siteName') {
+                    value = labels.siteName;
+                } else if (header === 'studyId') {
+                    value = labels.studyId;
+                } else if (header === 'siteId') {
+                    value = labels.siteId;
                 } else if (header === 'phoneNumber') {
-                    // Export as plain digits with country code (17153074271); UI can stay formatted
                     value = formatPhoneFive9(p.phoneNumber) || '';
                 } else {
                     value = p[header];
                 }
-                // Phone: bare digits, no quotes — Five9 / dialer friendly
                 if (header === 'phoneNumber') return String(value || '');
-                return `"${(value || '').toString().replace(/"/g, '""')}"`;
+                if (value == null) value = '';
+                if (typeof value === 'object') value = JSON.stringify(value);
+                return `"${String(value).replace(/"/g, '""')}"`;
             });
             csvRows.push(row.join(','));
         }
@@ -13806,7 +13856,10 @@ const exportToCSV = () => {
         const url = URL.createObjectURL(blob);
         link.setAttribute("href", url);
         const date = new Date().toISOString().split('T')[0];
-        link.setAttribute("download", `report_${date}.csv`);
+        const studySlug = state.lastReportMeta?.studyId
+            ? (resolveStudyTitle(state.lastReportMeta.studyId) || 'study').replace(/[^\w\-]+/g, '_').slice(0, 40)
+            : 'all_studies';
+        link.setAttribute("download", `report_${studySlug}_${date}.csv`);
         link.style.visibility = 'hidden';
         document.body.appendChild(link);
         link.click();
