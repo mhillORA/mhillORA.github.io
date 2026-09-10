@@ -22,6 +22,7 @@ const {
 const {
     answersToPrefillMap,
     buildPrefillMapForQuestions,
+    buildSiteRecordPrefill,
     findLatestLiveResponse,
     findSiteRoleLiveResponses,
     findSiteLiveResponses,
@@ -233,6 +234,39 @@ async function resolveSiteName(getContainer, siteId) {
     }
 }
 
+async function loadSiteDoc(getContainer, siteId) {
+    try {
+        const read = await getContainer(SITES).item(siteId, siteId).read();
+        return read.resource || null;
+    } catch (_) {
+        return null;
+    }
+}
+
+async function loadStaffForRole(getContainer, siteId, targetRole) {
+    const role = normalizeRole(targetRole);
+    try {
+        const { resources } = await getContainer(SITE_STAFF)
+            .items.query(
+                {
+                    query: 'SELECT * FROM c WHERE c.siteId = @siteId',
+                    parameters: [{ name: '@siteId', value: String(siteId) }],
+                },
+                { enableCrossPartitionQuery: true }
+            )
+            .fetchAll();
+        const list = resources || [];
+        const match = list.find((s) => {
+            const r = String(s.role || s.title || '').toLowerCase();
+            if (role === 'pi') return /^(pi)\b|investigator/.test(r);
+            return /coord/.test(r);
+        });
+        return match || null;
+    } catch (_) {
+        return null;
+    }
+}
+
 async function resolveRecipientEmail(getContainer, siteId, targetRole) {
     const role = normalizeRole(targetRole);
     try {
@@ -293,14 +327,22 @@ function buildPublicPayload({
     siteRoleResponses,
     questions,
     delta,
+    siteDoc = null,
+    coordinatorStaff = null,
+    piStaff = null,
 }) {
     const qList = Array.isArray(questions) ? questions : definition?.questions;
+    const sitePrefill = buildSiteRecordPrefill(qList, siteDoc, {
+        coordinatorStaff,
+        piStaff,
+    });
     // Cross-survey first (label / libraryQuestionId / gen-feas ids), then same-survey ids, then draft.
     const crossPrefill = buildPrefillMapForQuestions(qList, siteRoleResponses || (prior ? [prior] : []), {
         preferRole: assignment?.targetRole,
     });
     const prefill = {
         ...(definition?.defaultValues || {}),
+        ...sitePrefill,
         ...crossPrefill,
         ...answersToPrefillMap(prior?.answers),
         ...answersToPrefillMap(draftAnswers || assignment.draftAnswers),
@@ -308,7 +350,8 @@ function buildPublicPayload({
     const hasPrior =
         Boolean(prior) ||
         Boolean(assignment.draftAnswers?.length) ||
-        Object.keys(crossPrefill).length > 0;
+        Object.keys(crossPrefill).length > 0 ||
+        Object.keys(sitePrefill).length > 0;
     const status = String(assignment.status || '').toLowerCase();
     const publicQuestions = publicQuestionsFromList(qList);
     return {
@@ -430,6 +473,9 @@ function registerSurveySecureRoutes(app, deps) {
             }
 
             const siteName = await resolveSiteName(getContainer, assignment.siteId);
+            const siteDoc = await loadSiteDoc(getContainer, assignment.siteId);
+            const coordinatorStaff = await loadStaffForRole(getContainer, assignment.siteId, 'coordinator');
+            const piStaff = await loadStaffForRole(getContainer, assignment.siteId, 'pi');
             const relatedSiteIds = await resolveRelatedSiteIds(getContainer, assignment.siteId);
             const questions = await resolvePublicSurveyQuestions(getContainer, definition, {
                 generalFeasibilityVariant: assignment.generalFeasibilityVariant || 'long',
@@ -483,6 +529,9 @@ function registerSurveySecureRoutes(app, deps) {
                     siteRoleResponses: siteResponses,
                     questions,
                     delta,
+                    siteDoc,
+                    coordinatorStaff,
+                    piStaff,
                 }),
                 headers: corsHeaders(),
             };

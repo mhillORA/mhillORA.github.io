@@ -96,6 +96,84 @@ function buildPrefillMapForQuestions(questions, responseList, { preferRole } = {
     return map;
 }
 
+/**
+ * Prefill from live site + staff records (not prior survey answers).
+ * Point-of-contact / research contact questions map to the site coordinator.
+ */
+function buildSiteRecordPrefill(questions, site, { coordinatorStaff = null, piStaff = null } = {}) {
+    const map = {};
+    if (!site || typeof site !== 'object') return map;
+    const coord = coordinatorStaff && typeof coordinatorStaff === 'object' ? coordinatorStaff : {};
+    const pi = piStaff && typeof piStaff === 'object' ? piStaff : {};
+
+    const byLib = {
+        'ql-coord-name': site.siteCoordinator || coord.name || '',
+        'ql-coord-email': site.siteCoordinatorEmail || coord.email || '',
+        'ql-coord-phone': site.siteCoordinatorPhone || coord.phone || coord.phoneNumber || '',
+        'ql-coord-title': coord.title || 'Study Coordinator',
+        'ql-primary-contact-role': coord.title || 'Study Coordinator',
+        'ql-site-name': site.name || site.siteName || '',
+        'ql-site-address': site.address || site.streetAddress || site.mailingAddress || '',
+        'ql-site-phone': site.phone || site.sitePhone || site.mainPhone || '',
+        'ql-pi-name': site.pi || pi.name || '',
+        'ql-pi-email': site.piEmail || pi.email || '',
+        'ql-pi-phone': site.piPhone || pi.phone || pi.phoneNumber || '',
+        'ql-gf-00-name': '', // respondent — leave blank
+    };
+
+    const byQid = {
+        gf_15_research-contact: byLib['ql-coord-name'],
+        gf_16_poc-email: byLib['ql-coord-email'],
+        gsf_009_primary-research-point-of-contact-phone-number: byLib['ql-coord-phone'],
+        gf_17_poc-role: byLib['ql-primary-contact-role'],
+        gf_02_site-name: byLib['ql-site-name'],
+        gf_03_address: byLib['ql-site-address'],
+        gf_04_phone: byLib['ql-site-phone'],
+        gf_07_investigator-1: byLib['ql-pi-name'],
+        gf_09_inv-1-email: byLib['ql-pi-email'],
+    };
+
+    const labelHints = [
+        {
+            test: (n) => n.includes('primary research point of contact first') || n.includes('primary research contact first'),
+            value: byLib['ql-coord-name'],
+        },
+        {
+            test: (n) => n.includes('primary research contact email') || n.includes('primary research point of contact email'),
+            value: byLib['ql-coord-email'],
+        },
+        {
+            test: (n) => n.includes('primary research point of contact phone'),
+            value: byLib['ql-coord-phone'],
+        },
+        {
+            test: (n) => n.includes('primary research point of contact title') || n.includes('primary research point of contact role'),
+            value: byLib['ql-primary-contact-role'],
+        },
+    ];
+
+    for (const q of Array.isArray(questions) ? questions : []) {
+        const qid = String(q?.id || '');
+        if (!qid) continue;
+        const libId = String(q?.libraryQuestionId || '');
+        let val = '';
+        if (libId && byLib[libId]) val = byLib[libId];
+        if (!val && byQid[qid]) val = byQid[qid];
+        if (!val) {
+            const norm = normalizeQuestionLabel(q?.label || q?.title);
+            for (const hint of labelHints) {
+                if (hint.test(norm) && hint.value) {
+                    val = hint.value;
+                    break;
+                }
+            }
+        }
+        val = String(val || '').trim();
+        if (val) map[qid] = val;
+    }
+    return map;
+}
+
 function mergeAnswers(incoming, priorAnswers) {
     const oldAnswerMap = new Map(
         (priorAnswers || []).map((a) => [String(a.questionId ?? a.id ?? ''), a])
@@ -528,6 +606,7 @@ module.exports = {
     normalizeQuestionLabel,
     readAnswerValue,
     buildPrefillMapForQuestions,
+    buildSiteRecordPrefill,
     mergeAnswers,
     scoreAnswers,
     computeScore,
