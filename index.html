@@ -8037,8 +8037,16 @@ const getTakeSurveyModalHTML = () => {
     const defaultNext = (question.options && question.options[0] && question.options[0].next)
         || (currentQuestionIndex + 2 <= survey.questions.length ? String(currentQuestionIndex + 2) : 'submit');
     const isCallScript = question.isScript && (section === 'Voicemail Script' || section === 'Live Patient Script');
+    // At most one Voicemail + one Live script (UAT-123/116) — never duplicate the same section
     const callScripts = isCallScript
-        ? (survey.questions || []).map((q, idx) => ({ q, idx })).filter(x => x.q.isScript && x.q.section === section)
+        ? (() => {
+            const out = [];
+            ['Voicemail Script', 'Live Patient Script'].forEach(sec => {
+                const idx = (survey.questions || []).findIndex(q => q.isScript && q.section === sec);
+                if (idx >= 0) out.push({ q: survey.questions[idx], idx });
+            });
+            return out;
+        })()
         : [];
     const priorMulti = String(priorAnswer || '').split('|').map(s => s.trim()).filter(Boolean);
     return `
@@ -13364,6 +13372,24 @@ const renderBookedAppointmentsView = () => {
         bookedAppointments = bookedAppointments.filter(({ slot }) => toLocalDateKey(slot.startTime) === dayKey);
     }
     bookedAppointments.sort((a,b) => new Date(a.slot.startTime) - new Date(b.slot.startTime));
+
+    // UAT-147: also show open (unbooked) visit times so clinic can move patients
+    let openSlots = [];
+    (state.schedules || []).forEach(schedule => {
+        if (state.schedulingSiteFilter !== 'all' && schedule.siteId !== state.schedulingSiteFilter) return;
+        if (state.schedulingStudyFilter !== 'all' && schedule.studyId !== state.schedulingStudyFilter) return;
+        if (state.schedulingVisitFilter !== 'all' && schedule.visit !== state.schedulingVisitFilter) return;
+        (schedule.slots || []).forEach(slot => {
+            const dayKey = dateFilter === 'today' ? toLocalDateKey(new Date()) : dateFilter;
+            if (dateFilter !== 'all' && toLocalDateKey(slot.startTime) !== dayKey) return;
+            const bookedCount = countPatientsInSlot(slot.id);
+            const capacity = slot.capacity || 0;
+            if (bookedCount >= capacity) return;
+            openSlots.push({ schedule, slot, openCount: capacity - bookedCount, bookedCount, capacity });
+        });
+    });
+    openSlots.sort((a, b) => new Date(a.slot.startTime) - new Date(b.slot.startTime));
+
     const tabs = state.visitScheduleTabs || [];
     const tabsHTML = tabs.length ? `
         <div class="flex items-center gap-1 mb-4 overflow-x-auto border-b dark:border-gray-700 pb-0">
@@ -13382,10 +13408,10 @@ const renderBookedAppointmentsView = () => {
         ${tabsHTML}
         <div class="flex flex-wrap items-center justify-between gap-2 mb-4">
             <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300">Clinic Visit Schedule</h3>
-            <p class="text-sm text-gray-500 dark:text-gray-400">${dayLabel} · ${bookedAppointments.length} visit${bookedAppointments.length === 1 ? '' : 's'}</p>
+            <p class="text-sm text-gray-500 dark:text-gray-400">${dayLabel} · ${bookedAppointments.length} booked · ${openSlots.length} open slot${openSlots.length === 1 ? '' : 's'}</p>
         </div>
     `;
-    if (bookedAppointments.length > 0) {
+    if (bookedAppointments.length > 0 || openSlots.length > 0) {
         const canEditOutcome = isAdminUser();
         bookedHTML += `
             <div class="overflow-x-auto">
@@ -13430,6 +13456,21 @@ const renderBookedAppointmentsView = () => {
                         </td>
                     </tr>
                 `}).join('')}
+                ${openSlots.map(({ schedule, slot, openCount, bookedCount, capacity }) => `
+                    <tr class="dark:text-gray-300 align-top bg-emerald-50/60 dark:bg-emerald-950/20">
+                        <td class="px-3 py-3 whitespace-nowrap">${phi(new Date(slot.startTime).toLocaleString([], { dateStyle: 'short', timeStyle: 'short' }))}</td>
+                        <td class="px-3 py-3 text-emerald-700 dark:text-emerald-300 font-medium">OPEN (${openCount} of ${capacity})</td>
+                        <td class="px-3 py-3">—</td>
+                        <td class="px-3 py-3">—</td>
+                        <td class="px-3 py-3 text-xs text-gray-500">${bookedCount}/${capacity} booked</td>
+                        <td class="px-3 py-3">${state.studies.find(s => s.id === schedule.studyId)?.title || 'N/A'}</td>
+                        <td class="px-3 py-3">${phi(schedule.group || '—')}</td>
+                        <td class="px-3 py-3">${schedule.visit || 'General'}</td>
+                        <td class="px-3 py-3">
+                            <button type="button" class="appointment-slot text-xs text-blue-600 dark:text-blue-400 hover:underline" data-schedule-id="${schedule.id}" data-slot-id="${slot.id}">Edit capacity</button>
+                        </td>
+                    </tr>
+                `).join('')}
                 </tbody>
             </table>
             </div>
@@ -13520,8 +13561,9 @@ const exportFive9CSV = () => {
         patients.forEach(p => {
             const num = formatPhoneFive9(p.phoneNumber);
             if (!num) return;
-            const enrollment = p.enrollments?.find(e => e.status === 'current');
-            const site = state.sites.find(s => s.id === (enrollment?.siteId || p.homeSiteId || p.siteId));
+            // UAT-146: Site on export must match Home Site on profile
+            const site = state.sites.find(s => s.id === (p.homeSiteId || p.siteId))
+                || state.sites.find(s => s.id === p.enrollments?.find(e => e.status === 'current')?.siteId);
             const q = (v) => '"' + String(v || '').replace(/"/g, '""') + '"';
             rows.push([
                 num,
