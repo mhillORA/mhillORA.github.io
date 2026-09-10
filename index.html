@@ -2936,6 +2936,34 @@ const computePatientDenormalized = (patient) => {
     };
 };
 
+/** Same study matching for Studies roster, Reporting, and Pipeline (string-safe + appointments). */
+const patientBelongsToStudy = (patient, studyId) => {
+    if (!patient || !studyId) return false;
+    if (patient.status === 'Merged' || patient.mergedIntoId) return false;
+    const sid = String(studyId);
+    const denorm = computePatientDenormalized(patient);
+    if (denorm.currentStudyId != null && String(denorm.currentStudyId) === sid) return true;
+    if ((denorm.enrolledStudyIds || []).some(id => String(id) === sid)) return true;
+    if ((denorm.candidateStudyIds || []).some(id => String(id) === sid)) return true;
+    if ((patient.enrollments || []).some(e => e && e.studyId != null && String(e.studyId) === sid)) return true;
+    const appts = typeof getPatientAppointments === 'function' ? getPatientAppointments(patient) : (patient.appointments || []);
+    if ((appts || []).some(a => a && a.studyId != null && String(a.studyId) === sid && (a.status || 'scheduled') !== 'cancelled')) return true;
+    if (patient.appointment?.studyId != null && String(patient.appointment.studyId) === sid) return true;
+    return false;
+};
+
+const patientBelongsToSite = (patient, siteId) => {
+    if (!patient || !siteId) return false;
+    const sid = String(siteId);
+    const denorm = computePatientDenormalized(patient);
+    if (denorm.currentSiteId != null && String(denorm.currentSiteId) === sid) return true;
+    if ((patient.enrollments || []).some(e => e && e.siteId != null && String(e.siteId) === sid)) return true;
+    if (patient.homeSiteId != null && String(patient.homeSiteId) === sid) return true;
+    const appts = typeof getPatientAppointments === 'function' ? getPatientAppointments(patient) : (patient.appointments || []);
+    if ((appts || []).some(a => a && a.siteId != null && String(a.siteId) === sid && (a.status || 'scheduled') !== 'cancelled')) return true;
+    return false;
+};
+
 const PATIENT_FORM_STRING_FIELDS = new Set([
     'firstName', 'lastName', 'initials', 'globalId', 'screeningNumber', 'group', 'phoneNumber', 'email',
     'dob', 'address', 'city', 'state', 'zipCode', 'condition', 'source', 'therapeuticArea', 'registryStatus',
@@ -3139,16 +3167,23 @@ const getCurrentActor = () => state.currentUser?.email || state.currentUser?.use
 
 const getUserAllowedSiteIds = () => {
     if (!state.currentUser) return null;
-    if (state.currentUser.role === 'Internal' || state.currentUser.testModeAccess) return null;
+    // Unrestricted: admins/managers/internal, or no site ACL configured yet
+    if (isAdminUser() || isManagerUser() || state.currentUser.testModeAccess) return null;
+    const role = String(state.currentUser.role || '').toLowerCase();
+    if (role === 'internal' || role === 'admin' || role === 'ops') return null;
     const ids = state.currentUser.allowedSiteIds;
-    return Array.isArray(ids) ? ids : [];
+    if (!Array.isArray(ids) || ids.length === 0) return null;
+    return ids;
 };
 
 const getUserAllowedStudyIds = () => {
     if (!state.currentUser) return null;
-    if (state.currentUser.role === 'Internal' || state.currentUser.testModeAccess) return null;
+    if (isAdminUser() || isManagerUser() || state.currentUser.testModeAccess) return null;
+    const role = String(state.currentUser.role || '').toLowerCase();
+    if (role === 'internal' || role === 'admin' || role === 'ops') return null;
     const ids = state.currentUser.allowedStudyIds;
-    return Array.isArray(ids) ? ids : [];
+    if (!Array.isArray(ids) || ids.length === 0) return null;
+    return ids;
 };
 
 const getUserScopeForApi = () => {
@@ -3571,10 +3606,10 @@ const getStudyVisitMatrix = (study) => {
 const computeRecruitmentFunnel = (patients, filters = {}) => {
     let list = filterPatientsForCurrentUser([...patients]);
     if (filters.studyId && filters.studyId !== 'all') {
-        list = list.filter(p => p.enrollments?.some(e => e.studyId === filters.studyId));
+        list = list.filter(p => patientBelongsToStudy(p, filters.studyId));
     }
     if (filters.siteId && filters.siteId !== 'all') {
-        list = list.filter(p => p.enrollments?.some(e => e.siteId === filters.siteId));
+        list = list.filter(p => patientBelongsToSite(p, filters.siteId));
     }
     const stageIds = PIPELINE_STAGES.map(s => s.id);
     const counts = Object.fromEntries(stageIds.map(id => [id, 0]));
@@ -4850,10 +4885,7 @@ const updateEnrollmentNumbers = (studyId) => {
     if (!study) return;
     
     // Get participants for this study
-    const studyParticipants = state.patients.filter(p => {
-        const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
-        return currentEnrollment?.studyId === studyId;
-    });
+    const studyParticipants = state.patients.filter(p => patientBelongsToStudy(p, studyId));
     
     const enrolledCount = studyParticipants.filter(p => p.status === 'Enrolled').length;
     const screenFailCount = studyParticipants.filter(p => p.status === 'Screen Fail').length;
@@ -4892,10 +4924,7 @@ const renderStudyParticipants = (studyId) => {
     if (!tableBody) return;
     
     // Get participants for this study
-    let studyParticipants = state.patients.filter(p => {
-        const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
-        return currentEnrollment?.studyId === studyId;
-    });
+    let studyParticipants = state.patients.filter(p => patientBelongsToStudy(p, studyId));
     
     // Apply search filter
     if (state.participantSearchTerm) {
@@ -5304,13 +5333,7 @@ const renderPipelineBoard = () => {
     const assigneeFilter = document.getElementById('pipeline-assignee-filter')?.value || 'all';
     let patients = filterPatientsForCurrentUser(state.patients || []);
     if (studyFilter !== 'all') {
-        patients = patients.filter((p) => {
-            const denorm = computePatientDenormalized(p);
-            if (denorm.currentStudyId === studyFilter) return true;
-            if (denorm.candidateStudyIds?.includes(studyFilter)) return true;
-            if (denorm.enrolledStudyIds?.includes(studyFilter)) return true;
-            return p.enrollments?.some((e) => e.studyId === studyFilter) || false;
-        });
+        patients = patients.filter((p) => patientBelongsToStudy(p, studyFilter));
     }
     if (assigneeFilter !== 'all') {
         patients = patients.filter(p => p.assignedToUserId === assigneeFilter);
@@ -12822,10 +12845,10 @@ document.addEventListener('submit', async (e) => {
             let filteredPatients = [...filterPatientsForCurrentUser(state.patients)];
             // Apply filters
             if (data.studyId !== 'all') {
-                filteredPatients = filteredPatients.filter(p => p.enrollments?.some(e => e.studyId === data.studyId));
+                filteredPatients = filteredPatients.filter(p => patientBelongsToStudy(p, data.studyId));
             }
             if (data.siteId !== 'all') {
-                filteredPatients = filteredPatients.filter(p => p.enrollments?.some(e => e.siteId === data.siteId));
+                filteredPatients = filteredPatients.filter(p => patientBelongsToSite(p, data.siteId));
             }
             if (data.status !== 'all') {
                 filteredPatients = filteredPatients.filter(p => p.status === data.status);
@@ -12856,10 +12879,17 @@ document.addEventListener('submit', async (e) => {
             state.lastReportDateStart = reportStart;
             state.lastReportDateEnd = reportEnd;
             if (reportStart || reportEnd) {
-                // Date fields = survey completion window (Export Survey Results / UAT-130)
-                filteredPatients = filteredPatients.filter(p =>
-                    (p.surveyResults || []).some(sr => isTimestampInReportDateRange(sr.completedAt, reportStart, reportEnd))
-                );
+                // Generate Report: any study activity in range (survey, visit, enrollment, or created)
+                // Export Survey Results still filters by survey completion only.
+                filteredPatients = filteredPatients.filter(p => {
+                    if ((p.surveyResults || []).some(sr => isTimestampInReportDateRange(sr.completedAt, reportStart, reportEnd))) return true;
+                    if (p.appointment && isTimestampInReportDateRange(p.appointment.time, reportStart, reportEnd)) return true;
+                    if ((typeof getPatientAppointments === 'function' ? getPatientAppointments(p) : (p.appointments || []))
+                        .some(a => isTimestampInReportDateRange(a.time, reportStart, reportEnd))) return true;
+                    if ((p.enrollments || []).some(e => isTimestampInReportDateRange(e.enrolledDate || e.assignedAt, reportStart, reportEnd))) return true;
+                    if (isTimestampInReportDateRange(p.createdAt || p.lastUpdated, reportStart, reportEnd)) return true;
+                    return false;
+                });
             }
             state.lastReportData = filteredPatients;
             const exportBtn = document.getElementById('export-csv-btn');
@@ -12898,8 +12928,11 @@ document.addEventListener('submit', async (e) => {
             const total = filteredPatients.length;
             const avgAge = total > 0 ? (filteredPatients.reduce((sum, p) => sum + (p.age || 0), 0) / filteredPatients.filter(p => p.age).length).toFixed(1) : 'N/A';
             const scheduled = filteredPatients.filter(p => p.appointment).length;
+            const studyRosterCount = (data.studyId && data.studyId !== 'all')
+                ? (state.patients || []).filter(p => patientBelongsToStudy(p, data.studyId)).length
+                : null;
             metricsContainer.innerHTML = `
-                <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md text-center"><p class="text-sm text-gray-500 dark:text-gray-400">Total Patients</p><p class="text-2xl font-bold dark:text-white">${total}</p></div>
+                <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md text-center"><p class="text-sm text-gray-500 dark:text-gray-400">Total Patients</p><p class="text-2xl font-bold dark:text-white">${total}</p>${studyRosterCount != null ? `<p class="text-xs text-gray-500 mt-1">${studyRosterCount} on study roster</p>` : ''}</div>
                 <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md text-center"><p class="text-sm text-gray-500 dark:text-gray-400">Average Age</p><p class="text-2xl font-bold dark:text-white">${avgAge}</p></div>
                 <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md text-center"><p class="text-sm text-gray-500 dark:text-gray-400">Scheduled</p><p class="text-2xl font-bold dark:text-white">${scheduled}</p></div>
                 <div class="bg-white dark:bg-gray-800 p-4 rounded-lg shadow-md text-center"><p class="text-sm text-gray-500 dark:text-gray-400">Not Scheduled</p><p class="text-2xl font-bold dark:text-white">${total - scheduled}</p></div>
