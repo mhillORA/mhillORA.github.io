@@ -550,7 +550,7 @@ function registerSurveySecureRoutes(app, deps) {
                         missing.push(q.label || q.id);
                         continue;
                     }
-                    if (!a?.confirmed) {
+                    if (a && a.confirmed === false) {
                         unconfirmed.push(q.label || q.id);
                     }
                 }
