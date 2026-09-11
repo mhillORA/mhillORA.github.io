@@ -23,7 +23,7 @@ from azure.cosmos import CosmosClient
 from docx import Document
 
 REPO = Path(__file__).resolve().parents[1]
-DEFAULT_DOCX = Path(r"c:\Users\shue1\Downloads\General Site Feasibility Survey_10Sep2026.docx")
+DEFAULT_DOCX = Path(r"c:\Users\shue1\Downloads\General Site Feasibility Survey_10Sep2026 (2).docx")
 LONG_ID = "survey-general-feasibility"
 SHORT_ID = "survey-general-feasibility-short"
 
@@ -133,13 +133,21 @@ def parse_docx(path: Path) -> list[dict]:
     if cur:
         questions.append(cur)
 
-    # de-dupe by num (keep first complete)
+    # De-dupe by num, but keep DOCX *appearance* order (not sorted 1..N).
+    # The Word file places Access/DEI (Q30–53) after Staffing/Facilities (Q54+) in the page flow.
     by_num = {}
+    appearance_order = []
     for q in questions:
         n = q["num"]
-        if n not in by_num or len(q["options"]) > len(by_num[n]["options"]):
+        if n not in by_num:
             by_num[n] = q
-    questions = [by_num[k] for k in sorted(by_num)]
+            appearance_order.append(n)
+        elif len(q.get("options") or []) > len(by_num[n].get("options") or []):
+            # Prefer the richer option list; keep first-seen position
+            keep_pos = by_num[n]
+            q["section"] = q.get("section") or keep_pos.get("section")
+            by_num[n] = q
+    questions = [by_num[n] for n in appearance_order]
 
     yes_no = {"yes", "no"}
     for q in questions:
@@ -402,13 +410,16 @@ def main():
     long_def["title"] = "General Feasibility (Long)"
     long_def["description"] = (
         "General Site Feasibility Survey (10 Sep 2026). "
+        "Question order matches the DOCX page order. "
         "Auto-prepended (Long or Short) on study surveys. "
         "Question IDs preserved where matched to prior GF / library items."
     )
     long_def["questions"] = built
     long_def["generalFeasibilityVariant"] = "long"
+    long_def["docxQuestionOrder"] = "appearance"
     long_def["updatedAt"] = now
     long_def["source"] = "gsf-docx-10sep2026"
+    long_def["docxPath"] = str(docx_path.name)
     long_def["tags"] = list(
         dict.fromkeys((long_def.get("tags") or []) + ["general-feasibility", "general-feasibility-long", "gsf-2026"])
     )
