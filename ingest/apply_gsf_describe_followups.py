@@ -294,6 +294,21 @@ def main():
 
     now = datetime.now(timezone.utc).isoformat()
     long_def["questions"] = new_qs
+    long_def["pages"] = []
+    for q in new_qs:
+        title = (q.get("category") or q.get("section") or "General").strip() or "General"
+        if not long_def["pages"] or long_def["pages"][-1]["title"] != title:
+            long_def["pages"].append(
+                {"id": f"page-{len(long_def['pages']) + 1}", "title": title, "questionIds": []}
+            )
+        long_def["pages"][-1]["questionIds"].append(q["id"])
+    numbered = sum(
+        1
+        for q in new_qs
+        if isinstance(q.get("docxNum"), int)
+        and not (q.get("followUpOf") or "_fu_" in str(q.get("id") or "") or q.get("followUpSource"))
+    )
+    long_def["docxQuestionCount"] = numbered
     long_def["updatedAt"] = now
     long_def["describeFollowUpsSource"] = "docx-notes-10sep2026"
     def_c.upsert_item(long_def)
@@ -306,10 +321,23 @@ def main():
         if q.get("id") in short_ids or (q.get("followUpOf") in short_parents):
             short_qs.append(deepcopy(q))
     short_def["questions"] = short_qs
+    short_def["pages"] = [
+        {
+            "id": "page-short",
+            "title": "General Feasibility (Short)",
+            "questionIds": [q["id"] for q in short_qs if q.get("id")],
+        }
+    ]
+    short_def["docxQuestionCount"] = sum(
+        1
+        for q in short_qs
+        if isinstance(q.get("docxNum"), int)
+        and not (q.get("followUpOf") or "_fu_" in str(q.get("id") or "") or q.get("followUpSource"))
+    )
     short_def["updatedAt"] = now
     short_def["describeFollowUpsSource"] = "docx-notes-10sep2026"
     def_c.upsert_item(short_def)
-    print(f"Applied to Long ({after}) + Short ({len(short_qs)}) in Cosmos.")
+    print(f"Applied to Long ({after} cards, {numbered} numbered) + Short ({len(short_qs)}) in Cosmos.")
 
 
 if __name__ == "__main__":

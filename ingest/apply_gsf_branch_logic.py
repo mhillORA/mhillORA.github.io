@@ -1,11 +1,12 @@
 """
 Apply yellow-highlight Branch Logic from GSF DOCX onto Cosmos GF Long/Short.
 
-Keeps the 103 numbered DOCX questions only (no inserted inv/%/describe cards).
+Preserves 103 numbered DOCX questions + any describe/comment follow-up cards.
+Does not insert investigator/% extra cards (those stay as help on Q27/Q37).
 
 Yellow rules applied as showIf on existing numbered questions:
   1. Q21=No → hide Q22–Q26 (research-naïve)
-  2. Q27 options fixed to investigator count bands (details stay in Q27 help)
+  2. Q27 options fixed to investigator count bands (details in Q27 help)
   3. Q81 includes Anterior segment or Both → show Q82–Q83
   4. Q32 has any option other than "None commonly observed" → show Q33
   5. Q37 population note kept as help (no extra % question card)
@@ -28,7 +29,17 @@ REPO = Path(__file__).resolve().parents[1]
 
 
 def by_docx(questions):
-    return {q.get("docxNum"): q for q in questions if isinstance(q.get("docxNum"), int)}
+    """Primary numbered question per docxNum (skip describe follow-ups)."""
+    out = {}
+    for q in questions:
+        n = q.get("docxNum")
+        if not isinstance(n, int):
+            continue
+        if q.get("followUpOf") or "_fu_" in str(q.get("id") or "") or q.get("followUpSource"):
+            continue
+        if n not in out:
+            out[n] = q
+    return out
 
 
 def qid(questions, num):
@@ -67,16 +78,24 @@ def ensure_question(questions, *, after_num, new_q):
 
 
 def apply_to_questions(questions: list) -> list:
-    # Keep one card per DOCX number (appearance order). Drop follow-up / inv extras.
-    seen = set()
+    # Keep numbered parents (first per docxNum) + describe/comment follow-ups.
+    # Drop investigator / % estimate extras that are not followUpOf docx notes.
+    seen_primary = set()
     qs = []
     for q in deepcopy(questions):
+        qid_s = str(q.get("id") or "")
+        if q.get("followUpOf") or "_fu_" in qid_s or q.get("followUpSource"):
+            qs.append(q)
+            continue
         num = q.get("docxNum")
         if not isinstance(num, int):
             continue
-        if num in seen:
+        # Skip legacy inv / 037b cards if re-synced with them present
+        if qid_s.startswith(("gsf_027a_", "gsf_027b_", "gsf_027c_", "gsf_027d_", "gsf_027e_", "gsf_027f_", "gsf_027g_", "gsf_037b_")):
             continue
-        seen.add(num)
+        if num in seen_primary:
+            continue
+        seen_primary.add(num)
         qs.append(q)
 
     id21 = qid(qs, 21)
