@@ -415,8 +415,6 @@ function defaultInviteSubjectTemplate() {
 
 function defaultInviteBodyTemplate() {
     return [
-        'Dear PI and SC,',
-        '',
         'Thank you again for your interest in {{studyCode}}, {{studyTitle}}.',
         '',
         'I have attached {{attachmentNames}} for your review and support of the next step, the Feasibility Survey. The survey will take approximately 30 minutes, depending on the answers. All information provided via this survey will be kept confidential.',
