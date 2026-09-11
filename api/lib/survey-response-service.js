@@ -14,10 +14,21 @@ const {
     normalizeGeneralFeasibilityVariant,
     isGeneralFeasibilitySurveyId,
 } = require('./survey-compare');
-const { GF_OLD_QID_TO_LIB, GF_OLD_LABEL_TO_LIB, resolveGfBridgeLibraryId } = require('./gf-question-bridges');
+const {
+    resolveGfBridgeLibraryId,
+    resolveSourceLibraryId,
+    reshapeBridgeAnswer,
+} = require('./gf-question-bridges');
 
 function resolveStoredAnswerLibraryId(a) {
     return resolveGfBridgeLibraryId(a);
+}
+
+function readBridgedAnswerValue(a) {
+    const raw = readAnswerValue(a);
+    if (!raw) return '';
+    const shaped = reshapeBridgeAnswer(resolveGfBridgeLibraryId(a), raw, resolveSourceLibraryId(a));
+    return shaped ? shaped.value : '';
 }
 
 function sortByIsoDesc(rows, keys) {
@@ -94,7 +105,9 @@ function buildPrefillMapForQuestions(questions, responseList, { preferRole } = {
                 );
             }
             if (found) {
-                map[qid] = readAnswerValue(found);
+                const bridged = readBridgedAnswerValue(found);
+                if (!bridged) continue;
+                map[qid] = bridged;
                 break;
             }
         }

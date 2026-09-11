@@ -228,19 +228,34 @@ function assertTokenUsable(assignment) {
 async function resolveSiteName(getContainer, siteId) {
     try {
         const read = await getContainer(SITES).item(siteId, siteId).read();
-        return read.resource?.name || siteId;
-    } catch (_) {
-        return siteId;
-    }
+        if (read.resource?.name) return read.resource.name;
+    } catch (_) {}
+    try {
+        const read = await getContainer('legacy-sites').item(siteId, siteId).read();
+        if (read.resource?.name) return read.resource.name;
+    } catch (_) {}
+    return siteId;
 }
 
 async function loadSiteDoc(getContainer, siteId) {
     try {
         const read = await getContainer(SITES).item(siteId, siteId).read();
-        return read.resource || null;
-    } catch (_) {
-        return null;
-    }
+        if (read.resource) return read.resource;
+    } catch (_) {}
+    try {
+        const read = await getContainer('legacy-sites').item(siteId, siteId).read();
+        if (read.resource) {
+            const leg = read.resource;
+            return {
+                ...leg,
+                siteCoordinator: leg.siteCoordinator || leg.coordinator || '',
+                siteCoordinatorEmail: leg.siteCoordinatorEmail || leg.coordinatorEmail || '',
+                pi: leg.pi || leg.piName || '',
+                _fromLegacy: true,
+            };
+        }
+    } catch (_) {}
+    return null;
 }
 
 async function loadStaffForRole(getContainer, siteId, targetRole) {
@@ -277,6 +292,16 @@ async function resolveRecipientEmail(getContainer, siteId, targetRole) {
             if (role === 'coordinator' && site.siteCoordinatorEmail) {
                 return String(site.siteCoordinatorEmail).trim();
             }
+        }
+    } catch (_) {}
+
+    try {
+        const legRead = await getContainer('legacy-sites').item(siteId, siteId).read();
+        const leg = legRead.resource;
+        if (leg) {
+            if (role === 'pi' && leg.piEmail) return String(leg.piEmail).trim();
+            const coordEmail = leg.siteCoordinatorEmail || leg.coordinatorEmail;
+            if (role === 'coordinator' && coordEmail) return String(coordEmail).trim();
         }
     } catch (_) {}
 

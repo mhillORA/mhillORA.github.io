@@ -1,6 +1,6 @@
 /**
  * Old GF / Monday / SurveyMonkey answer ids & labels → libraryQuestionId
- * for the Sep 2026 Long form (+ historical fields bridged back onto Long).
+ * for the Sep 2026 Long form. Map-only — never edits the survey definition.
  */
 const GF_OLD_QID_TO_LIB = {
     // Live / prior GF long ids
@@ -122,7 +122,18 @@ const GF_OLD_LABEL_TO_LIB = {
     'allergy database': 'ql-gf-36-allergy-database',
 };
 
-function resolveGfBridgeLibraryId(a) {
+/**
+ * Only genuine concept overlaps onto an existing bible field.
+ * A Form 483 is issued after a regulatory inspection → implies "ever audited" = Yes.
+ * Do NOT map trials counts, DED/allergy DB sizes, specialties, coordinator headcount,
+ * patient-ID methods, etc. — those are different questions with no home on Long.
+ */
+const GF_LIB_FALLBACK_TO_BIBLE = {
+    'ql-gf-27-483': 'ql-gf-26-past-fda-audits',
+    'ql-gf-28-483-year': 'ql-gf-26-past-fda-audits',
+};
+
+function resolveSourceLibraryId(a) {
     const qid = String(a?.questionId ?? a?.id ?? '');
     const lib = String(a?.libraryQuestionId || '');
     if (lib) return lib;
@@ -141,8 +152,48 @@ function resolveGfBridgeLibraryId(a) {
     return '';
 }
 
+function applyBibleFallback(libId) {
+    const lib = String(libId || '');
+    if (!lib) return '';
+    return GF_LIB_FALLBACK_TO_BIBLE[lib] || lib;
+}
+
+function resolveGfBridgeLibraryId(a) {
+    return applyBibleFallback(resolveSourceLibraryId(a));
+}
+
+/**
+ * Shape values when routing 483 answers onto the audits question.
+ * Returns { libraryQuestionId, value } or null to skip (do not invent a mismatch).
+ */
+function reshapeBridgeAnswer(resolvedLib, rawValue, sourceLib) {
+    const val = String(rawValue ?? '').trim();
+    if (!val) return null;
+    const src = String(sourceLib || '');
+    const dest = String(resolvedLib || '');
+    if (!dest) return null;
+
+    if (dest === 'ql-gf-26-past-fda-audits') {
+        // 483 year implies an inspection occurred
+        if (src.includes('483-year') || src.includes('gf-28')) {
+            return { libraryQuestionId: dest, value: `Yes (483 year: ${val})` };
+        }
+        // 483 Yes ⇒ audited Yes; 483 No does NOT mean never audited — skip
+        if (src.includes('483') || src.includes('gf-27')) {
+            if (/^yes$/i.test(val)) return { libraryQuestionId: dest, value: 'Yes' };
+            return null;
+        }
+    }
+
+    return { libraryQuestionId: dest, value: val };
+}
+
 module.exports = {
     GF_OLD_QID_TO_LIB,
     GF_OLD_LABEL_TO_LIB,
+    GF_LIB_FALLBACK_TO_BIBLE,
+    resolveSourceLibraryId,
     resolveGfBridgeLibraryId,
+    applyBibleFallback,
+    reshapeBridgeAnswer,
 };

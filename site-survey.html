@@ -645,20 +645,66 @@
       return `<input id="${escapeHtml(id)}" name="${escapeHtml(id)}" type="text" value="${escapeHtml(val)}" ${reqNative} ${reqDeferred} placeholder="Your answer" />`;
     }
 
-    function isRowFilled(row) {
-      if (!row) return false;
+    function normalizeCompareValue(v) {
+      if (Array.isArray(v)) {
+        return v.map((x) => String(x ?? '').trim()).filter(Boolean).sort().join('||');
+      }
+      return String(v ?? '').trim();
+    }
+
+    /** True only when prefill would actually appear selected/filled in the control (not a ghost unmatched value). */
+    function prefillIsShown(q, pre) {
+      const type = (q.type || 'text').toLowerCase();
+      const opts = Array.isArray(q.options) ? q.options : [];
+      if (type === 'multiselect' || type === 'checkboxes' || type === 'checkbox') {
+        const selected = parseMultiDefaults(pre);
+        if (!selected.length) return false;
+        if (!opts.length) return true;
+        const allowed = new Set(opts.map((o) => String(optionValue(o))));
+        const labels = new Set(opts.map((o) => String(optionLabel(o))));
+        return selected.some((s) => allowed.has(String(s)) || labels.has(String(s)));
+      }
+      const s = String(pre ?? '').trim();
+      if (!s) return false;
+      const useRadio = type === 'radio' || type === 'yesno'
+        || (type === 'select' && (isYesNoOptions(opts) || opts.length <= 8));
+      if ((useRadio || type === 'select') && opts.length) {
+        return opts.some((o) => String(optionValue(o)) === s || String(optionLabel(o)) === s);
+      }
+      return true;
+    }
+
+    function shownPrefillValue(q, pre) {
+      if (!prefillIsShown(q, pre)) return '';
+      const type = (q.type || 'text').toLowerCase();
+      if (type === 'multiselect' || type === 'checkboxes' || type === 'checkbox') {
+        return normalizeCompareValue(parseMultiDefaults(pre));
+      }
+      return normalizeCompareValue(pre);
+    }
+
+    function rowAnswerValue(row) {
+      if (!row) return '';
       const qid = row.getAttribute('data-qid');
-      if (!qid) return false;
+      if (!qid) return '';
+      const esc = CSS.escape ? CSS.escape(qid) : qid;
       const multi = row.querySelector('[data-multiselect="true"]');
       if (multi) {
-        return row.querySelectorAll(`input[type="checkbox"][name="${CSS.escape ? CSS.escape(qid) : qid}"]:checked`).length > 0;
+        return normalizeCompareValue(
+          [...row.querySelectorAll(`input[type="checkbox"][name="${esc}"]:checked`)].map((el) => el.value)
+        );
       }
       const radio = row.querySelector('[data-radio-group="true"]');
       if (radio) {
-        return row.querySelectorAll(`input[type="radio"][name="${CSS.escape ? CSS.escape(qid) : qid}"]:checked`).length > 0;
+        const checked = row.querySelector(`input[type="radio"][name="${esc}"]:checked`);
+        return normalizeCompareValue(checked?.value || '');
       }
-      const field = row.querySelector(`[name="${CSS.escape ? CSS.escape(qid) : qid}"]`);
-      return !!(field && String(field.value || '').trim() !== '');
+      const field = row.querySelector(`[name="${esc}"]`);
+      return normalizeCompareValue(field?.value || '');
+    }
+
+    function isRowFilled(row) {
+      return rowAnswerValue(row) !== '';
     }
 
     function syncFillAndConfirm(form) {
@@ -669,10 +715,13 @@
         row.classList.toggle('is-empty', !filled);
         const confirmWrap = row.querySelector('.q-confirm');
         if (!confirmWrap) return;
-        // Confirm only when we already had an answer on file (prefill).
-        // Blank questions are just filled in — no confirm until a later invite prefills them.
+        // Confirm only for answers that were visibly prefilled AND left unchanged.
+        // Blank fills / edits to a new value = no confirm checkbox.
         const wasAnswered = confirmWrap.getAttribute('data-was-answered') === 'true';
-        const showConfirm = wasAnswered && filled;
+        const original = confirmWrap.getAttribute('data-prefill-value') || '';
+        const current = rowAnswerValue(row);
+        const unchanged = wasAnswered && original !== '' && current === original;
+        const showConfirm = unchanged && filled;
         confirmWrap.hidden = !showConfirm;
         if (!showConfirm) {
           const input = confirmWrap.querySelector('input[data-confirm-for]');
@@ -761,15 +810,7 @@
 
     function updateProgress(form) {
       const rows = [...form.querySelectorAll('.q')].filter((r) => !r.classList.contains('hidden'));
-      const filled = rows.filter((r) => {
-        const qid = r.getAttribute('data-qid');
-        const multi = r.querySelector('[data-multiselect="true"]');
-        if (multi) {
-          return r.querySelectorAll(`input[type="checkbox"][name="${CSS.escape ? CSS.escape(qid) : qid}"]:checked`).length > 0;
-        }
-        const field = r.querySelector(`[name="${CSS.escape ? CSS.escape(qid) : qid}"]`);
-        return field && String(field.value || '').trim() !== '';
-      }).length;
+      const filled = rows.filter((r) => isRowFilled(r)).length;
       const pct = rows.length ? Math.round((filled / rows.length) * 100) : 0;
       const bar = document.getElementById('progress-bar');
       const lbl = document.getElementById('progress-text');
@@ -1018,16 +1059,14 @@
         const pre = defaults[qid] ?? '';
         const { reqHtml, reqNative, reqDeferred } = reqBits(q);
         const help = q.help || q.context || q.description || '';
-        const type = (q.type || 'text').toLowerCase();
-        const wasAnswered = type === 'multiselect' || type === 'checkboxes' || type === 'checkbox'
-          ? parseMultiDefaults(pre).length > 0
-          : String(pre ?? '').trim() !== '';
+        const prefillShown = shownPrefillValue(q, pre);
+        const wasAnswered = prefillShown !== '';
         const confirmId = `${qid}__confirmed`;
         return `<div class="question q" data-qid="${escapeHtml(qid)}" data-page-idx="${pageIdx}" ${logicAttrs(q)}>
           <div class="q-text">${escapeHtml(label)}${reqHtml}</div>
           ${help ? `<div class="q-context">${escapeHtml(help)}</div>` : ''}
           ${fieldControl(q, qid, pre, reqNative, reqDeferred)}
-          <label class="q-confirm" for="${escapeHtml(confirmId)}" data-was-answered="${wasAnswered ? 'true' : 'false'}" hidden>
+          <label class="q-confirm" for="${escapeHtml(confirmId)}" data-was-answered="${wasAnswered ? 'true' : 'false'}" data-prefill-value="${escapeHtml(prefillShown)}" hidden>
             <input id="${escapeHtml(confirmId)}" type="checkbox" name="${escapeHtml(confirmId)}" data-confirm-for="${escapeHtml(qid)}" />
             <span><strong>Confirm</strong> this information is correct</span>
           </label>

@@ -1731,6 +1731,9 @@
                     case 'sites':
                         mainContentArea.innerHTML = getSitesHTML();
                         renderAllSites();
+                        refreshArtemisLegacySiteIndex()
+                            .then(() => renderAllSites())
+                            .catch(() => {});
                         if (window.__pendingLiveSiteId) {
                             const pendingLiveId = window.__pendingLiveSiteId;
                             window.__pendingLiveSiteId = null;
@@ -2852,11 +2855,80 @@
                 site.legacySiteIds.forEach((id) => { if (id) ids.add(id); });
             }
             if (site?.promotedFromLegacySiteId) ids.add(site.promotedFromLegacySiteId);
+            // Any Master Site List row linked to this live site
+            legacySitesCatalog().forEach((leg) => {
+                if (leg?.linkedArtemisSiteId && (leg.linkedArtemisSiteId === siteId || leg.id === siteId)) {
+                    if (leg.id) ids.add(leg.id);
+                    if (leg.linkedArtemisSiteId) ids.add(leg.linkedArtemisSiteId);
+                }
+            });
+            // If looking up a legacy id, also pull its live twin + that twin's other legacy ids
+            const legSelf = legacySitesCatalog().find((s) => s && s.id === siteId);
+            if (legSelf?.linkedArtemisSiteId) {
+                ids.add(legSelf.linkedArtemisSiteId);
+                const twin = (allSites || []).find((s) => s && s.id === legSelf.linkedArtemisSiteId);
+                if (Array.isArray(twin?.legacySiteIds)) {
+                    twin.legacySiteIds.forEach((id) => { if (id) ids.add(id); });
+                }
+            }
             const legacy = getArtemisSiteLegacyStats(siteId);
             if (Array.isArray(legacy?.legacySiteIds)) {
                 legacy.legacySiteIds.forEach((id) => { if (id) ids.add(id); });
             }
             return ids;
+        };
+
+        /**
+         * One list for Sites tab + survey send: live sites, plus unlinked Master Site List rows.
+         * Linked legacy rows collapse into their live twin (history still reachable via siteIdsForSurveyLookup).
+         */
+        const buildUnifiedSitesCatalog = () => {
+            const live = Array.isArray(allSites) ? allSites : [];
+            const legacy = legacySitesCatalog();
+            const linkedLegacyIds = new Set(
+                legacy.filter((s) => s?.linkedArtemisSiteId).map((s) => s.id)
+            );
+            const rows = live.map((s) => {
+                const linked = legacy.filter((l) => l && (
+                    l.linkedArtemisSiteId === s.id
+                    || (Array.isArray(s.legacySiteIds) && s.legacySiteIds.includes(l.id))
+                    || s.promotedFromLegacySiteId === l.id
+                ));
+                return {
+                    ...s,
+                    _catalog: linked.length ? 'linked' : 'live',
+                    _source: 'live',
+                    _linkedLegacyIds: linked.map((l) => l.id),
+                    _linkedLegacyNames: linked.map((l) => l.name).filter(Boolean),
+                };
+            });
+            legacy.forEach((leg) => {
+                if (!leg?.id || linkedLegacyIds.has(leg.id)) return;
+                // Also skip if already represented via live.legacySiteIds without linkedArtemisSiteId set
+                const covered = live.some((s) =>
+                    s.promotedFromLegacySiteId === leg.id
+                    || (Array.isArray(s.legacySiteIds) && s.legacySiteIds.includes(leg.id))
+                );
+                if (covered) return;
+                rows.push({
+                    id: leg.id,
+                    name: leg.name || leg.institution_name || leg.id,
+                    status: 'Legacy',
+                    pi: leg.pi || leg.piName || '',
+                    piEmail: leg.piEmail || '',
+                    siteCoordinator: leg.siteCoordinator || leg.coordinator || '',
+                    siteCoordinatorEmail: leg.siteCoordinatorEmail || leg.coordinatorEmail || '',
+                    address: leg.address || leg.street || '',
+                    city: leg.city || '',
+                    state: leg.state || '',
+                    zip: leg.zip || '',
+                    indication: leg.indicationsCovered || leg.indication || [],
+                    _catalog: 'legacy',
+                    _source: 'legacy',
+                    _legacyDoc: leg,
+                });
+            });
+            return rows.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
         };
 
         const latestSurveyResponsesBySurvey = (siteId) => {
@@ -3449,7 +3521,13 @@
             'allergy database': 'ql-gf-36-allergy-database',
         };
 
-        const resolveAnswerLibraryId = (a) => {
+        /** Only genuine overlaps: Form 483 ⇒ regulatory audit occurred. */
+        const GF_LIB_FALLBACK_TO_BIBLE = {
+            'ql-gf-27-483': 'ql-gf-26-past-fda-audits',
+            'ql-gf-28-483-year': 'ql-gf-26-past-fda-audits',
+        };
+
+        const resolveSourceLibraryId = (a) => {
             const qid = String(a?.questionId ?? a?.id ?? '');
             const lib = String(a?.libraryQuestionId || '');
             if (lib) return lib;
@@ -3463,6 +3541,30 @@
                 return 'ql-gf-20-please-indicate-the-types-of-ophthalmic-studies-your-sit';
             }
             return '';
+        };
+
+        const resolveAnswerLibraryId = (a) => {
+            const src = resolveSourceLibraryId(a);
+            return (src && GF_LIB_FALLBACK_TO_BIBLE[src]) || src || '';
+        };
+
+        /** Shape 483 → audits; skip 483=No (does not mean never audited). */
+        const reshapeBridgeAnswer = (resolvedLib, rawValue, sourceLib) => {
+            const val = String(rawValue ?? '').trim();
+            if (!val) return null;
+            const src = String(sourceLib || '');
+            const dest = String(resolvedLib || '');
+            if (!dest) return null;
+            if (dest === 'ql-gf-26-past-fda-audits') {
+                if (src.includes('483-year') || src.includes('gf-28')) {
+                    return { libraryQuestionId: dest, value: `Yes (483 year: ${val})` };
+                }
+                if (src.includes('483') || src.includes('gf-27')) {
+                    if (/^yes$/i.test(val)) return { libraryQuestionId: dest, value: 'Yes' };
+                    return null;
+                }
+            }
+            return { libraryQuestionId: dest, value: val };
         };
 
         const findAnswerForQuestion = (response, question) => {
@@ -3522,14 +3624,18 @@
             };
             responses.forEach((resp) => {
                 asSurveyList(resp.answers).forEach((a) => {
-                    const val = readSurveyAnswerValue(a);
-                    if (!val) return;
+                    const rawVal = readSurveyAnswerValue(a);
+                    if (!rawVal) return;
+                    const sourceLib = resolveSourceLibraryId(a);
+                    const destLib = resolveAnswerLibraryId(a);
+                    const shaped = reshapeBridgeAnswer(destLib, rawVal, sourceLib);
+                    if (!shaped) return;
                     const entry = {
-                        value: val,
+                        value: shaped.value,
                         type: a.type || 'text',
                         label: a.label || a.title || '',
                         questionId: String(a.questionId ?? a.id ?? ''),
-                        libraryQuestionId: resolveAnswerLibraryId(a),
+                        libraryQuestionId: shaped.libraryQuestionId,
                         surveyId: resp.surveyId,
                         responseId: resp.id,
                         submittedAt: resp.submittedAt || resp.updatedAt || resp.createdAt || '',
@@ -6662,7 +6768,7 @@
             const allDefs = (allSiteSurveyDefinitions || []).slice().sort((a, b) => (a.title || '').localeCompare(b.title || ''));
             const predefined = allDefs.filter(isPredefinedSurveyDef);
             const custom = allDefs.filter(d => !isPredefinedSurveyDef(d));
-            const sites = (allSites || []).slice().sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+            const sites = buildUnifiedSitesCatalog();
             const noDefs = allDefs.length === 0;
             const noSites = sites.length === 0;
             const prefillSiteId = prefill.siteId || '';
@@ -6690,6 +6796,7 @@
                 const pi = emailFor(s, 'pi');
                 const coord = emailFor(s, 'coordinator');
                 const priorCount = allPriorSurveyResponsesForSite(s.id).length;
+                const tag = s._catalog === 'legacy' ? 'Master' : s._catalog === 'linked' ? 'Linked' : 'Live';
                 const priorBadge = priorCount
                     ? `<span class="inline-flex mt-1 text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-200">${priorCount} prior</span>`
                     : `<span class="inline-flex mt-1 text-[10px] px-1.5 py-0.5 rounded-full bg-gray-100 text-gray-500 dark:bg-gray-700 dark:text-gray-400">No prior</span>`;
@@ -6697,7 +6804,7 @@
                     <label class="flex items-start gap-3 p-2 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700/50 border border-transparent hover:border-gray-200 dark:hover:border-gray-600">
                         <input type="checkbox" name="siteIds" value="${escapeHtml(s.id)}" class="mt-1" ${checked} ${noSites ? 'disabled' : ''} />
                         <span class="min-w-0">
-                            <span class="block font-medium text-gray-900 dark:text-gray-100 truncate">${escapeHtml(s.name || s.id)}</span>
+                            <span class="block font-medium text-gray-900 dark:text-gray-100 truncate">${escapeHtml(s.name || s.id)} <span class="text-[10px] font-semibold text-gray-500">${escapeHtml(tag)}</span></span>
                             <span class="block text-xs text-gray-500 dark:text-gray-400 truncate">PI: ${escapeHtml(pi || 'no email')} · Coord: ${escapeHtml(coord || 'no email')}</span>
                             ${priorBadge}
                         </span>
@@ -7000,7 +7107,7 @@
             <div class="px-4 py-6 sm:px-0 space-y-8">
                  ${workspacePeopleSubnav('sites')}
                  <div class="flex flex-col sm:flex-row justify-between items-center">
-                      <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200 mb-4 sm:mb-0">Site Management</h2>
+                      <h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200 mb-4 sm:mb-0">Site Management <span class="text-base font-normal text-gray-500 dark:text-gray-400">· live + master list</span></h2>
                       <div class="flex items-center space-x-2">
                           <button id="bulk-delete-site-btn" class="hidden inline-flex items-center px-4 py-2 border border-red-300 text-sm font-medium rounded-md shadow-sm text-red-700 bg-red-100 hover:bg-red-200">
                               ${getIcon('trash')}
@@ -7014,13 +7121,26 @@
                  </div>
                  <div class="mb-4 space-y-4">
                      <input type="text" id="site-search-input" placeholder="Search by site name..." class="w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 bg-white dark:bg-gray-700 dark:text-gray-200">
-                     <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md p-4">
-                         <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Filter by Site Status</label>
-                         <select id="site-status-filter" class="w-full sm:w-auto p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
-                             <option value="all">All Sites</option>
-                             <option value="Active">Active Sites</option>
-                             <option value="Inactive">Inactive Sites</option>
-                         </select>
+                     <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md p-4 flex flex-col sm:flex-row gap-3 sm:items-end">
+                         <div class="flex-1">
+                             <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Catalog</label>
+                             <select id="site-catalog-filter" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                 <option value="all">All sites (live + master list)</option>
+                                 <option value="live">Live / scheduling only</option>
+                                 <option value="linked">Linked (live + legacy history)</option>
+                                 <option value="legacy">Master list only (unlinked)</option>
+                             </select>
+                         </div>
+                         <div class="flex-1">
+                             <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Status</label>
+                             <select id="site-status-filter" class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white">
+                                 <option value="all">All statuses</option>
+                                 <option value="Active">Active</option>
+                                 <option value="Inactive">Inactive</option>
+                                 <option value="Legacy">Legacy</option>
+                             </select>
+                         </div>
+                         <div class="text-xs text-gray-500 dark:text-gray-400 pb-2" id="site-catalog-count"></div>
                      </div>
                  </div>
                  <div class="bg-white dark:bg-gray-800 rounded-lg shadow-md overflow-x-auto">
@@ -7908,79 +8028,112 @@
             return true; // Patient is eligible
         };
         
-        const renderAllSites = (sitesToRender = allSites) => {
+        const renderAllSites = (sitesToRender = null) => {
             const sitesTableBody = document.getElementById('sites-table-body');
-            if(sitesTableBody) {
-                // Apply site status filter
-                const siteStatusFilter = document.getElementById('site-status-filter')?.value || 'all';
-                let filteredSites = [...sitesToRender];
-                
-                if (siteStatusFilter === 'Active') {
-                    filteredSites = filteredSites.filter(s => s.status === 'Active');
-                } else if (siteStatusFilter === 'Inactive') {
-                    filteredSites = filteredSites.filter(s => s.status === 'Inactive');
-                }
-                
-                if (filteredSites.length === 0) {
-                    sitesTableBody.innerHTML = `<tr><td colspan="9" class="text-center py-8 text-gray-500 dark:text-gray-400">No sites found.</td></tr>`;
-                    return;
-                }
-                // Always sort sites alphabetically by name
-                const sortedSites = [...filteredSites].sort((a, b) => (a.name || '').localeCompare(b.name || ''));
-                sitesTableBody.innerHTML = sortedSites.map(site => {
-                    const sitePatients = allPatients.filter(p => {
-                        const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
-                        return currentEnrollment?.siteId === site.id;
-                    });
-                    const enrolled = sitePatients.filter(p => p.status && p.status.toLowerCase() === 'enrolled').length;
-                    const screenFailed = sitePatients.filter(p => p.status && p.status.toLowerCase() === 'screen fail').length;
-                    const totalScreened = enrolled + screenFailed;
-                    const screenFailRate = totalScreened > 0 ? Math.round((screenFailed / totalScreened) * 100) : 0;
-                    const siteSurvey = siteSurveyStatusHtml(site.id);
-                    const legacyStats = getArtemisSiteLegacyStats(site.id);
-                    const latestTitle = siteSurvey.latest
-                        ? formatSiteSurveyDefinitionTitle(siteSurvey.latest.surveyId)
-                        : '';
+            if(!sitesTableBody) return;
+            const unified = Array.isArray(sitesToRender) ? sitesToRender : buildUnifiedSitesCatalog();
+            const siteStatusFilter = document.getElementById('site-status-filter')?.value || 'all';
+            const catalogFilter = document.getElementById('site-catalog-filter')?.value || 'all';
+            const search = String(document.getElementById('site-search-input')?.value || '').trim().toLowerCase();
+            let filteredSites = [...unified];
 
-                    return `
-                        <tr>
-                            <td class="px-6 py-4 whitespace-nowrap"><input type="checkbox" data-id="${site.id}" class="h-4 w-4 rounded border-gray-300 text-indigo-600 site-checkbox"></td>
-                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${site.status || 'N/A'}</td>
-                            <td class="px-6 py-4 whitespace-nowrap font-medium text-gray-900 dark:text-gray-100">
-                                <button type="button" class="view-site-details-btn text-left hover:underline" data-site-id="${escapeHtml(site.id)}">${escapeHtml(site.name)}</button>
-                                <div class="mt-1 flex flex-wrap items-center gap-1.5">${feasibilityOutdatedBadgeHtml(site.id, { compact: true })}</div>
-                            </td>
-                            <td class="px-6 py-4 text-sm text-gray-500 dark:text-gray-400">${escapeHtml(formatSiteInvestigatorsSummary(site))}</td>
-                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
-                                <div class="flex flex-wrap gap-1">
-                                    ${ensureArray(site.indication).map(ind => `<span class="text-xs bg-blue-100 text-blue-800 px-2 py-0.5 rounded-full">${ind}</span>`).join('')}
-                                </div>
-                            </td>
-                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${screenFailRate}%</td>
-                            <td class="px-6 py-4 whitespace-nowrap text-sm">
-                                ${legacyStats?.nStudies
-                                    ? `<div class="flex flex-col gap-0.5">
-                                        <span class="inline-flex w-fit items-center px-2 py-0.5 rounded-full text-[11px] font-semibold bg-violet-100 text-violet-800 dark:bg-violet-900/40 dark:text-violet-200">${legacyStats.nStudies} past</span>
-                                        <span class="text-[11px] text-gray-500 dark:text-gray-400">${Math.round(Number(legacyStats.enrolled || 0)).toLocaleString()} legacy enrolled</span>
-                                       </div>`
-                                    : `<span class="text-xs text-gray-400">—</span>`}
-                            </td>
-                            <td class="px-6 py-4 whitespace-nowrap text-sm">
-                                <div class="flex flex-col gap-1.5 min-w-[8rem]">
-                                    ${siteSurvey.pill}
-                                    ${latestTitle ? `<div class="text-xs text-gray-600 dark:text-gray-300 truncate max-w-[11rem] font-medium">${escapeHtml(latestTitle)}</div>` : ''}
-                                    ${siteSurvey.latest && siteSurvey.latest.score ? surveyScoreBadgeHtml(siteSurvey.latest) : ''}
-                                    <button type="button" class="view-site-details-btn text-left text-indigo-600 hover:text-indigo-800 dark:text-indigo-400 dark:hover:text-indigo-300 text-xs font-semibold" data-site-id="${escapeHtml(site.id)}" data-site-tab="surveys">View surveys →</button>
-                                </div>
-                            </td>
-                            <td class="sticky right-0 z-10 bg-white dark:bg-gray-800 px-6 py-4 whitespace-nowrap text-sm font-medium space-x-4 shadow-[-4px_0_6px_-4px_rgba(0,0,0,0.1)]">
-                                <button type="button" data-action="edit-site" data-id="${site.id}" class="text-indigo-600 hover:text-indigo-900 dark:text-indigo-400 dark:hover:text-indigo-300">Edit</button>
-                                <button type="button" data-action="delete-site" data-id="${site.id}" class="text-red-600 hover:text-red-900 dark:text-red-400 dark:hover:text-red-300">Delete</button>
-                            </td>
-                        </tr>
-                    `;
-                }).join('');
+            if (catalogFilter === 'live') {
+                filteredSites = filteredSites.filter((s) => s._catalog === 'live');
+            } else if (catalogFilter === 'linked') {
+                filteredSites = filteredSites.filter((s) => s._catalog === 'linked');
+            } else if (catalogFilter === 'legacy') {
+                filteredSites = filteredSites.filter((s) => s._catalog === 'legacy');
             }
+
+            if (siteStatusFilter === 'Active') {
+                filteredSites = filteredSites.filter(s => s.status === 'Active');
+            } else if (siteStatusFilter === 'Inactive') {
+                filteredSites = filteredSites.filter(s => s.status === 'Inactive');
+            } else if (siteStatusFilter === 'Legacy') {
+                filteredSites = filteredSites.filter(s => s.status === 'Legacy' || s._catalog === 'legacy');
+            }
+
+            if (search) {
+                filteredSites = filteredSites.filter((s) => String(s.name || '').toLowerCase().includes(search));
+            }
+
+            const countEl = document.getElementById('site-catalog-count');
+            if (countEl) {
+                const u = buildUnifiedSitesCatalog();
+                countEl.textContent = `Showing ${filteredSites.length} of ${u.length} · live ${u.filter(s=>s._catalog==='live').length} · linked ${u.filter(s=>s._catalog==='linked').length} · master-only ${u.filter(s=>s._catalog==='legacy').length}`;
+            }
+
+            if (filteredSites.length === 0) {
+                sitesTableBody.innerHTML = `<tr><td colspan="9" class="text-center py-8 text-gray-500 dark:text-gray-400">No sites found.</td></tr>`;
+                return;
+            }
+            const sortedSites = [...filteredSites].sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+            sitesTableBody.innerHTML = sortedSites.map(site => {
+                const isLegacyOnly = site._catalog === 'legacy';
+                const sitePatients = isLegacyOnly ? [] : allPatients.filter(p => {
+                    const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
+                    return currentEnrollment?.siteId === site.id;
+                });
+                const enrolled = sitePatients.filter(p => p.status && p.status.toLowerCase() === 'enrolled').length;
+                const screenFailed = sitePatients.filter(p => p.status && p.status.toLowerCase() === 'screen fail').length;
+                const totalScreened = enrolled + screenFailed;
+                const screenFailRate = totalScreened > 0 ? Math.round((screenFailed / totalScreened) * 100) : 0;
+                const siteSurvey = siteSurveyStatusHtml(site.id);
+                const legacyStats = getArtemisSiteLegacyStats(site.id);
+                const latestTitle = siteSurvey.latest
+                    ? formatSiteSurveyDefinitionTitle(siteSurvey.latest.surveyId)
+                    : '';
+                const catalogBadge = site._catalog === 'linked'
+                    ? `<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-200" title="Linked to Master Site List">Linked</span>`
+                    : site._catalog === 'legacy'
+                      ? `<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-amber-100 text-amber-900 dark:bg-amber-900/40 dark:text-amber-100" title="Master Site List only">Master list</span>`
+                      : `<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-slate-100 text-slate-700 dark:bg-slate-700 dark:text-slate-200">Live</span>`;
+                const linkedNote = (site._linkedLegacyNames || []).length
+                    ? `<div class="text-[11px] text-gray-500 dark:text-gray-400 truncate max-w-[14rem]" title="${escapeHtml((site._linkedLegacyNames || []).join(', '))}">History: ${escapeHtml((site._linkedLegacyNames || []).join(', '))}</div>`
+                    : '';
+
+                return `
+                    <tr>
+                        <td class="px-6 py-4 whitespace-nowrap"><input type="checkbox" data-id="${site.id}" class="h-4 w-4 rounded border-gray-300 text-indigo-600 site-checkbox" ${isLegacyOnly ? 'disabled title="Master-list rows are not bulk-deleted here"' : ''}></td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${escapeHtml(site.status || 'N/A')}</td>
+                        <td class="px-6 py-4 whitespace-nowrap font-medium text-gray-900 dark:text-gray-100">
+                            <button type="button" class="view-site-details-btn text-left hover:underline" data-site-id="${escapeHtml(site.id)}" ${isLegacyOnly ? 'data-site-source="legacy"' : ''}>${escapeHtml(site.name)}</button>
+                            <div class="mt-1 flex flex-wrap items-center gap-1.5">${catalogBadge}${feasibilityOutdatedBadgeHtml(site.id, { compact: true })}</div>
+                            ${linkedNote}
+                        </td>
+                        <td class="px-6 py-4 text-sm text-gray-500 dark:text-gray-400">${escapeHtml(formatSiteInvestigatorsSummary(site))}</td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                            <div class="flex flex-wrap gap-1">
+                                ${ensureArray(site.indication).map(ind => `<span class="text-xs bg-blue-100 text-blue-800 px-2 py-0.5 rounded-full">${escapeHtml(ind)}</span>`).join('')}
+                            </div>
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${isLegacyOnly ? '—' : `${screenFailRate}%`}</td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm">
+                            ${legacyStats?.nStudies
+                                ? `<div class="flex flex-col gap-0.5">
+                                    <span class="inline-flex w-fit items-center px-2 py-0.5 rounded-full text-[11px] font-semibold bg-violet-100 text-violet-800 dark:bg-violet-900/40 dark:text-violet-200">${legacyStats.nStudies} past</span>
+                                    <span class="text-[11px] text-gray-500 dark:text-gray-400">${Math.round(Number(legacyStats.enrolled || 0)).toLocaleString()} legacy enrolled</span>
+                                   </div>`
+                                : `<span class="text-xs text-gray-400">—</span>`}
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap text-sm">
+                            <div class="flex flex-col gap-1.5 min-w-[8rem]">
+                                ${siteSurvey.pill}
+                                ${latestTitle ? `<div class="text-xs text-gray-600 dark:text-gray-300 truncate max-w-[11rem] font-medium">${escapeHtml(latestTitle)}</div>` : ''}
+                                ${siteSurvey.latest && siteSurvey.latest.score ? surveyScoreBadgeHtml(siteSurvey.latest) : ''}
+                                <button type="button" class="view-site-details-btn text-left text-indigo-600 hover:text-indigo-800 dark:text-indigo-400 dark:hover:text-indigo-300 text-xs font-semibold" data-site-id="${escapeHtml(site.id)}" data-site-tab="surveys" ${isLegacyOnly ? 'data-site-source="legacy"' : ''}>View surveys →</button>
+                            </div>
+                        </td>
+                        <td class="sticky right-0 z-10 bg-white dark:bg-gray-800 px-6 py-4 whitespace-nowrap text-sm font-medium space-x-4 shadow-[-4px_0_6px_-4px_rgba(0,0,0,0.1)]">
+                            ${isLegacyOnly
+                                ? `<button type="button" class="send-site-survey-btn text-teal-700 hover:text-teal-900 dark:text-teal-300" data-site-id="${escapeHtml(site.id)}">Send survey</button>
+                                   <button type="button" class="view-site-details-btn text-indigo-600 hover:text-indigo-900 dark:text-indigo-400" data-site-id="${escapeHtml(site.id)}" data-site-source="legacy">Open</button>`
+                                : `<button type="button" data-action="edit-site" data-id="${site.id}" class="text-indigo-600 hover:text-indigo-900 dark:text-indigo-400 dark:hover:text-indigo-300">Edit</button>
+                                   <button type="button" data-action="delete-site" data-id="${site.id}" class="text-red-600 hover:text-red-900 dark:text-red-400 dark:hover:text-red-300">Delete</button>`}
+                        </td>
+                    </tr>
+                `;
+            }).join('');
         };
 
         const renderAllStudies = () => {
@@ -12806,8 +12959,16 @@
             if (viewSiteDetailsBtn) {
                 const siteId = viewSiteDetailsBtn.getAttribute('data-site-id');
                 const initialTab = viewSiteDetailsBtn.getAttribute('data-site-tab') || 'overview';
+                const source = viewSiteDetailsBtn.getAttribute('data-site-source') || '';
                 if (siteId) {
                     (async () => {
+                        if (source === 'legacy' || String(siteId).startsWith('legacy-') || String(siteId).includes('feas-')) {
+                            const isLive = (allSites || []).some((s) => s && s.id === siteId);
+                            if (!isLive && window.ArtemisLegacy?.openSiteDetail) {
+                                await window.ArtemisLegacy.openSiteDetail(siteId);
+                                return;
+                            }
+                        }
                         await Promise.all([
                             refreshArtemisLegacySiteIndex(),
                             refreshSiteSurveyDataForSite(siteId),
@@ -12815,6 +12976,12 @@
                         createSiteDetailsModal(siteId, { initialTab });
                     })();
                 }
+            }
+
+            if (e.target.closest('.send-site-survey-btn')) {
+                const btn = e.target.closest('.send-site-survey-btn');
+                const siteId = btn?.getAttribute('data-site-id');
+                if (siteId) createSiteSurveyAssignmentModal({ siteId });
             }
 
             const viewSiteSurveyResponseBtn = e.target.closest('.view-site-survey-response-btn');
@@ -12827,15 +12994,15 @@
 
         mainContentArea.addEventListener('input', (e) => {
             if (e.target.id === 'site-search-input') {
-                const searchTerm = e.target.value.toLowerCase();
-                const filteredSites = allSites.filter(site => 
-                    site.name.toLowerCase().includes(searchTerm)
-                );
-                renderAllSites(filteredSites);
+                renderAllSites();
             }
         });
 
         mainContentArea.addEventListener('change', (e) => {
+             if (e.target.id === 'site-status-filter' || e.target.id === 'site-catalog-filter') {
+                renderAllSites();
+                return;
+             }
              if (e.target.id === 'dash-role-select') {
                 applyDashboardRoleView(e.target.value || 'ops');
                 return;
