@@ -2931,6 +2931,20 @@
             return rows.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
         };
 
+        /** Prefer live site id whenever a Master Site List row is linked/promoted. */
+        const canonicalSiteIdForReporting = (siteId) => {
+            if (!siteId) return null;
+            const liveHit = (allSites || []).find((s) => s && (
+                s.id === siteId
+                || s.promotedFromLegacySiteId === siteId
+                || (Array.isArray(s.legacySiteIds) && s.legacySiteIds.includes(siteId))
+            ));
+            if (liveHit?.id) return liveHit.id;
+            const leg = legacySitesCatalog().find((s) => s && s.id === siteId);
+            if (leg?.linkedArtemisSiteId) return leg.linkedArtemisSiteId;
+            return siteId;
+        };
+
         const latestSurveyResponsesBySurvey = (siteId) => {
             const ids = siteIdsForSurveyLookup(siteId);
             const grouped = new Map();
@@ -3736,37 +3750,25 @@
             const isGf = surveyId === 'survey-general-feasibility'
                 || surveyId === 'survey-general-feasibility-short';
 
-            // Master Site List (legacy-sites ~437) + live Sites + anyone with responses.
-            const siteIdSet = new Set();
-            legacySitesCatalog().forEach((s) => { if (s?.id) siteIdSet.add(s.id); });
-            (allSites || []).forEach((s) => {
-                if (!s?.id) return;
-                siteIdSet.add(s.id);
-                if (s.promotedFromLegacySiteId) siteIdSet.add(s.promotedFromLegacySiteId);
-                (s.legacySiteIds || []).forEach((id) => { if (id) siteIdSet.add(id); });
+            // One logical site per row — same catalog as Sites tab (linked master rows collapse into live).
+            const canonicalSites = new Set(
+                buildUnifiedSitesCatalog().map((s) => s?.id).filter(Boolean)
+            );
+            const coveredAliases = new Set();
+            canonicalSites.forEach((id) => {
+                siteIdsForSurveyLookup(id).forEach((alias) => coveredAliases.add(alias));
             });
             (allSiteSurveyResponses || []).forEach((r) => {
                 if (!r || r._archived || !r.siteId) return;
                 if (roleFilter && roleFilter !== 'all'
                     && String(r.targetRole || '').toLowerCase() !== roleFilter) return;
-                if (isGf || r.surveyId === surveyId) siteIdSet.add(r.siteId);
-            });
-            // Canonicalize legacy aliases → live site id when possible; keep legacy ids otherwise
-            const canonicalSites = new Set();
-            siteIdSet.forEach((sid) => {
-                const live = (allSites || []).find((s) => s && (
-                    s.id === sid
-                    || (Array.isArray(s.legacySiteIds) && s.legacySiteIds.includes(sid))
-                    || s.promotedFromLegacySiteId === sid
-                ));
-                if (live?.id) {
-                    canonicalSites.add(live.id);
-                    return;
+                if (!(isGf || r.surveyId === surveyId)) return;
+                if (coveredAliases.has(r.siteId)) return;
+                const cid = canonicalSiteIdForReporting(r.siteId);
+                if (cid) {
+                    canonicalSites.add(cid);
+                    siteIdsForSurveyLookup(cid).forEach((alias) => coveredAliases.add(alias));
                 }
-                const legacy = legacySitesCatalog().find((s) => s && (
-                    s.id === sid || s.linkedArtemisSiteId === sid
-                ));
-                canonicalSites.add(legacy?.id || sid);
             });
 
             const siteRows = [];
@@ -4248,9 +4250,10 @@
             const bySite = new Map();
             assignments.forEach(a => {
                 if (!a.siteId) return;
-                const prev = bySite.get(a.siteId);
+                const cid = canonicalSiteIdForReporting(a.siteId) || a.siteId;
+                const prev = bySite.get(cid);
                 const rank = String(a.status || '').toLowerCase() === 'submitted' ? 2 : 1;
-                if (!prev || rank >= prev.rank) bySite.set(a.siteId, { assignment: a, rank });
+                if (!prev || rank >= prev.rank) bySite.set(cid, { assignment: a, rank });
             });
             const invited = bySite.size;
             const submitted = [...bySite.values()].filter(x => String(x.assignment.status || '').toLowerCase() === 'submitted').length;
@@ -7205,7 +7208,7 @@
 
 
 
-            const surveySiteRows = (allSites || []).slice()
+            const surveySiteRows = buildUnifiedSitesCatalog().slice()
 
                 .filter(site => {
 
@@ -7213,9 +7216,11 @@
 
                     if (!siteId) return false;
 
-                    const assignments = (allSiteSurveyAssignments || []).filter(a => a && a.siteId === siteId);
+                    const ids = siteIdsForSurveyLookup(siteId);
 
-                    const responses = (allSiteSurveyResponses || []).filter(r => r && r.siteId === siteId);
+                    const assignments = (allSiteSurveyAssignments || []).filter(a => a && ids.has(a.siteId));
+
+                    const responses = (allSiteSurveyResponses || []).filter(r => r && ids.has(r.siteId));
 
                     return assignments.length > 0 || responses.length > 0;
 
@@ -7227,9 +7232,11 @@
 
                     const siteId = site.id;
 
-                    const assignments = (allSiteSurveyAssignments || []).filter(a => a && a.siteId === siteId);
+                    const ids = siteIdsForSurveyLookup(siteId);
 
-                    const responses = (allSiteSurveyResponses || []).filter(r => r && r.siteId === siteId)
+                    const assignments = (allSiteSurveyAssignments || []).filter(a => a && ids.has(a.siteId));
+
+                    const responses = (allSiteSurveyResponses || []).filter(r => r && ids.has(r.siteId))
 
                         .slice()
 
