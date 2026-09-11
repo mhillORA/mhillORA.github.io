@@ -169,10 +169,32 @@ const getIdFromRequest = (request) => {
     return request.params.id;
 };
 
+const STUDY_STATUS_ALLOWED = new Set([
+    // NASA / clinical recruitment statuses
+    'recruiting', 'enrolling', 'active', 'completed', 'suspended', 'closed', 'archived',
+    // Legacy Artemis / chaos scheduler statuses
+    'inactive',
+]);
+
+const isAllowedStudyStatus = (status) => STUDY_STATUS_ALLOWED.has(String(status || '').trim().toLowerCase());
+
 const validateStudiesSchema = (data) => {
     const errors = [];
 
-    const isChaosFormat = data.name && data.color && (data.requiredRoles || data.sites);
+    // Prefer NASA/clinical validation when clinical fields exist. Many Artemis imports also carry
+    // name/color/sites — the old chaos-only status list rejected Archive / Recruiting (400).
+    const hasNasaClinicalShape = !!(
+        data.title
+        || data.protocolNumber
+        || Array.isArray(data.siteIds)
+        || data.washoutDays != null
+        || data.archived === true
+        || (data.status && ['recruiting', 'enrolling', 'closed', 'archived'].includes(String(data.status).toLowerCase()))
+    );
+    const isChaosFormat = !hasNasaClinicalShape
+        && data.name
+        && data.color
+        && (data.requiredRoles || data.sites);
 
     const isTimeString = (v) => typeof v === 'string' && /^\d{2}:\d{2}$/.test(v);
     const normalizeVisitProfiles = (visitProfiles) => {
@@ -206,6 +228,10 @@ const validateStudiesSchema = (data) => {
         });
     };
 
+    if (data.status && !isAllowedStudyStatus(data.status)) {
+        errors.push('status must be one of: Recruiting, Enrolling, Active, Completed, Suspended, Closed, Archived (or legacy active/inactive/completed/suspended)');
+    }
+
     if (isChaosFormat) {
         if (!data.name || typeof data.name !== 'string') {
             errors.push('name is required and must be a string');
@@ -235,10 +261,6 @@ const validateStudiesSchema = (data) => {
             errors.push('description must be a string');
         }
         
-        if (data.status && !['active', 'inactive', 'completed', 'suspended'].includes(data.status.toLowerCase())) {
-            errors.push('status must be one of: active, inactive, completed, suspended');
-        }
-        
         if (data.phase && typeof data.phase !== 'string') {
             errors.push('phase must be a string');
         }
@@ -249,8 +271,11 @@ const validateStudiesSchema = (data) => {
 
         normalizeVisitProfiles(data.visitProfiles);
     } else {
-        if (!data.title || typeof data.title !== 'string') {
+        // Accept Artemis name as title fallback so archive/status updates still validate
+        if ((!data.title || typeof data.title !== 'string') && !(data.name && typeof data.name === 'string')) {
             errors.push('title is required and must be a string');
+        } else if (data.title && typeof data.title !== 'string') {
+            errors.push('title must be a string');
         }
         
         if (data.protocolNumber && typeof data.protocolNumber !== 'string') {
@@ -259,10 +284,6 @@ const validateStudiesSchema = (data) => {
         
         if (data.target !== undefined && (typeof data.target !== 'number' || data.target < 0)) {
             errors.push('target must be a non-negative number');
-        }
-        
-        if (data.status && !['Recruiting', 'Enrolling', 'Active', 'Completed', 'Suspended', 'Closed', 'Archived'].includes(data.status)) {
-            errors.push('status must be one of: Recruiting, Enrolling, Active, Completed, Suspended, Closed, Archived');
         }
         
         if (data.indication && !Array.isArray(data.indication)) {
