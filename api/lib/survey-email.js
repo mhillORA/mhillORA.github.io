@@ -275,6 +275,7 @@ function inviteEmailCopy({
     opener,
     closer,
     subjectOverride,
+    bodyOverride,
 }) {
     const rolePart = String(roleSubjectLabel || roleLabel || 'Site').trim() || 'Site';
     const code = String(studyCode || '').trim();
@@ -283,20 +284,46 @@ function inviteEmailCopy({
         : `Feasibility Survey || ${rolePart}`;
     const subject = String(subjectOverride || '').trim().slice(0, 200) || defaultSubject;
 
-    const greet = String(greeting || 'Dear PI and SC,').trim() || 'Dear PI and SC,';
-    const studyLine =
-        String(studyTitle || '').trim() ||
-        (String(protocolName || '').trim()
-            ? String(protocolName).trim()
-            : 'this clinical trial');
-    const openText =
-        String(opener || '').trim() ||
-        `Thank you again for your interest in ${studyLine}.`;
     const names = Array.isArray(attachmentNames)
         ? attachmentNames.map((n) => String(n || '').trim()).filter(Boolean)
         : [];
     const due = String(dueDate || '').trim();
     const pwd = String(password || '').trim();
+    const dueFallback =
+        due || (expiresAt ? new Date(expiresAt).toLocaleDateString() : '');
+    const studyLine =
+        String(studyTitle || '').trim() ||
+        (String(protocolName || '').trim()
+            ? String(protocolName).trim()
+            : 'this clinical trial');
+
+    const customBody = String(bodyOverride || '').trim();
+    if (customBody) {
+        const vars = {
+            inviteUrl: inviteUrl || '',
+            link: inviteUrl || '',
+            password: pwd,
+            dueDate: dueFallback,
+            siteName: siteName || '',
+            role: rolePart,
+            roleLabel: String(roleLabel || rolePart),
+            studyCode: code,
+            studyTitle: studyLine,
+            attachmentNames: names.length ? names.join(', ') : '(none attached)',
+            attachments: names.length ? names.join(', ') : '(none attached)',
+        };
+        const text = applyBodyTemplate(customBody, vars);
+        return {
+            subject,
+            text,
+            html: plainTextToInviteHtml(text),
+        };
+    }
+
+    const greet = String(greeting || 'Dear PI and SC,').trim() || 'Dear PI and SC,';
+    const openText =
+        String(opener || '').trim() ||
+        `Thank you again for your interest in ${studyLine}.`;
     const closeText =
         String(closer || '').trim() ||
         'Thank you again for your time. We look forward to working with you on this study!';
@@ -307,11 +334,9 @@ function inviteEmailCopy({
           } for your review and support of the next step, the Feasibility Survey: ${names.join(', ')}.`
         : 'Please review any materials included with this invitation to support the next step, the Feasibility Survey.';
 
-    const dueLine = due
-        ? `Please complete this feasibility survey by ${due}.`
-        : expiresAt
-          ? `Please complete this feasibility survey by ${new Date(expiresAt).toLocaleDateString()}.`
-          : '';
+    const dueLine = dueFallback
+        ? `Please complete this feasibility survey by ${dueFallback}.`
+        : '';
 
     const textParts = [
         greet,
@@ -343,9 +368,7 @@ function inviteEmailCopy({
     if (pwd) htmlParts.push(`<p><strong>Password is ${escapeHtml(pwd)}</strong></p>`);
     if (dueLine) {
         htmlParts.push(
-            `<p>Please complete this feasibility survey by <strong>${escapeHtml(
-                due || (expiresAt ? new Date(expiresAt).toLocaleDateString() : '')
-            )}</strong>.</p>`
+            `<p>Please complete this feasibility survey by <strong>${escapeHtml(dueFallback)}</strong>.</p>`
         );
     }
     htmlParts.push(`<p>${escapeHtml(closeText)}</p>`, `<p>Best regards,<br/>The Ora Team</p>`);
@@ -358,6 +381,69 @@ function inviteEmailCopy({
         text: textParts.join('\n'),
         html: htmlParts.join('\n'),
     };
+}
+
+function applyBodyTemplate(template, vars) {
+    let text = String(template || '');
+    for (const [key, value] of Object.entries(vars || {})) {
+        const re = new RegExp(`\\{\\{\\s*${key}\\s*\\}\\}`, 'gi');
+        text = text.replace(re, value == null ? '' : String(value));
+    }
+    // Drop leftover empty password / due lines after blank substitution
+    text = text
+        .split('\n')
+        .filter((line) => {
+            const t = line.trim();
+            if (/^Password is\s*$/i.test(t)) return false;
+            if (/^Please complete this feasibility survey by\s*\.?$/i.test(t)) return false;
+            return true;
+        })
+        .join('\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+    return text;
+}
+
+function plainTextToInviteHtml(text) {
+    const blocks = String(text || '')
+        .split(/\n{2,}/)
+        .map((b) => b.trim())
+        .filter(Boolean);
+    if (!blocks.length) return '';
+    return blocks
+        .map((block) => {
+            const withBreaks = escapeHtml(block).replace(/\n/g, '<br/>');
+            // Autolink bare https URLs in custom body
+            const linked = withBreaks.replace(
+                /(https?:\/\/[^\s<]+)/g,
+                '<a href="$1">$1</a>'
+            );
+            return `<p>${linked}</p>`;
+        })
+        .join('\n');
+}
+
+function defaultInviteBodyTemplate() {
+    return [
+        'Dear PI and SC,',
+        '',
+        'Thank you again for your interest in {{studyTitle}}.',
+        '',
+        'I have attached the following documents for your review and support of the next step, the Feasibility Survey: {{attachmentNames}}.',
+        'The survey will take approximately 30 minutes, depending on the answers. All information provided via this survey will be kept confidential.',
+        '',
+        'Here is a link to the survey:',
+        '{{inviteUrl}}',
+        '',
+        'Password is {{password}}',
+        '',
+        'Please complete this feasibility survey by {{dueDate}}.',
+        '',
+        'Thank you again for your time. We look forward to working with you on this study!',
+        '',
+        'Best regards,',
+        'The Ora Team',
+    ].join('\n');
 }
 
 function opsNotifyCopy({ siteName, surveyTitle, roleLabel, status }) {
@@ -410,6 +496,7 @@ function emailProviderStatus() {
 module.exports = {
     deliverSurveyEmail,
     inviteEmailCopy,
+    defaultInviteBodyTemplate,
     opsNotifyCopy,
     emailProviderStatus,
 };

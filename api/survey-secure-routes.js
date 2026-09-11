@@ -1012,6 +1012,9 @@ function registerSurveySecureRoutes(app, deps) {
                 const inviteDueDate = String(body?.dueDate || body?.emailDueDate || '')
                     .trim()
                     .slice(0, 80);
+                const emailBodyTemplate = String(body?.emailBody || body?.body || '')
+                    .trim()
+                    .slice(0, 12000);
 
                 let attachmentMeta = [];
                 let emailFiles = [];
@@ -1108,6 +1111,7 @@ function registerSurveySecureRoutes(app, deps) {
                             emailCc: ccEmails.length ? ccEmails : undefined,
                             emailSubject: customSubject || undefined,
                             emailDueDate: inviteDueDate || undefined,
+                            emailBodyTemplate: emailBodyTemplate || undefined,
                             studyCode: studyCode || undefined,
                             studyTitle: studyTitle || undefined,
                             // Same hash on every assignment in this send — one password unlocks all links.
@@ -1141,6 +1145,7 @@ function registerSurveySecureRoutes(app, deps) {
                                 password: invitePassword,
                                 dueDate: inviteDueDate,
                                 subjectOverride: customSubject,
+                                bodyOverride: emailBodyTemplate,
                             });
                             emailResult = await deliverSurveyEmail({
                                 to: email,
@@ -1300,6 +1305,9 @@ function registerSurveySecureRoutes(app, deps) {
                         password: String(body?.password || body?.emailPassword || '').trim(),
                         dueDate: String(body?.dueDate || assignment.emailDueDate || '').trim(),
                         subjectOverride: resendSubject,
+                        bodyOverride: String(
+                            body?.emailBody || body?.body || assignment.emailBodyTemplate || ''
+                        ).trim(),
                     });
                     emailResult = await deliverSurveyEmail({
                         to: email,
