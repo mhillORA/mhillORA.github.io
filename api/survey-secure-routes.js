@@ -42,6 +42,7 @@ const {
 const {
     deliverSurveyEmail,
     inviteEmailCopy,
+    formatInviteCloseDate,
     opsNotifyCopy,
     emailProviderStatus,
 } = require('./lib/survey-email');
@@ -1009,9 +1010,6 @@ function registerSurveySecureRoutes(app, deps) {
                     .trim()
                     .slice(0, 80);
                 const invitePasswordHash = hashSurveyPassword(invitePassword);
-                const inviteDueDate = String(body?.dueDate || body?.emailDueDate || '')
-                    .trim()
-                    .slice(0, 80);
                 const emailBodyTemplate = String(body?.emailBody || body?.body || '')
                     .trim()
                     .slice(0, 12000);
@@ -1110,7 +1108,6 @@ function registerSurveySecureRoutes(app, deps) {
                             attachments: attachmentMeta.length ? attachmentMeta : undefined,
                             emailCc: ccEmails.length ? ccEmails : undefined,
                             emailSubject: customSubject || undefined,
-                            emailDueDate: inviteDueDate || undefined,
                             emailBodyTemplate: emailBodyTemplate || undefined,
                             studyCode: studyCode || undefined,
                             studyTitle: studyTitle || undefined,
@@ -1126,6 +1123,9 @@ function registerSurveySecureRoutes(app, deps) {
                             expiresInDays,
                             baseUrl,
                         });
+                        // Close date in email = calendar day of link expiry (today + days).
+                        const closeDateLabel = formatInviteCloseDate(assignment.expiresAt);
+                        assignment.emailDueDate = closeDateLabel || undefined;
                         if (validateSurveyAssignmentsSchema) {
                             validateSurveyAssignmentsSchema(assignment);
                         }
@@ -1143,7 +1143,7 @@ function registerSurveySecureRoutes(app, deps) {
                                 studyCode,
                                 studyTitle,
                                 password: invitePassword,
-                                dueDate: inviteDueDate,
+                                dueDate: closeDateLabel,
                                 subjectOverride: customSubject,
                                 bodyOverride: emailBodyTemplate,
                             });
@@ -1303,7 +1303,7 @@ function registerSurveySecureRoutes(app, deps) {
                         studyCode: assignment.studyCode,
                         studyTitle: assignment.studyTitle,
                         password: String(body?.password || body?.emailPassword || '').trim(),
-                        dueDate: String(body?.dueDate || assignment.emailDueDate || '').trim(),
+                        dueDate: formatInviteCloseDate(assignment.expiresAt),
                         subjectOverride: resendSubject,
                         bodyOverride: String(
                             body?.emailBody || body?.body || assignment.emailBodyTemplate || ''

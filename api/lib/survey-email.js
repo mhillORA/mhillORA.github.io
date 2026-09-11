@@ -259,6 +259,27 @@ async function deliverSurveyEmail({ to, subject, text, html, meta, cc, attachmen
     return { ok: false, mode: 'manual', error: 'no_email_provider' };
 }
 
+function formatInviteCloseDate(expiresAt) {
+    const t = Date.parse(expiresAt);
+    if (!Number.isFinite(t)) return '';
+    try {
+        return new Date(t).toLocaleDateString('en-US', {
+            weekday: 'long',
+            month: 'long',
+            day: 'numeric',
+            year: 'numeric',
+            timeZone: 'America/New_York',
+        });
+    } catch (_) {
+        return new Date(t).toLocaleDateString('en-US', {
+            weekday: 'long',
+            month: 'long',
+            day: 'numeric',
+            year: 'numeric',
+        });
+    }
+}
+
 function inviteEmailCopy({
     siteName,
     roleLabel,
@@ -287,10 +308,10 @@ function inviteEmailCopy({
     const names = Array.isArray(attachmentNames)
         ? attachmentNames.map((n) => String(n || '').trim()).filter(Boolean)
         : [];
-    const due = String(dueDate || '').trim();
     const pwd = String(password || '').trim();
+    // Close date is calculated from link expiry (today + days). Manual dueDate only as override.
     const dueFallback =
-        due || (expiresAt ? new Date(expiresAt).toLocaleDateString() : '');
+        String(dueDate || '').trim() || formatInviteCloseDate(expiresAt) || '';
     const studyLine =
         String(studyTitle || '').trim() ||
         (String(protocolName || '').trim()
@@ -304,6 +325,8 @@ function inviteEmailCopy({
             link: inviteUrl || '',
             password: pwd,
             dueDate: dueFallback,
+            closeDate: dueFallback,
+            expiresAt: dueFallback,
             siteName: siteName || '',
             role: rolePart,
             roleLabel: String(roleLabel || rolePart),
@@ -312,7 +335,15 @@ function inviteEmailCopy({
             attachmentNames: names.length ? names.join(', ') : '(none attached)',
             attachments: names.length ? names.join(', ') : '(none attached)',
         };
-        const text = applyBodyTemplate(customBody, vars);
+        let text = applyBodyTemplate(customBody, vars);
+        // If password was set but template omitted {{password}}, append it so it still appears.
+        if (pwd && !/\bpassword\b/i.test(text)) {
+            text = `${text}\n\nPassword is ${pwd}`.trim();
+        }
+        // If close date exists but template omitted it, append.
+        if (dueFallback && !/\b(by|before|due|complete|closes?)\b/i.test(text)) {
+            text = `${text}\n\nPlease complete this feasibility survey by ${dueFallback}.`.trim();
+        }
         return {
             subject,
             text,
@@ -497,6 +528,7 @@ module.exports = {
     deliverSurveyEmail,
     inviteEmailCopy,
     defaultInviteBodyTemplate,
+    formatInviteCloseDate,
     opsNotifyCopy,
     emailProviderStatus,
 };
