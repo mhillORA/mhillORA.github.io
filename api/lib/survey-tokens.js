@@ -29,6 +29,25 @@ function hashSurveyToken(raw) {
     return crypto.createHash('sha256').update(`${pepper()}:${String(raw || '')}`).digest('hex');
 }
 
+/** Shared batch invite password — same plaintext can unlock every link in one send. */
+function hashSurveyPassword(password) {
+    const p = String(password || '').trim();
+    if (!p) return null;
+    return crypto.createHash('sha256').update(`${pepper()}:survey-pw:${p}`).digest('hex');
+}
+
+function verifySurveyPassword(password, hash) {
+    if (!hash) return true;
+    const expected = String(hash || '');
+    const actual = hashSurveyPassword(password);
+    if (!actual || actual.length !== expected.length) return false;
+    try {
+        return crypto.timingSafeEqual(Buffer.from(actual, 'utf8'), Buffer.from(expected, 'utf8'));
+    } catch (_) {
+        return false;
+    }
+}
+
 function clampExpiresInDays(days) {
     const n = Number(days);
     if (!Number.isFinite(n)) return DEFAULT_TTL_DAYS;
@@ -59,10 +78,20 @@ function isPastHardExpiry(iso, graceDays = EXPIRY_GRACE_DAYS) {
 /** Strip secrets before returning assignment docs to any client. */
 function redactAssignment(doc) {
     if (!doc || typeof doc !== 'object') return doc;
-    const { tokenHash, tokenRaw, inviteToken, ...safe } = doc;
+    const {
+        tokenHash,
+        tokenRaw,
+        inviteToken,
+        passwordHash,
+        surveyPassword,
+        password,
+        emailPassword,
+        ...safe
+    } = doc;
     return {
         ...safe,
         hasInviteToken: Boolean(tokenHash),
+        requiresPassword: Boolean(passwordHash),
         tokenPrefix: doc.tokenPrefix || undefined,
     };
 }
@@ -77,6 +106,8 @@ module.exports = {
     EXPIRY_GRACE_DAYS,
     mintSurveyToken,
     hashSurveyToken,
+    hashSurveyPassword,
+    verifySurveyPassword,
     clampExpiresInDays,
     defaultExpiresAt,
     isExpired,

@@ -612,9 +612,17 @@
     };
 
     async function api(path, options = {}) {
+      const headers = {
+        'Content-Type': 'application/json',
+        ...(options.headers || {}),
+      };
+      const pw = getStoredSurveyPassword();
+      if (pw && !headers['X-Survey-Password']) {
+        headers['X-Survey-Password'] = pw;
+      }
       const res = await fetch(`${API}${path}`, {
-        headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
         ...options,
+        headers,
       });
       const text = await res.text();
       let data = null;
@@ -626,6 +634,70 @@
         throw err;
       }
       return data;
+    }
+
+    const passwordStorageKey = () => `ora-survey-pw:${token || ''}`;
+    function getStoredSurveyPassword() {
+      if (!token) return '';
+      try { return String(sessionStorage.getItem(passwordStorageKey()) || ''); } catch (_) { return ''; }
+    }
+    function setStoredSurveyPassword(pw) {
+      if (!token) return;
+      try {
+        const v = String(pw || '').trim();
+        if (v) sessionStorage.setItem(passwordStorageKey(), v);
+        else sessionStorage.removeItem(passwordStorageKey());
+      } catch (_) {}
+    }
+
+    function renderPasswordGate(payload, errorMsg) {
+      const title = payload?.survey?.title || 'Site survey';
+      el.title.textContent = title;
+      el.desc.textContent = 'This survey is password protected.';
+      setChip('Password required', 'warn');
+      el.bar.hidden = true;
+      el.intro.hidden = true;
+      el.privacy.hidden = true;
+      el.content.innerHTML = `
+        <div class="submit-section" style="max-width:28rem;margin:0 auto;">
+          <div class="submit-title">Enter survey password</div>
+          <p class="submit-note" style="margin-bottom:12px;">Use the password from your invitation email. The same password works for every site link in this invite batch.</p>
+          ${errorMsg ? banner('Could not unlock', errorMsg, 'err') : ''}
+          <form id="survey-unlock-form" class="space-y-3">
+            <label class="block" style="display:block;margin-bottom:10px;">
+              <span style="display:block;font-size:13px;font-weight:600;margin-bottom:6px;color:var(--text);">Password</span>
+              <input name="password" type="password" autocomplete="current-password" required
+                style="width:100%;" placeholder="Survey password" />
+            </label>
+            <button type="submit" class="btn-primary" id="unlock-btn">Unlock survey</button>
+          </form>
+        </div>`;
+      const form = document.getElementById('survey-unlock-form');
+      form?.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const pw = String(new FormData(form).get('password') || '').trim();
+        const btn = document.getElementById('unlock-btn');
+        if (btn) btn.disabled = true;
+        try {
+          await api('/public/site-survey', {
+            method: 'POST',
+            body: JSON.stringify({ t: token, action: 'unlock', password: pw }),
+            headers: { 'X-Survey-Password': pw },
+          });
+          setStoredSurveyPassword(pw);
+          const unlocked = await api(`/public/site-survey?t=${encodeURIComponent(token)}`);
+          if (unlocked?.locked) {
+            renderPasswordGate(unlocked, 'Incorrect password. Try again.');
+            return;
+          }
+          renderSurvey(unlocked);
+        } catch (err) {
+          renderPasswordGate(payload, err.message || 'Incorrect password');
+        } finally {
+          const again = document.getElementById('unlock-btn');
+          if (again) again.disabled = false;
+        }
+      });
     }
 
     function qsByName(form, name) {
@@ -1003,7 +1075,11 @@
             <strong>Documents included with this survey</strong>
             <ul>${inviteAttachments.map((a) => {
               const id = encodeURIComponent(a.id || '');
-              const href = `${API}/public/site-survey/attachment?t=${encodeURIComponent(token)}&id=${id}`;
+              const href = `${API}/public/site-survey/attachment?t=${encodeURIComponent(token)}&id=${id}${
+                getStoredSurveyPassword()
+                  ? `&password=${encodeURIComponent(getStoredSurveyPassword())}`
+                  : ''
+              }`;
               const label = escapeHtml(a.fileName || 'Download');
               const size = a.size ? ` (${Math.max(1, Math.round(Number(a.size) / 1024))} KB)` : '';
               return `<li><a href="${href}" target="_blank" rel="noopener">${label}</a>${escapeHtml(size)}</li>`;
@@ -1529,6 +1605,10 @@
         }
 
         const payload = await api(`/public/site-survey?t=${encodeURIComponent(token)}`);
+        if (payload?.locked) {
+          renderPasswordGate(payload);
+          return;
+        }
         renderSurvey(payload);
       } catch (err) {
         setChip(err.status === 410 ? 'Expired' : 'Error', 'err');

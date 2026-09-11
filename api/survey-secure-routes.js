@@ -10,6 +10,8 @@
 const {
     mintSurveyToken,
     hashSurveyToken,
+    hashSurveyPassword,
+    verifySurveyPassword,
     defaultExpiresAt,
     isExpired,
     isPastHardExpiry,
@@ -73,7 +75,8 @@ function corsHeaders() {
         'Content-Type': 'application/json',
         'Access-Control-Allow-Origin': origin,
         'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type,Authorization,X-Artemis-Operator',
+        'Access-Control-Allow-Headers':
+            'Content-Type,Authorization,X-Artemis-Operator,X-Survey-Password',
         'Cache-Control': 'no-store',
     };
 }
@@ -126,6 +129,38 @@ function roleSubjectLabel(role) {
     if (r === 'pi') return 'PI';
     if (r === 'coordinator') return 'SC';
     return roleLabel(role);
+}
+
+function assignmentRequiresPassword(assignment) {
+    return Boolean(assignment && assignment.passwordHash);
+}
+
+function readProvidedPassword(request, body) {
+    const fromBody = body?.password ?? body?.surveyPassword ?? body?.emailPassword;
+    if (fromBody != null && String(fromBody).length) return String(fromBody);
+    const fromHeader = readHeader(request, 'X-Survey-Password');
+    if (fromHeader) return String(fromHeader);
+    const fromQuery = readQueryParam(request, 'password');
+    if (fromQuery) return String(fromQuery);
+    return '';
+}
+
+function passwordOk(assignment, providedPassword) {
+    if (!assignmentRequiresPassword(assignment)) return true;
+    return verifySurveyPassword(providedPassword, assignment.passwordHash);
+}
+
+function passwordGateFailure(assignment, providedPassword) {
+    if (passwordOk(assignment, providedPassword)) return null;
+    return {
+        status: 401,
+        jsonBody: {
+            error: 'password_required',
+            requiresPassword: true,
+            message: 'Enter the survey password from your invitation email.',
+        },
+        headers: corsHeaders(),
+    };
 }
 
 function publicQuestionsFromList(questions) {
@@ -427,10 +462,43 @@ function buildPublicPayload({
             ),
         },
         attachments: publicAttachmentMeta(attachments),
+        requiresPassword: assignmentRequiresPassword(assignment),
+        locked: false,
         prefill,
         hasPrior,
         alreadySubmitted: status === 'submitted',
         delta: delta || null,
+    };
+}
+
+function buildLockedPublicPayload({ assignment, definition, siteName }) {
+    const status = String(assignment?.status || '').toLowerCase();
+    return {
+        locked: true,
+        requiresPassword: true,
+        siteDisplayName: siteName,
+        privacyContact:
+            process.env.PRIVACY_CONTACT_EMAIL ||
+            process.env.SURVEY_EMAIL_FROM ||
+            'siteprofiles@oraclinical.com',
+        assignment: {
+            status,
+            targetRole: assignment?.targetRole,
+            expiresAt: assignment?.expiresAt || null,
+            allowResubmit: assignment?.allowResubmit !== false,
+        },
+        survey: {
+            id: definition?.id,
+            title: definition?.title || 'Site survey',
+            description: definition?.description || '',
+            questions: [],
+            pages: [],
+        },
+        attachments: [],
+        prefill: {},
+        hasPrior: false,
+        alreadySubmitted: status === 'submitted',
+        delta: null,
     };
 }
 
@@ -502,6 +570,19 @@ function registerSurveySecureRoutes(app, deps) {
                 };
             }
 
+            const siteNameEarly = await resolveSiteName(getContainer, assignment.siteId);
+            const providedPw = readProvidedPassword(request, null);
+            if (!passwordOk(assignment, providedPw)) {
+                return {
+                    jsonBody: buildLockedPublicPayload({
+                        assignment,
+                        definition,
+                        siteName: siteNameEarly,
+                    }),
+                    headers: corsHeaders(),
+                };
+            }
+
             // Mark opened (first open only; never reopen past submitted)
             if (!assignment.openedAt) {
                 try {
@@ -520,7 +601,7 @@ function registerSurveySecureRoutes(app, deps) {
                 } catch (_) {}
             }
 
-            const siteName = await resolveSiteName(getContainer, assignment.siteId);
+            const siteName = siteNameEarly;
             const siteDoc = await loadSiteDoc(getContainer, assignment.siteId);
             const coordinatorStaff = await loadStaffForRole(getContainer, assignment.siteId, 'coordinator');
             const piStaff = await loadStaffForRole(getContainer, assignment.siteId, 'pi');
@@ -622,6 +703,36 @@ function registerSurveySecureRoutes(app, deps) {
             if (bad) {
                 return { status: bad.status, jsonBody: { error: bad.error }, headers: corsHeaders() };
             }
+
+            const providedPw = readProvidedPassword(request, body);
+            if (action === 'unlock') {
+                if (!rateLimit(`unlock:${ip}:${assignment.id}`, 12, 60_000)) {
+                    return {
+                        status: 429,
+                        jsonBody: { error: 'Too many password attempts. Wait a minute and try again.' },
+                        headers: corsHeaders(),
+                    };
+                }
+                if (!passwordOk(assignment, providedPw)) {
+                    return {
+                        status: 401,
+                        jsonBody: {
+                            error: 'invalid_password',
+                            requiresPassword: true,
+                            message: 'Incorrect password. Use the password from your invitation email.',
+                        },
+                        headers: corsHeaders(),
+                    };
+                }
+                return {
+                    status: 200,
+                    jsonBody: { ok: true, unlocked: true },
+                    headers: corsHeaders(),
+                };
+            }
+
+            const gated = passwordGateFailure(assignment, providedPw);
+            if (gated) return gated;
 
             const alreadySubmitted =
                 String(assignment.status || '').toLowerCase() === 'submitted';
@@ -819,6 +930,8 @@ function registerSurveySecureRoutes(app, deps) {
                 if (bad) {
                     return { status: bad.status, jsonBody: { error: bad.error }, headers: corsHeaders() };
                 }
+                const gated = passwordGateFailure(assignment, readProvidedPassword(request, null));
+                if (gated) return gated;
                 const allowed = new Set(assignment.attachmentIds || []);
                 if (!allowed.has(String(attachmentId))) {
                     return {
@@ -895,6 +1008,7 @@ function registerSurveySecureRoutes(app, deps) {
                 const invitePassword = String(body?.password || body?.emailPassword || '')
                     .trim()
                     .slice(0, 80);
+                const invitePasswordHash = hashSurveyPassword(invitePassword);
                 const inviteDueDate = String(body?.dueDate || body?.emailDueDate || '')
                     .trim()
                     .slice(0, 80);
@@ -996,6 +1110,8 @@ function registerSurveySecureRoutes(app, deps) {
                             emailDueDate: inviteDueDate || undefined,
                             studyCode: studyCode || undefined,
                             studyTitle: studyTitle || undefined,
+                            // Same hash on every assignment in this send — one password unlocks all links.
+                            passwordHash: invitePasswordHash || undefined,
                             createdAt: now,
                             updatedAt: now,
                             lastSentAt: now,
@@ -1083,6 +1199,7 @@ function registerSurveySecureRoutes(app, deps) {
                         emailProvider: emailProviderStatus(),
                         cc: ccEmails,
                         subject: customSubject || null,
+                        passwordRequired: Boolean(invitePasswordHash),
                         attachments: attachmentMeta,
                         results,
                     },
