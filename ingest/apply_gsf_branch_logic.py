@@ -1,12 +1,14 @@
 """
 Apply yellow-highlight Branch Logic from GSF DOCX onto Cosmos GF Long/Short.
 
-Yellow rules (from DOCX highlight):
+Keeps the 103 numbered DOCX questions only (no inserted inv/%/describe cards).
+
+Yellow rules applied as showIf on existing numbered questions:
   1. Q21=No → hide Q22–Q26 (research-naïve)
-  2. Q27 investigator count → Inv #1 always; Inv #2+ when count is 4–6 or 7–10
+  2. Q27 options fixed to investigator count bands (details stay in Q27 help)
   3. Q81 includes Anterior segment or Both → show Q82–Q83
   4. Q32 has any option other than "None commonly observed" → show Q33
-  5. Q37 has any population selected → show % estimate follow-up
+  5. Q37 population note kept as help (no extra % question card)
 
 Usage:
   python ingest/apply_gsf_branch_logic.py
@@ -65,9 +67,19 @@ def ensure_question(questions, *, after_num, new_q):
 
 
 def apply_to_questions(questions: list) -> list:
-    qs = deepcopy(questions)
+    # Keep one card per DOCX number (appearance order). Drop follow-up / inv extras.
+    seen = set()
+    qs = []
+    for q in deepcopy(questions):
+        num = q.get("docxNum")
+        if not isinstance(num, int):
+            continue
+        if num in seen:
+            continue
+        seen.add(num)
+        qs.append(q)
+
     id21 = qid(qs, 21)
-    id27 = qid(qs, 27)
     id32 = qid(qs, 32)
     id33 = qid(qs, 33)
     id37 = qid(qs, 37)
@@ -75,15 +87,18 @@ def apply_to_questions(questions: list) -> list:
     id82 = qid(qs, 82)
     id83 = qid(qs, 83)
 
-    # Fix Q27 options — count only (investigator fields were mis-parsed as options)
+    # Fix Q27 options — count only (investigator sub-fields stay as help, not extra cards)
     q27 = by_docx(qs).get(27)
     if q27:
         q27["options"] = ["1–3", "4–6", "7–10"]
         q27["type"] = "radio"
-        q27["help"] = (
-            "Investigator #1 details are required below. "
-            "If your site has 4+ investigators, Investigator #2 fields also appear."
+        help_bits = [str(q27.get("help") or "").strip()]
+        help_bits.append(
+            "Include Investigator #1 name, email, phone, credentials (MD/OD/DO), and years of "
+            "clinical research experience in the site profile / comments as applicable. "
+            "For 4+ investigators, also include Investigator #2 name and email."
         )
+        q27["help"] = " ".join(x for x in help_bits if x).strip()
 
     # 1) Research experience: Q22–26 only if Q21 = Yes
     if id21:
@@ -97,7 +112,7 @@ def apply_to_questions(questions: list) -> list:
     q21 = by_docx(qs).get(21)
     if q21:
         q21["help"] = (
-            'If No, Q22–Q26 are skipped and the site is flagged as research-naïve.'
+            "If No, Q22–Q26 are skipped and the site is flagged as research-naïve."
         )
         q21["flags"] = {"researchNaiveWhen": "No"}
 
@@ -126,117 +141,18 @@ def apply_to_questions(questions: list) -> list:
                 },
             )
 
-    # 5) Population % follow-up after Q37
+    # 5) Population % guidance stays on Q37 help (no extra numbered/unnumbered card)
     if id37:
-        pct_q = {
-            "id": "gsf_037b_estimate-percent-by-selected-population",
-            "libraryQuestionId": "ql-gsf_037b_estimate-percent-by-selected-population",
-            "label": (
-                "For each racial/ethnic group you selected, estimate the approximate "
-                "percentage of your patient population (total may be approximate)."
-            ),
-            "type": "textarea",
-            "required": False,
-            "category": "SECTION 7: DIVERSITY, EQUITY & INCLUSION IN RESEARCH",
-            "section": "SECTION 7: DIVERSITY, EQUITY & INCLUSION IN RESEARCH",
-            "docxNum": 37,
-            "help": "Shown when at least one population group is selected above.",
-            "logic": {"showIf": {"questionId": id37, "notEmpty": True}},
-        }
-        qs = ensure_question(qs, after_num=37, new_q=pct_q)
-
-    # 2) Investigator detail blocks driven by Q27 count
-    if id27:
-        inv1 = [
-            {
-                "id": "gsf_027a_investigator-1-name",
-                "libraryQuestionId": "ql-pi-name",
-                "label": "Investigator #1 — First and Last Name",
-                "type": "text",
-                "required": True,
-                "category": "SECTION 4: INVESTIGATORS",
-                "section": "SECTION 4: INVESTIGATORS",
-                "docxNum": 27,
-            },
-            {
-                "id": "gsf_027b_investigator-1-email",
-                "libraryQuestionId": "ql-pi-email",
-                "label": "Investigator #1 — Email",
-                "type": "text",
-                "required": True,
-                "category": "SECTION 4: INVESTIGATORS",
-                "section": "SECTION 4: INVESTIGATORS",
-                "docxNum": 27,
-            },
-            {
-                "id": "gsf_027c_investigator-1-phone",
-                "libraryQuestionId": "ql-pi-phone",
-                "label": "Investigator #1 — Phone",
-                "type": "text",
-                "required": True,
-                "category": "SECTION 4: INVESTIGATORS",
-                "section": "SECTION 4: INVESTIGATORS",
-                "docxNum": 27,
-            },
-            {
-                "id": "gsf_027d_investigator-1-credentials",
-                "libraryQuestionId": "ql-gf-08-inv-1-credentials",
-                "label": "Investigator #1 — Credentials (MD / OD / DO)",
-                "type": "text",
-                "required": True,
-                "category": "SECTION 4: INVESTIGATORS",
-                "section": "SECTION 4: INVESTIGATORS",
-                "docxNum": 27,
-            },
-            {
-                "id": "gsf_027e_investigator-1-years",
-                "libraryQuestionId": "ql-gf-11-experience-yrs",
-                "label": "Investigator #1 — Years of clinical research experience",
-                "type": "number",
-                "required": True,
-                "category": "SECTION 4: INVESTIGATORS",
-                "section": "SECTION 4: INVESTIGATORS",
-                "docxNum": 27,
-            },
-        ]
-        inv2 = [
-            {
-                "id": "gsf_027f_investigator-2-name",
-                "libraryQuestionId": "ql-gf-12-investigator-2",
-                "label": "Investigator #2 — First and Last Name",
-                "type": "text",
-                "required": False,
-                "category": "SECTION 4: INVESTIGATORS",
-                "section": "SECTION 4: INVESTIGATORS",
-                "docxNum": 27,
-                "logic": {
-                    "showIf": {
-                        "questionId": id27,
-                        "includesAny": ["4–6", "7–10"],
-                    }
-                },
-                "help": "Shown when investigator count is 4 or more.",
-            },
-            {
-                "id": "gsf_027g_investigator-2-email",
-                "libraryQuestionId": "ql-gf-12-investigator-2-email",
-                "label": "Investigator #2 — Email",
-                "type": "text",
-                "required": False,
-                "category": "SECTION 4: INVESTIGATORS",
-                "section": "SECTION 4: INVESTIGATORS",
-                "docxNum": 27,
-                "logic": {
-                    "showIf": {
-                        "questionId": id27,
-                        "includesAny": ["4–6", "7–10"],
-                    }
-                },
-            },
-        ]
-        # Insert after Q27 in reverse so order stays inv1 then inv2
-        for block in (inv2[::-1] + inv1[::-1]):
-            qs = ensure_question(qs, after_num=27, new_q=block)
+        q37 = by_docx(qs).get(37)
+        if q37:
+            help_bits = [str(q37.get("help") or "").strip()]
+            note = (
+                "If any group is selected, estimate approximate % of your patient population "
+                "for each selected group (total may be approximate) in comments if requested."
+            )
+            if note not in " ".join(help_bits):
+                help_bits.append(note)
+            q37["help"] = " ".join(x for x in help_bits if x).strip()
 
     return qs
 
@@ -279,6 +195,15 @@ def main():
 
     now = datetime.now(timezone.utc).isoformat()
     long_def["questions"] = new_qs
+    long_def["pages"] = []
+    for q in new_qs:
+        title = (q.get("category") or q.get("section") or "General").strip() or "General"
+        if not long_def["pages"] or long_def["pages"][-1]["title"] != title:
+            long_def["pages"].append(
+                {"id": f"page-{len(long_def['pages']) + 1}", "title": title, "questionIds": []}
+            )
+        long_def["pages"][-1]["questionIds"].append(q["id"])
+    long_def["docxQuestionCount"] = len(new_qs)
     long_def["updatedAt"] = now
     long_def["branchLogicSource"] = "gsf-docx-yellow-highlights-10sep2026"
     def_c.upsert_item(long_def)
@@ -293,6 +218,14 @@ def main():
         by_num = {q.get("docxNum"): q for q in new_qs}
         short_qs = [deepcopy(by_num[n]) for n in SHORT_NUMS if n in by_num]
     short_def["questions"] = short_qs
+    short_def["pages"] = [
+        {
+            "id": "page-short",
+            "title": "General Feasibility (Short)",
+            "questionIds": [q["id"] for q in short_qs if q.get("id")],
+        }
+    ]
+    short_def["docxQuestionCount"] = len(short_qs)
     short_def["updatedAt"] = now
     short_def["branchLogicSource"] = "gsf-docx-yellow-highlights-10sep2026"
     def_c.upsert_item(short_def)

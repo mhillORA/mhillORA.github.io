@@ -407,16 +407,26 @@ def main():
         print("\nDry run only. Re-run with --apply to write Cosmos.")
         return
 
+    # Section pages for public form paging (one page per DOCX section in appearance order)
+    pages = []
+    for q in built:
+        title = (q.get("category") or q.get("section") or "General").strip() or "General"
+        if not pages or pages[-1]["title"] != title:
+            pages.append({"id": f"page-{len(pages) + 1}", "title": title, "questionIds": []})
+        pages[-1]["questionIds"].append(q["id"])
+
     long_def["title"] = "General Feasibility (Long)"
     long_def["description"] = (
         "General Site Feasibility Survey (10 Sep 2026). "
-        "Question order matches the DOCX page order. "
-        "Auto-prepended (Long or Short) on study surveys. "
+        "103 numbered questions in DOCX page order. "
+        "Auto-prepended (Long) on study surveys. "
         "Question IDs preserved where matched to prior GF / library items."
     )
     long_def["questions"] = built
+    long_def["pages"] = pages
     long_def["generalFeasibilityVariant"] = "long"
     long_def["docxQuestionOrder"] = "appearance"
+    long_def["docxQuestionCount"] = len(built)
     long_def["updatedAt"] = now
     long_def["source"] = "gsf-docx-10sep2026"
     long_def["docxPath"] = str(docx_path.name)
@@ -436,15 +446,26 @@ def main():
             "description": "Compact subset of the 10 Sep 2026 General Site Feasibility Survey.",
             "status": "active",
             "questions": short_qs,
+            "pages": [
+                {
+                    "id": "page-short",
+                    "title": "General Feasibility (Short)",
+                    "questionIds": [q["id"] for q in short_qs],
+                }
+            ],
             "generalFeasibilityVariant": "short",
             "predefined": True,
             "tags": ["general-feasibility", "general-feasibility-short", "gsf-2026", "predefined"],
             "source": "gsf-docx-10sep2026",
+            "docxQuestionCount": len(short_qs),
             "updatedAt": now,
         }
     )
     def_c.upsert_item(short_def)
-    print(f"\nAPPLIED Long={LONG_ID} ({len(built)} qs) Short={SHORT_ID} ({len(short_qs)} qs)")
+    print(
+        f"\nAPPLIED Long={LONG_ID} ({len(built)} qs, {len(pages)} pages) "
+        f"Short={SHORT_ID} ({len(short_qs)} qs)"
+    )
 
 
 if __name__ == "__main__":

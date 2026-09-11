@@ -106,7 +106,7 @@ function rateLimit(key, limit, windowMs) {
 function roleLabel(role) {
     const r = normalizeRole(role);
     if (r === 'pi') return 'PI';
-    if (r === 'coordinator') return 'Coordinator';
+    if (r === 'coordinator') return 'Primary contact';
     return role || 'Staff';
 }
 
