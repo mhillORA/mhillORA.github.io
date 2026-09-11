@@ -13,7 +13,7 @@ function readClientSecret() {
     ).trim();
 }
 
-async function deliverViaWebhook({ to, subject, text, html, meta }) {
+async function deliverViaWebhook({ to, subject, text, html, meta, cc, attachments }) {
     const webhook = process.env.SURVEY_EMAIL_WEBHOOK || process.env.SURVEY_NOTIFY_WEBHOOK;
     if (!webhook) return null;
 
@@ -24,10 +24,12 @@ async function deliverViaWebhook({ to, subject, text, html, meta }) {
             body: JSON.stringify({
                 type: 'site_survey_invite',
                 to,
+                cc: Array.isArray(cc) && cc.length ? cc : undefined,
                 subject,
                 text,
                 html: html || undefined,
                 meta: meta || undefined,
+                attachments: Array.isArray(attachments) && attachments.length ? attachments : undefined,
             }),
         });
         if (!res.ok) {
@@ -84,7 +86,7 @@ async function getGraphAppToken() {
     return cachedGraphToken;
 }
 
-async function deliverViaGraph({ to, subject, text, html }) {
+async function deliverViaGraph({ to, subject, text, html, cc, attachments }) {
     const from = (process.env.SURVEY_EMAIL_FROM || process.env.SURVEY_MAIL_FROM || '').trim();
     if (!from) return null;
 
@@ -99,6 +101,31 @@ async function deliverViaGraph({ to, subject, text, html }) {
             };
         }
 
+        const ccList = Array.isArray(cc) ? cc.filter(Boolean) : [];
+        const graphAttachments = (Array.isArray(attachments) ? attachments : [])
+            .filter((a) => a?.contentBase64 && a?.fileName)
+            .map((a) => ({
+                '@odata.type': '#microsoft.graph.fileAttachment',
+                name: a.fileName,
+                contentType: a.contentType || 'application/octet-stream',
+                contentBytes: a.contentBase64,
+            }));
+
+        const message = {
+            subject,
+            body: {
+                contentType: html ? 'HTML' : 'Text',
+                content: html || text,
+            },
+            toRecipients: [{ emailAddress: { address: to } }],
+        };
+        if (ccList.length) {
+            message.ccRecipients = ccList.map((addr) => ({ emailAddress: { address: addr } }));
+        }
+        if (graphAttachments.length) {
+            message.attachments = graphAttachments;
+        }
+
         const res = await fetch(
             `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(from)}/sendMail`,
             {
@@ -108,14 +135,7 @@ async function deliverViaGraph({ to, subject, text, html }) {
                     'Content-Type': 'application/json',
                 },
                 body: JSON.stringify({
-                    message: {
-                        subject,
-                        body: {
-                            contentType: html ? 'HTML' : 'Text',
-                            content: html || text,
-                        },
-                        toRecipients: [{ emailAddress: { address: to } }],
-                    },
+                    message,
                     saveToSentItems: true,
                 }),
             }
@@ -136,7 +156,7 @@ async function deliverViaGraph({ to, subject, text, html }) {
     }
 }
 
-async function deliverViaSendGrid({ to, subject, text, html }) {
+async function deliverViaSendGrid({ to, subject, text, html, cc, attachments }) {
     const apiKey = (process.env.SENDGRID_API_KEY || '').trim();
     const from = (
         process.env.SURVEY_EMAIL_FROM ||
@@ -147,21 +167,39 @@ async function deliverViaSendGrid({ to, subject, text, html }) {
     if (!apiKey || !from) return null;
 
     try {
+        const ccList = Array.isArray(cc) ? cc.filter(Boolean) : [];
+        const sgAttachments = (Array.isArray(attachments) ? attachments : [])
+            .filter((a) => a?.contentBase64 && a?.fileName)
+            .map((a) => ({
+                content: a.contentBase64,
+                filename: a.fileName,
+                type: a.contentType || 'application/octet-stream',
+                disposition: 'attachment',
+            }));
+
+        const payload = {
+            personalizations: [
+                {
+                    to: [{ email: to }],
+                    ...(ccList.length ? { cc: ccList.map((email) => ({ email })) } : {}),
+                },
+            ],
+            from: { email: from, name: process.env.SURVEY_EMAIL_FROM_NAME || 'Ora Clinical' },
+            subject,
+            content: [
+                { type: 'text/plain', value: text },
+                ...(html ? [{ type: 'text/html', value: html }] : []),
+            ],
+        };
+        if (sgAttachments.length) payload.attachments = sgAttachments;
+
         const res = await fetch('https://api.sendgrid.com/v3/mail/send', {
             method: 'POST',
             headers: {
                 Authorization: `Bearer ${apiKey}`,
                 'Content-Type': 'application/json',
             },
-            body: JSON.stringify({
-                personalizations: [{ to: [{ email: to }] }],
-                from: { email: from, name: process.env.SURVEY_EMAIL_FROM_NAME || 'Ora Clinical' },
-                subject,
-                content: [
-                    { type: 'text/plain', value: text },
-                    ...(html ? [{ type: 'text/html', value: html }] : []),
-                ],
-            }),
+            body: JSON.stringify(payload),
         });
         if (!res.ok) {
             const body = await res.text().catch(() => '');
@@ -178,34 +216,69 @@ async function deliverViaSendGrid({ to, subject, text, html }) {
     }
 }
 
-async function deliverSurveyEmail({ to, subject, text, html, meta }) {
+async function deliverSurveyEmail({ to, subject, text, html, meta, cc, attachments }) {
     const recipient = String(to || '').trim();
     if (!recipient || !recipient.includes('@')) {
         return { ok: false, mode: 'none', error: 'missing_recipient' };
     }
 
-    const viaWebhook = await deliverViaWebhook({ to: recipient, subject, text, html, meta });
+    const ccList = Array.isArray(cc) ? cc.filter(Boolean) : [];
+    const files = Array.isArray(attachments) ? attachments : [];
+
+    const viaWebhook = await deliverViaWebhook({
+        to: recipient,
+        subject,
+        text,
+        html,
+        meta,
+        cc: ccList,
+        attachments: files,
+    });
     if (viaWebhook) return viaWebhook;
 
-    const viaGraph = await deliverViaGraph({ to: recipient, subject, text, html });
+    const viaGraph = await deliverViaGraph({
+        to: recipient,
+        subject,
+        text,
+        html,
+        cc: ccList,
+        attachments: files,
+    });
     if (viaGraph) return viaGraph;
 
-    const viaSendGrid = await deliverViaSendGrid({ to: recipient, subject, text, html });
+    const viaSendGrid = await deliverViaSendGrid({
+        to: recipient,
+        subject,
+        text,
+        html,
+        cc: ccList,
+        attachments: files,
+    });
     if (viaSendGrid) return viaSendGrid;
 
     return { ok: false, mode: 'manual', error: 'no_email_provider' };
 }
 
-function inviteEmailCopy({ siteName, roleLabel, inviteUrl, expiresAt }) {
+function inviteEmailCopy({ siteName, roleLabel, inviteUrl, expiresAt, attachmentNames }) {
     const subject = 'ORA site survey — action requested';
     const expiryLine = expiresAt
         ? `\nThis link expires on ${new Date(expiresAt).toLocaleDateString()}.\n`
         : '\n';
+    const names = Array.isArray(attachmentNames) ? attachmentNames.filter(Boolean) : [];
+    const attachText = names.length
+        ? `\nAttached for your reference:\n${names.map((n) => `- ${n}`).join('\n')}\n`
+        : '';
+    const attachHtml = names.length
+        ? `<p>Attached for your reference:</p><ul>${names
+              .map((n) => `<li>${escapeHtml(n)}</li>`)
+              .join('')}</ul>`
+        : '';
     const text =
         `Hello,\n\n` +
         `Please complete the ${roleLabel} site survey for ${siteName || 'your site'} using this secure link:\n\n` +
         `${inviteUrl}\n` +
         expiryLine +
+        attachText +
         `\nDo not forward this link — it is unique to you.\n` +
         `\nThank you,\nORA Clinical Operations\n`;
     const html =
@@ -216,6 +289,7 @@ function inviteEmailCopy({ siteName, roleLabel, inviteUrl, expiresAt }) {
         (expiresAt
             ? `<p>This link expires on ${escapeHtml(new Date(expiresAt).toLocaleDateString())}.</p>`
             : '') +
+        attachHtml +
         `<p>Do not forward this link — it is unique to you.</p>` +
         `<p>Thank you,<br/>ORA Clinical Operations</p>`;
     return { subject, text, html };

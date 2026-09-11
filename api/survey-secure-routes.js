@@ -43,6 +43,16 @@ const {
     opsNotifyCopy,
     emailProviderStatus,
 } = require('./lib/survey-email');
+const {
+    normalizeIncomingAttachments,
+    parseCcList,
+    persistAttachments,
+    loadAttachmentDocs,
+    publicAttachmentMeta,
+    emailAttachmentPayload,
+    MAX_FILES,
+    MAX_BYTES,
+} = require('./lib/survey-attachments');
 
 const ASSIGNMENTS = 'site-survey-assignments';
 const DEFINITIONS = 'site-survey-definitions';
@@ -355,6 +365,7 @@ function buildPublicPayload({
     siteDoc = null,
     coordinatorStaff = null,
     piStaff = null,
+    attachments = [],
 }) {
     const qList = Array.isArray(questions) ? questions : definition?.questions;
     const sitePrefill = buildSiteRecordPrefill(qList, siteDoc, {
@@ -407,6 +418,7 @@ function buildPublicPayload({
                 assignment?.generalFeasibilityVariant ?? 'long'
             ),
         },
+        attachments: publicAttachmentMeta(attachments),
         prefill,
         hasPrior,
         alreadySubmitted: status === 'submitted',
@@ -548,6 +560,16 @@ function registerSurveySecureRoutes(app, deps) {
                         })
                       : null;
 
+            let attachmentDocs = [];
+            try {
+                attachmentDocs = await loadAttachmentDocs(
+                    getContainer,
+                    assignment.attachmentIds || []
+                );
+            } catch (_) {
+                attachmentDocs = [];
+            }
+
             return {
                 jsonBody: buildPublicPayload({
                     assignment,
@@ -560,6 +582,7 @@ function registerSurveySecureRoutes(app, deps) {
                     siteDoc,
                     coordinatorStaff,
                     piStaff,
+                    attachments: attachmentDocs,
                 }),
                 headers: corsHeaders(),
             };
@@ -764,6 +787,64 @@ function registerSurveySecureRoutes(app, deps) {
         },
     });
 
+    // ---------- Public: download invite attachment by token ----------
+    app.http('publicSiteSurveyAttachment', {
+        methods: ['GET', 'OPTIONS'],
+        authLevel: 'anonymous',
+        route: 'public/site-survey/attachment',
+        handler: async (request, context) => {
+            if (request.method === 'OPTIONS') {
+                return { status: 204, headers: corsHeaders() };
+            }
+            try {
+                const raw = readQueryParam(request, 't') || readQueryParam(request, 'token');
+                const attachmentId = readQueryParam(request, 'id');
+                if (!raw || !attachmentId) {
+                    return {
+                        status: 400,
+                        jsonBody: { error: 'token and attachment id are required' },
+                        headers: corsHeaders(),
+                    };
+                }
+                const assignment = await findAssignmentByToken(getContainer, raw);
+                const bad = assertTokenUsable(assignment);
+                if (bad) {
+                    return { status: bad.status, jsonBody: { error: bad.error }, headers: corsHeaders() };
+                }
+                const allowed = new Set(assignment.attachmentIds || []);
+                if (!allowed.has(String(attachmentId))) {
+                    return {
+                        status: 404,
+                        jsonBody: { error: 'Attachment not found for this invite' },
+                        headers: corsHeaders(),
+                    };
+                }
+                const docs = await loadAttachmentDocs(getContainer, [attachmentId]);
+                const doc = docs[0];
+                if (!doc?.contentBase64) {
+                    return {
+                        status: 404,
+                        jsonBody: { error: 'Attachment content missing' },
+                        headers: corsHeaders(),
+                    };
+                }
+                const bytes = Buffer.from(String(doc.contentBase64).replace(/\s+/g, ''), 'base64');
+                return {
+                    status: 200,
+                    body: bytes,
+                    headers: {
+                        ...corsHeaders(),
+                        'Content-Type': doc.contentType || 'application/octet-stream',
+                        'Content-Disposition': `attachment; filename="${String(doc.fileName || 'file').replace(/"/g, '')}"`,
+                        'Cache-Control': 'no-store',
+                    },
+                };
+            } catch (error) {
+                return handleError(context, error, 'public/site-survey/attachment');
+            }
+        },
+    });
+
     // ---------- Ops: bulk send ----------
     app.http('siteSurveySend', {
         methods: ['POST', 'OPTIONS'],
@@ -797,6 +878,37 @@ function registerSurveySecureRoutes(app, deps) {
                 );
                 if (isGeneralFeasibilitySurveyId(surveyId)) {
                     generalFeasibilityVariant = 'none';
+                }
+
+                const ccEmails = parseCcList(body?.cc || body?.ccEmails || '');
+                const customSubject = String(body?.subject || body?.emailSubject || '')
+                    .trim()
+                    .slice(0, 200);
+
+                let attachmentMeta = [];
+                let emailFiles = [];
+                try {
+                    const incoming = normalizeIncomingAttachments(body?.attachments || []);
+                    if (incoming.length) {
+                        attachmentMeta = await persistAttachments(
+                            getContainer,
+                            getCosmosClient,
+                            generateId,
+                            incoming,
+                            { surveyId, operator, batchId: generateId() }
+                        );
+                        const docs = await loadAttachmentDocs(
+                            getContainer,
+                            attachmentMeta.map((a) => a.id)
+                        );
+                        emailFiles = emailAttachmentPayload(docs);
+                    }
+                } catch (attErr) {
+                    return {
+                        status: 400,
+                        jsonBody: { error: attErr.message || 'Invalid attachments' },
+                        headers: corsHeaders(),
+                    };
                 }
 
                 if (!surveyId) {
@@ -837,6 +949,8 @@ function registerSurveySecureRoutes(app, deps) {
                 const asgC = getContainer(ASSIGNMENTS);
                 const results = [];
                 const now = new Date().toISOString();
+                const attachmentIds = attachmentMeta.map((a) => a.id);
+                const attachmentNames = attachmentMeta.map((a) => a.fileName);
 
                 for (const siteId of siteIds) {
                     const siteName = await resolveSiteName(getContainer, siteId);
@@ -854,6 +968,10 @@ function registerSurveySecureRoutes(app, deps) {
                             status: 'sent',
                             allowResubmit: true,
                             generalFeasibilityVariant,
+                            attachmentIds: attachmentIds.length ? attachmentIds : undefined,
+                            attachments: attachmentMeta.length ? attachmentMeta : undefined,
+                            emailCc: ccEmails.length ? ccEmails : undefined,
+                            emailSubject: customSubject || undefined,
                             createdAt: now,
                             updatedAt: now,
                             lastSentAt: now,
@@ -876,12 +994,15 @@ function registerSurveySecureRoutes(app, deps) {
                                 roleLabel: roleLabel(targetRole),
                                 inviteUrl,
                                 expiresAt: assignment.expiresAt,
+                                attachmentNames,
                             });
                             emailResult = await deliverSurveyEmail({
                                 to: email,
-                                subject: copy.subject,
+                                cc: ccEmails,
+                                subject: customSubject || copy.subject,
                                 text: copy.text,
                                 html: copy.html,
+                                attachments: emailFiles,
                                 meta: {
                                     assignmentId: assignment.id,
                                     siteId,
@@ -930,6 +1051,9 @@ function registerSurveySecureRoutes(app, deps) {
                         surveyId,
                         surveyTitle: definition.title,
                         emailProvider: emailProviderStatus(),
+                        cc: ccEmails,
+                        subject: customSubject || null,
+                        attachments: attachmentMeta,
                         results,
                     },
                     headers: corsHeaders(),
@@ -1001,17 +1125,36 @@ function registerSurveySecureRoutes(app, deps) {
                 let emailResult = { ok: false, mode: 'manual' };
                 if (body.sendEmail !== false && email) {
                     assignment.targetEmail = email;
+                    const resendCc = parseCcList(body?.cc || assignment.emailCc || '');
+                    const resendSubject = String(
+                        body?.subject || assignment.emailSubject || ''
+                    )
+                        .trim()
+                        .slice(0, 200);
+                    let resendFiles = [];
+                    let attachmentNames = [];
+                    try {
+                        const docs = await loadAttachmentDocs(
+                            getContainer,
+                            assignment.attachmentIds || []
+                        );
+                        resendFiles = emailAttachmentPayload(docs);
+                        attachmentNames = docs.map((d) => d.fileName).filter(Boolean);
+                    } catch (_) {}
                     const copy = inviteEmailCopy({
                         siteName,
                         roleLabel: roleLabel(assignment.targetRole),
                         inviteUrl,
                         expiresAt: assignment.expiresAt,
+                        attachmentNames,
                     });
                     emailResult = await deliverSurveyEmail({
                         to: email,
-                        subject: copy.subject,
+                        cc: resendCc,
+                        subject: resendSubject || copy.subject,
                         text: copy.text,
                         html: copy.html,
+                        attachments: resendFiles,
                         meta: { assignmentId: assignment.id, resend: true },
                     });
                     await getContainer(ASSIGNMENTS).items.upsert({
