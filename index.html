@@ -1073,6 +1073,49 @@ const isNumberedSurveyQuestion = (q) => {
     const sec = String(q.section || q.header || '');
     return !NON_NUMBERED_PSQ_SECTIONS.has(sec);
 };
+/** Auto number within each PSQ section (restarts at 1 when the section changes). */
+const getPsqAutoNumberMeta = (survey, questionOrIndex) => {
+    const questions = survey?.questions || [];
+    const idx = typeof questionOrIndex === 'number'
+        ? questionOrIndex
+        : questions.findIndex(q => q === questionOrIndex);
+    if (idx < 0) return null;
+    const question = questions[idx];
+    if (!isNumberedSurveyQuestion(question)) return null;
+    const section = String(question.section || question.header || '');
+    let number = 0;
+    for (let i = 0; i <= idx; i += 1) {
+        const q = questions[i];
+        if (!isNumberedSurveyQuestion(q)) continue;
+        if (String(q.section || q.header || '') !== section) continue;
+        number += 1;
+    }
+    const sectionTotal = questions.filter(q =>
+        isNumberedSurveyQuestion(q) && String(q.section || q.header || '') === section
+    ).length;
+    return {
+        section,
+        number,
+        sectionTotal,
+        label: `Q${number}`,
+        progressLabel: section
+            ? `${section} · Question ${number} of ${sectionTotal}`
+            : `Question ${number} of ${sectionTotal}`,
+    };
+};
+const assignPsqAutoNumbers = (questions = []) => {
+    const sectionCounts = Object.create(null);
+    return (questions || []).map((q, index) => {
+        if (!isNumberedSurveyQuestion(q)) {
+            const next = { ...q, id: index + 1 };
+            delete next.psqNumber;
+            return next;
+        }
+        const section = String(q.section || q.header || '') || '__none__';
+        sectionCounts[section] = (sectionCounts[section] || 0) + 1;
+        return { ...q, id: index + 1, psqNumber: sectionCounts[section], numbered: true };
+    });
+};
 
 const isActualStudy = (study) => {
     if (!study || study.archived || String(study.status || '').toLowerCase() === 'archived') return false;
@@ -1108,9 +1151,55 @@ const isAppointmentVisitV1 = (visitLabel) => {
 };
 
 const MED_STALE_MS = 365 * 24 * 60 * 60 * 1000; // 1 year — mark stale, keep forever
+const getMedicationEndDateKey = (med) => {
+    const raw = med && (med.endDate || med.expiresAt || med.expirationDate);
+    if (!raw) return '';
+    const key = toLocalDateKey(raw);
+    if (key) return key;
+    const s = String(raw).trim();
+    return /^\d{4}-\d{2}-\d{2}/.test(s) ? s.slice(0, 10) : '';
+};
+const isMedicationExpiredByDate = (med) => {
+    const key = getMedicationEndDateKey(med);
+    if (!key) return false;
+    return key <= toLocalDateKey(new Date());
+};
+const isMedicationCurrent = (med) => !!(med && med.active !== false && !isMedicationExpiredByDate(med));
 const getActivePatientMedications = (patient) =>
-    ((patient && patient.medications) || []).filter(m => m && m.active !== false);
+    ((patient && patient.medications) || []).filter(isMedicationCurrent);
+const getPastPatientMedications = (patient) =>
+    ((patient && patient.medications) || []).filter(m => m && !isMedicationCurrent(m));
+const reconcilePatientMedications = (medications) => {
+    const today = toLocalDateKey(new Date());
+    const now = new Date().toISOString();
+    let changed = false;
+    const next = (medications || []).map((m) => {
+        if (!m || m.active === false) return m;
+        const endKey = getMedicationEndDateKey(m);
+        if (!endKey || endKey > today) return m;
+        changed = true;
+        return {
+            ...m,
+            active: false,
+            endDate: m.endDate || endKey,
+            discontinuedAt: m.discontinuedAt || now,
+            discontinuedReason: m.discontinuedReason || 'expired',
+            reviewedAt: m.reviewedAt || now,
+        };
+    });
+    return { medications: next, changed };
+};
+const persistExpiredMedicationsIfNeeded = async (patientId) => {
+    const patient = (state.patients || []).find(p => p.id === patientId);
+    if (!patient) return null;
+    const { medications, changed } = reconcilePatientMedications(patient.medications);
+    if (!changed) return patient;
+    await updatePatientFields(patientId, { medications }, 'medications_auto_expired', 'end date reached');
+    patient.medications = medications;
+    return patient;
+};
 const isMedicationStale = (med) => {
+    if (!isMedicationCurrent(med)) return false;
     const t = med && (med.reviewedAt || med.enteredAt || med.startDate);
     if (!t) return false;
     const ms = new Date(t).getTime();
@@ -1267,7 +1356,8 @@ const getStudySchedulingRecordHTML = (patient) => {
 };
 
 /** After med changes: stay in PSQ if a survey is open for this patient; else refresh profile meds tab. */
-const refreshPatientMedsUI = (patientId) => {
+const refreshPatientMedsUI = async (patientId) => {
+    try { await persistExpiredMedicationsIfNeeded(patientId); } catch { /* non-blocking */ }
     const refreshed = state.patients.find(p => p.id === patientId);
     if (!refreshed) return;
     if (state.currentSurveyState && state.currentSurveyState.patient?.id === patientId) {
@@ -1282,34 +1372,54 @@ const refreshPatientMedsUI = (patientId) => {
 const getMedicationsEditorHTML = (patient, editable) => {
     const canEditDefault = editable !== false;
     const meds = Array.isArray(patient.medications) ? patient.medications : [];
+    const currentMeds = meds.filter(isMedicationCurrent);
+    const pastMeds = meds.filter(m => m && !isMedicationCurrent(m));
     const catalog = getActiveReferenceList('medications');
     const locked = isPatientProfileLocked(patient) && !isManagerUser();
     const canEdit = canEditDefault && !locked;
-    const hasStale = meds.some(isMedicationStale);
+    const hasStale = currentMeds.some(isMedicationStale);
+    const renderMedCard = (m, { past = false } = {}) => {
+        const stale = !past && isMedicationStale(m);
+        const endKey = getMedicationEndDateKey(m);
+        const expired = isMedicationExpiredByDate(m) || m.discontinuedReason === 'expired';
+        const pastLabel = expired
+            ? ' <span class="text-xs font-normal text-gray-500">(expired — moved to past)</span>'
+            : ' <span class="text-xs font-normal text-gray-500">(discontinued — retained for history)</span>';
+        return '<div class="p-3 border dark:border-gray-700 rounded-md ' + (stale ? 'border-amber-400 dark:border-amber-600' : '') + (past ? ' bg-gray-50 dark:bg-gray-900/40' : '') + '"><div class="flex justify-between gap-2"><div>'
+            + '<p class="font-semibold dark:text-white">' + (m.name || 'Medication')
+            + (stale ? ' <span class="text-xs font-normal text-amber-700 dark:text-amber-300">(1+ year old)</span>' : '')
+            + (past ? pastLabel : '')
+            + '</p>'
+            + '<p class="text-sm text-gray-600 dark:text-gray-400">Dose: ' + (m.dosage || '—') + ' · Freq: ' + (m.frequency || '—') + '</p>'
+            + '<p class="text-sm text-gray-600 dark:text-gray-400">Start: ' + (m.startDate || '—')
+            + ' · End / expiration: ' + (endKey || '—')
+            + ' · Last taken: ' + (m.lastTaken || '—') + '</p>'
+            + '<p class="text-xs text-gray-500">Entered: ' + (m.enteredAt ? new Date(m.enteredAt).toLocaleString() : '—') + ' by ' + (m.enteredBy || '—')
+            + ' · Reviewed: ' + (m.reviewedAt ? new Date(m.reviewedAt).toLocaleDateString() : '—')
+            + (m.discontinuedAt ? (' · Ended: ' + new Date(m.discontinuedAt).toLocaleDateString()) : '')
+            + '</p>'
+            + (m.notes ? ('<p class="text-sm mt-1 dark:text-gray-300">' + m.notes + '</p>') : '')
+            + '</div><div class="flex flex-col items-end gap-1">'
+            + (canEdit ? ('<button type="button" data-action="edit-patient-medication" data-patient-id="' + patient.id + '" data-med-id="' + m.id + '" class="text-indigo-600 dark:text-indigo-300 text-xs hover:underline">Edit</button>') : '')
+            + (canEdit && stale ? ('<button type="button" data-action="refresh-one-medication" data-patient-id="' + patient.id + '" data-med-id="' + m.id + '" class="text-amber-700 dark:text-amber-300 text-xs hover:underline">Refresh</button>') : '')
+            + (canEdit && !past ? ('<button type="button" data-action="remove-patient-medication" data-patient-id="' + patient.id + '" data-med-id="' + m.id + '" class="text-red-600 text-sm hover:underline">Discontinue</button>') : '')
+            + (canEdit && past ? ('<button type="button" data-action="restore-patient-medication" data-patient-id="' + patient.id + '" data-med-id="' + m.id + '" class="text-green-600 text-sm hover:underline">Restore to current</button>') : '')
+            + '</div></div></div>';
+    };
     return '<div class="space-y-3" data-patient-meds="' + patient.id + '">'
         + (hasStale ? ('<div class="p-2 rounded border border-amber-300 bg-amber-50 dark:bg-amber-950/40 text-sm text-amber-900 dark:text-amber-100 flex flex-wrap items-center justify-between gap-2">'
             + '<span>Some medications are older than 1 year (kept on file). Refresh review dates if still accurate.</span>'
             + (canEdit ? ('<button type="button" data-action="refresh-patient-medications" data-patient-id="' + patient.id + '" class="px-3 py-1 bg-amber-600 text-white rounded text-xs">Refresh all review dates</button>') : '')
             + '</div>') : '')
-        + (meds.length ? meds.map(m => {
-            const stale = isMedicationStale(m);
-            return '<div class="p-3 border dark:border-gray-700 rounded-md ' + (stale ? 'border-amber-400 dark:border-amber-600' : '') + '"><div class="flex justify-between gap-2"><div>'
-            + '<p class="font-semibold dark:text-white">' + (m.name || 'Medication')
-            + (stale ? ' <span class="text-xs font-normal text-amber-700 dark:text-amber-300">(1+ year old)</span>' : '')
-            + (m.active === false ? ' <span class="text-xs font-normal text-gray-500">(discontinued — retained for history)</span>' : '')
-            + '</p>'
-            + '<p class="text-sm text-gray-600 dark:text-gray-400">Dose: ' + (m.dosage || '—') + ' · Freq: ' + (m.frequency || '—') + '</p>'
-            + '<p class="text-sm text-gray-600 dark:text-gray-400">Last taken: ' + (m.lastTaken || '—') + '</p>'
-            + '<p class="text-xs text-gray-500">Entered: ' + (m.enteredAt ? new Date(m.enteredAt).toLocaleString() : '—') + ' by ' + (m.enteredBy || '—')
-            + ' · Reviewed: ' + (m.reviewedAt ? new Date(m.reviewedAt).toLocaleDateString() : '—') + '</p>'
-            + (m.notes ? ('<p class="text-sm mt-1 dark:text-gray-300">' + m.notes + '</p>') : '')
-            + '</div><div class="flex flex-col items-end gap-1">'
-            + (canEdit ? ('<button type="button" data-action="edit-patient-medication" data-patient-id="' + patient.id + '" data-med-id="' + m.id + '" class="text-indigo-600 dark:text-indigo-300 text-xs hover:underline">Edit</button>') : '')
-            + (canEdit && stale ? ('<button type="button" data-action="refresh-one-medication" data-patient-id="' + patient.id + '" data-med-id="' + m.id + '" class="text-amber-700 dark:text-amber-300 text-xs hover:underline">Refresh</button>') : '')
-            + (canEdit && m.active !== false ? ('<button type="button" data-action="remove-patient-medication" data-patient-id="' + patient.id + '" data-med-id="' + m.id + '" class="text-red-600 text-sm hover:underline">Discontinue</button>') : '')
-            + (canEdit && m.active === false ? ('<button type="button" data-action="restore-patient-medication" data-patient-id="' + patient.id + '" data-med-id="' + m.id + '" class="text-green-600 text-sm hover:underline">Restore</button>') : '')
-            + '</div></div></div>';
-        }).join('') : '<p class="text-sm text-gray-500 dark:text-gray-400">No medications on file.</p>')
+        + '<div class="space-y-2">'
+        + '<h4 class="text-sm font-semibold uppercase tracking-wide text-gray-600 dark:text-gray-400">Current medications (' + currentMeds.length + ')</h4>'
+        + (currentMeds.length ? currentMeds.map(m => renderMedCard(m)).join('') : '<p class="text-sm text-gray-500 dark:text-gray-400">No current medications.</p>')
+        + '</div>'
+        + '<div class="space-y-2 pt-2 border-t dark:border-gray-700">'
+        + '<h4 class="text-sm font-semibold uppercase tracking-wide text-gray-600 dark:text-gray-400">Past medications (' + pastMeds.length + ')</h4>'
+        + '<p class="text-xs text-gray-500 dark:text-gray-400">Meds with an end/expiration date on or before today move here automatically. Discontinued meds are kept for history.</p>'
+        + (pastMeds.length ? pastMeds.map(m => renderMedCard(m, { past: true })).join('') : '<p class="text-sm text-gray-500 dark:text-gray-400">No past medications.</p>')
+        + '</div>'
         + (canEdit ? ('<form id="add-patient-medication-form" data-patient-id="' + patient.id + '" class="grid grid-cols-1 md:grid-cols-2 gap-2 p-3 border dark:border-gray-700 rounded-md bg-gray-50 dark:bg-gray-900">'
             + '<div class="md:col-span-2"><label class="text-xs font-medium dark:text-gray-300">Medication</label>'
             + '<input list="nasa-med-catalog" name="name" required class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="Start typing…">'
@@ -1317,6 +1427,7 @@ const getMedicationsEditorHTML = (patient, editable) => {
             + '<div><label class="text-xs font-medium dark:text-gray-300">Dosage</label><input name="dosage" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., 10mg"></div>'
             + '<div><label class="text-xs font-medium dark:text-gray-300">Frequency</label><input name="frequency" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., once daily / PRN"></div>'
             + '<div><label class="text-xs font-medium dark:text-gray-300">Start date</label><input type="date" name="startDate" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"></div>'
+            + '<div><label class="text-xs font-medium dark:text-gray-300">End / expiration date</label><input type="date" name="endDate" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><p class="text-[11px] text-gray-500 mt-1">On this date the med moves to Past medications.</p></div>'
             + '<div><label class="text-xs font-medium dark:text-gray-300">Last taken (optional)</label><input type="date" name="lastTaken" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"></div>'
             + '<div class="md:col-span-2"><label class="text-xs font-medium dark:text-gray-300">Notes</label><input name="notes" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"></div>'
             + '<div class="md:col-span-2"><button type="submit" class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 text-sm">Add medication</button></div>'
@@ -5498,7 +5609,7 @@ const getSurveysHTML = (fixedStudyId = '') => `
         ${fixedStudyId ? '' : '<h2 class="text-3xl font-bold text-gray-800 dark:text-gray-200 mb-6">Surveys with Branching Logic</h2>'}
         <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-md mb-8">
             <h3 class="text-xl font-semibold text-gray-700 dark:text-gray-300 mb-2">${fixedStudyId ? 'Create Pre-Screening Questionnaire' : 'Create New Survey'}</h3>
-            <p class="text-xs text-gray-500 dark:text-gray-400 mb-4">Insert script tokens in question text: ${typeof SCRIPT_TOKEN_HELP !== 'undefined' ? SCRIPT_TOKEN_HELP : '{{site_name}} {{patient_name}} {{recruiter_name}} {{study_name}}'}. Auto-filled when taking a PSQ.</p>
+            <p class="text-xs text-gray-500 dark:text-gray-400 mb-4">Insert script tokens in question text: ${typeof SCRIPT_TOKEN_HELP !== 'undefined' ? SCRIPT_TOKEN_HELP : '{{site_name}} {{patient_name}} {{recruiter_name}} {{study_name}}'}. Auto-filled when taking a PSQ. Question numbers auto-assign within each section (Q1, Q2…).</p>
             <form id="survey-creator-form" class="space-y-6">
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <div><label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Survey Title</label><input type="text" name="title" class="mt-1 block w-full border border-gray-300 dark:border-gray-600 rounded-md shadow-sm p-2 bg-white dark:bg-gray-700 dark:text-white" placeholder="e.g., Patient Intake Survey" required /></div>
@@ -8100,8 +8211,8 @@ const formatSurveyBranchTarget = (survey, target) => {
         const item = survey?.questions?.[rawIndex];
         if (!item) return `Item ${target}`;
         if (!isNumberedSurveyQuestion(item)) return `Section/item — ${item.section || item.text || target}`;
-        const displayNumber = (survey.questions || []).slice(0, rawIndex + 1).filter(isNumberedSurveyQuestion).length;
-        return `Question ${displayNumber}`;
+        const auto = getPsqAutoNumberMeta(survey, rawIndex);
+        return auto ? (auto.section ? `${auto.section} · Q${auto.number}` : `Question ${auto.number}`) : `Question ${target}`;
     }
     return String(target || 'End — Completed');
 };
@@ -8110,10 +8221,10 @@ const getViewSurveyModalHTML = (survey) => {
     if (!survey) return `<h2>Survey not found</h2>`;
     const study = state.studies.find(s => s.id === survey.studyId);
     let questionsHTML = survey.questions.map((q, index) => {
-        const displayNumber = isNumberedSurveyQuestion(q)
-            ? survey.questions.slice(0, index + 1).filter(isNumberedSurveyQuestion).length
-            : null;
-        const displayLabel = displayNumber ? `Question ${displayNumber}` : (q.section || (q.isScript ? 'Script' : 'Unnumbered item'));
+        const auto = getPsqAutoNumberMeta(survey, index);
+        const displayLabel = auto
+            ? (auto.section ? `${auto.section} · Q${auto.number}` : `Question ${auto.number}`)
+            : (q.section || (q.isScript ? 'Script' : 'Unnumbered item'));
         let optionsHTML = q.options.map(opt => {
             const nextText = formatSurveyBranchTarget(survey, opt.next);
             return `
@@ -8170,20 +8281,27 @@ const getViewSurveyModalHTML = (survey) => {
 const getEditSurveyModalHTML = (survey) => {
     if (!survey) return `<h2>Survey not found</h2>`;
     const study = state.studies.find(s => s.id === survey.studyId);
+    const numberedQuestions = assignPsqAutoNumbers(survey.questions || []);
     
     return `
         <h2 class="text-2xl font-bold dark:text-white mb-4">Edit Survey: ${survey.title}</h2>
         <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">For Study: ${study?.title || 'N/A'}</p>
+        <p class="text-xs text-gray-500 dark:text-gray-400 mb-4">Question numbers auto-assign within each PSQ section (Q1, Q2… restarts per section).</p>
         <form id="edit-survey-form" data-id="${survey.id}" class="space-y-6">
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div><label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Survey Title</label><input type="text" name="title" class="mt-1 block w-full border border-gray-300 dark:border-gray-600 rounded-md shadow-sm p-2 bg-white dark:bg-gray-700 dark:text-white" value="${survey.title}" required /></div>
                 <div><label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Assign to Study</label><select name="studyId" class="mt-1 block w-full border border-gray-300 dark:border-gray-600 rounded-md shadow-sm p-2 bg-white dark:bg-gray-700 dark:text-white" required><option value="">Select a study</option>${state.studies.filter(isActualStudy).map(s => `<option value="${s.id}" ${s.id === survey.studyId ? 'selected' : ''}>${s.title}</option>`).join('')}</select></div>
             </div>
             <div id="edit-questions-container" class="space-y-4">
-                ${survey.questions.map((q, index) => `
+                ${numberedQuestions.map((q, index) => {
+                    const auto = getPsqAutoNumberMeta({ questions: numberedQuestions }, index);
+                    const labelText = auto
+                        ? (auto.section ? `${auto.section} · Q${auto.number}` : `Question ${auto.number}`)
+                        : (q.section || (q.isScript ? 'Script' : 'Unnumbered question'));
+                    return `
                     <div id="edit-q-${index}" class="p-4 border dark:border-gray-700 rounded-lg bg-gray-50 dark:bg-gray-700 relative question-block" ${q.isScript ? 'data-script-block="1"' : ''}>
                         <button type="button" data-action="remove-question" data-q-id="edit-q-${index}" class="absolute top-2 right-2 p-1 text-red-500 hover:bg-red-100 dark:hover:bg-red-900 rounded-full"><i data-lucide="x" class="w-4 h-4"></i></button>
-                        <label class="font-medium dark:text-white" id="edit-q-${index}-label">${q.text.length > 50 ? q.text.substring(0, 50) + '...' : q.text}</label>
+                        <label class="font-medium dark:text-white" id="edit-q-${index}-label">${labelText}</label>
                         ${q.isScript
                             ? `<textarea name="edit-q-${index}-script" rows="5" class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-800 dark:text-white mb-2" required>${escapeHtml(q.text || '')}</textarea>
                                <input type="hidden" name="edit-q-${index}-type" value="open-text">`
@@ -8231,7 +8349,8 @@ const getEditSurveyModalHTML = (survey) => {
                         </div>
                         <button type="button" data-action="add-option" data-q-id="edit-q-${index}" data-type="${q.type}" class="text-sm text-blue-600 dark:text-blue-400 hover:underline mt-2">+ Add Option</button>`}
                     </div>
-                `).join('')}
+                `;
+                }).join('')}
             </div>
             <div class="flex flex-wrap gap-2 items-center">
                 <button type="button" data-action="add-question" class="text-sm font-medium text-blue-600 dark:text-blue-400 p-2 hover:bg-blue-50 dark:hover:bg-gray-700 rounded-md">+ Add Question</button>
@@ -8317,13 +8436,11 @@ const getTakeSurveyModalHTML = () => {
         `;
     }
     const vars = getScriptVariableMap(patient);
-    const numberedQs = (survey.questions || []).filter(isNumberedSurveyQuestion);
-    const numberedIndex = isNumberedSurveyQuestion(question)
-        ? numberedQs.findIndex(q => q === question) + 1
-        : null;
-    const progressLabel = question.isScript || !isNumberedSurveyQuestion(question)
-        ? (question.isScript ? 'Script' : (section || 'Section'))
-        : `Question ${numberedIndex} of ${numberedQs.length}`;
+    const autoNumber = getPsqAutoNumberMeta(survey, currentQuestionIndex);
+    const progressLabel = autoNumber
+        ? autoNumber.progressLabel
+        : (question.isScript ? 'Script' : (section || 'Section'));
+    const questionNumberPrefix = autoNumber ? `<span class="text-blue-600 dark:text-blue-400 font-bold mr-2">${autoNumber.label}.</span>` : '';
     const history = state.currentSurveyState.history || [];
     const isContactDetails = isSurveyContactDetailsStep(question);
     const isMedReviewSection = isSurveyMedicationStep(question);
@@ -8390,7 +8507,7 @@ const getTakeSurveyModalHTML = () => {
             <input type="hidden" name="answer" value="${isContactDetails ? 'Contact details reviewed' : (isMedReviewSection ? 'Medications reviewed' : 'Script read')}">
             <input type="hidden" name="answerNext" value="${defaultNext}">
             ` : `
-            <p class="text-lg font-semibold dark:text-white mb-4 break-words whitespace-normal">${questionText}</p>
+            <p class="text-lg font-semibold dark:text-white mb-4 break-words whitespace-normal">${questionNumberPrefix}${questionText}</p>
             ${notesHTML}
             ${tableHTML}
             <div class="space-y-3 dark:text-gray-300">
@@ -9586,8 +9703,11 @@ document.addEventListener('click', async (e) => {
             case 'view-patient': {
                 closeModal();
                 const viewPatient = await resolvePatientById(id);
-                if (viewPatient) openSidePanel(getPatientProfileHTML(viewPatient), true);
-                else showNotification('Patient not found.', 'error');
+                if (viewPatient) {
+                    try { await persistExpiredMedicationsIfNeeded(viewPatient.id); } catch { /* non-blocking */ }
+                    const live = state.patients.find(p => p.id === viewPatient.id) || viewPatient;
+                    openSidePanel(getPatientProfileHTML(live), true);
+                } else showNotification('Patient not found.', 'error');
                 break;
             }
             case 'view-study-patients': {
@@ -10067,12 +10187,18 @@ document.addEventListener('click', async (e) => {
                 if (startIdx > maxIdx) startIdx = maxIdx;
                 state.currentSurveyState = {
                     patient: patientForSurvey,
-                    survey: surveyForStart,
+                    survey: {
+                        ...surveyForStart,
+                        questions: assignPsqAutoNumbers(surveyForStart.questions || [])
+                    },
                     currentQuestionIndex: startIdx,
                     answers: (!forceRestart && draft?.answers) ? [...draft.answers] : [],
                     history: []
                 };
-                if (!forceRestart && draft) showNotification('Resuming PSQ at question ' + (startIdx + 1) + ' with ' + (draft.answers?.length || 0) + ' saved answer(s).', 'info');
+                if (!forceRestart && draft) {
+                    const auto = getPsqAutoNumberMeta(state.currentSurveyState.survey, startIdx);
+                    showNotification('Resuming PSQ at ' + (auto ? auto.progressLabel : ('question ' + (startIdx + 1))) + ' with ' + (draft.answers?.length || 0) + ' saved answer(s).', 'info');
+                }
                 openModal(getTakeSurveyModalHTML());
                 break;
             }
@@ -10443,7 +10569,7 @@ document.addEventListener('click', async (e) => {
                 try {
                     const now = new Date().toISOString();
                     const medications = (p.medications || []).map(m => m.id === medId
-                        ? { ...m, active: false, discontinuedAt: now, reviewedAt: now }
+                        ? { ...m, active: false, discontinuedAt: now, discontinuedReason: 'discontinued', reviewedAt: now }
                         : m);
                     await updatePatientFields(pid, { medications }, 'medication_discontinued', medId);
                     await loadAllData();
@@ -10460,13 +10586,27 @@ document.addEventListener('click', async (e) => {
                 const p = state.patients.find(x => x.id === pid);
                 if (!p) break;
                 try {
-                    const medications = (p.medications || []).map(m => m.id === medId
-                        ? { ...m, active: true, discontinuedAt: null, reviewedAt: new Date().toISOString() }
-                        : m);
+                    const medications = (p.medications || []).map(m => {
+                        if (m.id !== medId) return m;
+                        const restored = {
+                            ...m,
+                            active: true,
+                            discontinuedAt: null,
+                            discontinuedReason: null,
+                            reviewedAt: new Date().toISOString(),
+                        };
+                        // Past end date would immediately re-expire — clear it so Restore returns to Current
+                        if (isMedicationExpiredByDate(restored)) {
+                            restored.endDate = '';
+                            restored.expiresAt = '';
+                            restored.expirationDate = '';
+                        }
+                        return restored;
+                    });
                     await updatePatientFields(pid, { medications }, 'medication_restored', medId);
                     await loadAllData();
-                    refreshPatientMedsUI(pid);
-                    showNotification('Medication restored.', 'success');
+                    await refreshPatientMedsUI(pid);
+                    showNotification('Medication restored to current.', 'success');
                 } catch (err) {
                     showNotification(err.message || 'Could not restore medication.', 'error');
                 }
@@ -10488,8 +10628,9 @@ document.addEventListener('click', async (e) => {
                         </div>
                         <div class="grid grid-cols-2 gap-2">
                             <div><label class="text-sm dark:text-gray-300">Start date</label><input type="date" name="startDate" value="${med.startDate || ''}" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"></div>
-                            <div><label class="text-sm dark:text-gray-300">Last taken</label><input type="date" name="lastTaken" value="${med.lastTaken || ''}" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"></div>
+                            <div><label class="text-sm dark:text-gray-300">End / expiration</label><input type="date" name="endDate" value="${getMedicationEndDateKey(med) || ''}" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"><p class="text-[11px] text-gray-500 mt-1">On/after this date the med moves to Past.</p></div>
                         </div>
+                        <div><label class="text-sm dark:text-gray-300">Last taken</label><input type="date" name="lastTaken" value="${med.lastTaken || ''}" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"></div>
                         <div><label class="text-sm dark:text-gray-300">Notes</label><input name="notes" value="${String(med.notes || '').replace(/"/g, '&quot;')}" class="mt-1 w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"></div>
                         <button type="submit" class="w-full bg-indigo-600 text-white py-2 rounded-md">Save Medication</button>
                     </form>
@@ -11360,6 +11501,7 @@ document.addEventListener('submit', async (e) => {
                     dosage: String(data.dosage || '').trim(),
                     frequency: String(data.frequency || '').trim(),
                     startDate: data.startDate || '',
+                    endDate: data.endDate || '',
                     lastTaken: data.lastTaken || '',
                     notes: String(data.notes || '').trim(),
                     active: true,
@@ -11367,11 +11509,12 @@ document.addEventListener('submit', async (e) => {
                     reviewedAt: new Date().toISOString(),
                     enteredBy: getCurrentActor()
                 };
-                const medications = [...(patient.medications || []), med];
+                const reconciled = reconcilePatientMedications([med]).medications[0];
+                const medications = [...(patient.medications || []), reconciled];
                 await updatePatientFields(pid, { medications }, 'medication_added', med.name);
                 await loadAllData();
-                refreshPatientMedsUI(pid);
-                showNotification('Medication added.', 'success');
+                await refreshPatientMedsUI(pid);
+                showNotification(reconciled.active === false ? 'Medication added to Past (end date reached).' : 'Medication added.', 'success');
             } catch (err) {
                 showNotification(err.message || 'Could not add medication.', 'error');
             }
@@ -11385,20 +11528,29 @@ document.addEventListener('submit', async (e) => {
             try {
                 const medications = (patient.medications || []).map(m => {
                     if (m.id !== medId) return m;
-                    return {
+                    const updated = {
                         ...m,
                         name: String(data.name || '').trim(),
                         dosage: String(data.dosage || '').trim(),
                         frequency: String(data.frequency || '').trim(),
                         startDate: data.startDate || '',
+                        endDate: data.endDate || '',
+                        expiresAt: data.endDate || '',
                         lastTaken: data.lastTaken || '',
                         notes: String(data.notes || '').trim(),
                         reviewedAt: new Date().toISOString(),
                     };
+                    // Extending end date into the future returns the med to current
+                    if (updated.endDate && !isMedicationExpiredByDate(updated)) {
+                        updated.active = true;
+                        updated.discontinuedAt = null;
+                        updated.discontinuedReason = null;
+                    }
+                    return reconcilePatientMedications([updated]).medications[0];
                 });
                 await updatePatientFields(pid, { medications }, 'medication_edited', data.name);
                 await loadAllData();
-                refreshPatientMedsUI(pid);
+                await refreshPatientMedsUI(pid);
                 showNotification('Medication updated.', 'success');
             } catch (err) {
                 showNotification(err.message || 'Could not update medication.', 'error');
@@ -12997,7 +13149,7 @@ document.addEventListener('submit', async (e) => {
                     }
                 });
             });
-            const newSurvey = { title: data.title, studyId: data.studyId, questions, eligibilityRules };
+            const newSurvey = { title: data.title, studyId: data.studyId, questions: assignPsqAutoNumbers(questions), eligibilityRules };
             const created = await createDocument('surveys', newSurvey);
             if (created && created.id) {
                 state.surveys = [...(state.surveys || []).filter(s => s.id !== created.id), created];
@@ -13078,7 +13230,7 @@ document.addEventListener('submit', async (e) => {
                 if (table) question.table = table;
                 questions.push(question);
             });
-            const updatedSurvey = { title: data.title, studyId: data.studyId, questions };
+            const updatedSurvey = { title: data.title, studyId: data.studyId, questions: assignPsqAutoNumbers(questions) };
             await updateDocument('surveys', surveyId, updatedSurvey);
             const idx = (state.surveys || []).findIndex(s => s.id === surveyId);
             if (idx >= 0) state.surveys[idx] = { ...state.surveys[idx], ...updatedSurvey };
@@ -13173,19 +13325,24 @@ const updateBranchingLogicDropdowns = () => {
     const questionsContainer = getActiveSurveyQuestionsContainer();
     if (!questionsContainer) return;
     const questionElements = questionsContainer.querySelectorAll('.question-block');
-    let displayQuestionNumber = 0;
+    const sectionCounts = Object.create(null);
     const questionOptions = Array.from(questionElements).map((el, index) => {
         const section = el.querySelector('select[name$="-section"]')?.value || '';
         const isScript = el.dataset.scriptBlock === '1';
         const numberedControl = el.querySelector('input[name$="-numbered"]');
         const isNumbered = !isScript && !NON_NUMBERED_PSQ_SECTIONS.has(section) && numberedControl?.checked !== false;
-        if (isNumbered) displayQuestionNumber += 1;
+        let autoLabel = '';
+        if (isNumbered) {
+            const key = section || '__none__';
+            sectionCounts[key] = (sectionCounts[key] || 0) + 1;
+            autoLabel = section ? `${section} · Q${sectionCounts[key]}` : `Question ${sectionCounts[key]}`;
+        }
         const textControl = el.querySelector('input[name$="-text"], textarea[name$="-script"]');
         const snippet = String(textControl?.value || '').trim().slice(0, 42);
         const label = isScript
             ? `Go to section: ${section || 'Script'}`
             : isNumbered
-                ? `Go to Question ${displayQuestionNumber}${snippet ? ` — ${snippet}` : ''}`
+                ? `Go to ${autoLabel}${snippet ? ` — ${snippet}` : ''}`
                 : `Go to unnumbered item${section ? `: ${section}` : ''}${snippet ? ` — ${snippet}` : ''}`;
         return { value: String(index + 1), text: label };
     });
@@ -13360,7 +13517,7 @@ const handleDrop = (e) => {
 const renumberSurveyQuestions = () => {
     const container = getActiveSurveyQuestionsContainer();
     if (!container) return;
-    let qNum = 0;
+    const sectionCounts = Object.create(null);
     Array.from(container.querySelectorAll('.question-block')).forEach((block) => {
         const label = block.querySelector('[id$="-label"]');
         if (!label) return;
@@ -13370,8 +13527,11 @@ const renumberSurveyQuestions = () => {
             label.textContent = section || (block.dataset.scriptBlock === '1' ? 'Script' : 'Unnumbered question');
             return;
         }
-        qNum += 1;
-        label.textContent = 'Question ' + qNum;
+        const key = section || '__none__';
+        sectionCounts[key] = (sectionCounts[key] || 0) + 1;
+        label.textContent = section
+            ? `${section} · Q${sectionCounts[key]}`
+            : `Question ${sectionCounts[key]}`;
     });
 };
 
