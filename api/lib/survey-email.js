@@ -300,11 +300,6 @@ function inviteEmailCopy({
 }) {
     const rolePart = String(roleSubjectLabel || roleLabel || 'Site').trim() || 'Site';
     const code = String(studyCode || '').trim();
-    const defaultSubject = code
-        ? `${code} || Feasibility Survey || ${rolePart}`
-        : `Feasibility Survey || ${rolePart}`;
-    const subject = String(subjectOverride || '').trim().slice(0, 200) || defaultSubject;
-
     const names = Array.isArray(attachmentNames)
         ? attachmentNames.map((n) => String(n || '').trim()).filter(Boolean)
         : [];
@@ -318,99 +313,58 @@ function inviteEmailCopy({
             ? String(protocolName).trim()
             : 'this clinical trial');
 
-    const customBody = String(bodyOverride || '').trim();
-    if (customBody) {
-        const vars = {
-            inviteUrl: inviteUrl || '',
-            link: inviteUrl || '',
-            password: pwd,
-            dueDate: dueFallback,
-            closeDate: dueFallback,
-            expiresAt: dueFallback,
-            siteName: siteName || '',
-            role: rolePart,
-            roleLabel: String(roleLabel || rolePart),
-            studyCode: code,
-            studyTitle: studyLine,
-            attachmentNames: names.length ? names.join(', ') : '(none attached)',
-            attachments: names.length ? names.join(', ') : '(none attached)',
-        };
-        let text = applyBodyTemplate(customBody, vars);
-        // If password was set but template omitted {{password}}, append it so it still appears.
-        if (pwd && !/\bpassword\b/i.test(text)) {
-            text = `${text}\n\nPassword is ${pwd}`.trim();
+    const vars = {
+        inviteUrl: inviteUrl || '',
+        link: inviteUrl || '',
+        password: pwd,
+        dueDate: dueFallback,
+        closeDate: dueFallback,
+        expiresAt: dueFallback,
+        siteName: siteName || '',
+        role: rolePart,
+        roleLabel: String(roleLabel || rolePart),
+        studyCode: code,
+        studyTitle: studyLine,
+        attachmentNames: names.length ? names.join(', ') : 'the Protocol Synopsis',
+        attachments: names.length ? names.join(', ') : 'the Protocol Synopsis',
+    };
+
+    const subjectRaw = String(subjectOverride || '').trim() || defaultInviteSubjectTemplate();
+    let subject = applyBodyTemplate(subjectRaw, vars)
+        .replace(/\s*\|\|\s*/g, ' || ')
+        .replace(/^\s*\|\|\s*/, '')
+        .replace(/\s*\|\|\s*$/, '')
+        .replace(/\s{2,}/g, ' ')
+        .trim()
+        .slice(0, 200);
+    if (!subject) {
+        subject = code
+            ? `${code} || Feasibility Survey || ${rolePart}`
+            : `Feasibility Survey || ${rolePart}`;
+    }
+
+    const customBody = String(bodyOverride || '').trim() || defaultInviteBodyTemplate();
+    let text = applyBodyTemplate(customBody, vars);
+    // If password was set but template omitted {{password}}, append it so it still appears.
+    if (pwd && !/\bpassword\b/i.test(text)) {
+        text = `${text}\n\nPassword is ${pwd}`.trim();
+    }
+    // Always ensure the invite URL is present when we have one.
+    if (inviteUrl && !String(text).includes(String(inviteUrl))) {
+        if (/\{\{\s*(inviteUrl|link)\s*\}\}/i.test(customBody) === false && !/here is a link/i.test(text)) {
+            text = text.replace(
+                /(Here is a link to the survey:\s*)/i,
+                `$1\n${inviteUrl}\n`
+            );
+            if (!text.includes(inviteUrl)) {
+                text = `${text}\n\nHere is a link to the survey:\n${inviteUrl}`.trim();
+            }
         }
-        // If close date exists but template omitted it, append.
-        if (dueFallback && !/\b(by|before|due|complete|closes?)\b/i.test(text)) {
-            text = `${text}\n\nPlease complete this feasibility survey by ${dueFallback}.`.trim();
-        }
-        return {
-            subject,
-            text,
-            html: plainTextToInviteHtml(text),
-        };
     }
-
-    const greet = String(greeting || 'Dear PI and SC,').trim() || 'Dear PI and SC,';
-    const openText =
-        String(opener || '').trim() ||
-        `Thank you again for your interest in ${studyLine}.`;
-    const closeText =
-        String(closer || '').trim() ||
-        'Thank you again for your time. We look forward to working with you on this study!';
-
-    const attachIntro = names.length
-        ? `I have attached ${
-              names.length === 1 ? 'the following document' : 'the following documents'
-          } for your review and support of the next step, the Feasibility Survey: ${names.join(', ')}.`
-        : 'Please review any materials included with this invitation to support the next step, the Feasibility Survey.';
-
-    const dueLine = dueFallback
-        ? `Please complete this feasibility survey by ${dueFallback}.`
-        : '';
-
-    const textParts = [
-        greet,
-        '',
-        openText,
-        '',
-        attachIntro,
-        'The survey will take approximately 30 minutes, depending on the answers. All information provided via this survey will be kept confidential.',
-        '',
-        'Here is a link to the survey:',
-        inviteUrl || '',
-        '',
-    ];
-    if (pwd) textParts.push(`Password is ${pwd}`, '');
-    if (dueLine) textParts.push(dueLine, '');
-    textParts.push(closeText, '', 'Best regards,', 'The Ora Team');
-    if (siteName) textParts.push('', `Site: ${siteName}`);
-
-    const htmlParts = [
-        `<p>${escapeHtml(greet)}</p>`,
-        `<p>${escapeHtml(openText)}</p>`,
-        `<p>${escapeHtml(attachIntro)}</p>`,
-        `<p>The survey will take approximately 30 minutes, depending on the answers. All information provided via this survey will be kept confidential.</p>`,
-        `<p>Here is a link to the survey:</p>`,
-        inviteUrl
-            ? `<p><a href="${escapeAttr(inviteUrl)}">${escapeHtml(inviteUrl)}</a></p>`
-            : '<p>(secure link)</p>',
-    ];
-    if (pwd) htmlParts.push(`<p><strong>Password is ${escapeHtml(pwd)}</strong></p>`);
-    if (dueLine) {
-        htmlParts.push(
-            `<p>Please complete this feasibility survey by <strong>${escapeHtml(dueFallback)}</strong>.</p>`
-        );
-    }
-    htmlParts.push(`<p>${escapeHtml(closeText)}</p>`, `<p>Best regards,<br/>The Ora Team</p>`);
-    if (siteName) {
-        htmlParts.push(`<p style="color:#666;font-size:12px;">Site: ${escapeHtml(siteName)}</p>`);
-    }
-
     return {
         subject,
-        text: textParts.join('\n'),
-        html: htmlParts.join('\n'),
+        text,
+        html: plainTextToInviteHtml(text),
     };
 }
 
@@ -454,14 +408,18 @@ function plainTextToInviteHtml(text) {
         .join('\n');
 }
 
+/** Exact ops template from ReBUILD send example — placeholders filled at send time. */
+function defaultInviteSubjectTemplate() {
+    return '{{studyCode}} || Feasibility Survey || {{role}}';
+}
+
 function defaultInviteBodyTemplate() {
     return [
         'Dear PI and SC,',
         '',
-        'Thank you again for your interest in {{studyTitle}}.',
+        'Thank you again for your interest in {{studyCode}}, {{studyTitle}}.',
         '',
-        'I have attached the following documents for your review and support of the next step, the Feasibility Survey: {{attachmentNames}}.',
-        'The survey will take approximately 30 minutes, depending on the answers. All information provided via this survey will be kept confidential.',
+        'I have attached {{attachmentNames}} for your review and support of the next step, the Feasibility Survey. The survey will take approximately 30 minutes, depending on the answers. All information provided via this survey will be kept confidential.',
         '',
         'Here is a link to the survey:',
         '{{inviteUrl}}',
@@ -475,6 +433,12 @@ function defaultInviteBodyTemplate() {
         'Best regards,',
         'The Ora Team',
     ].join('\n');
+}
+
+function defaultRebuildStudyTitle() {
+    return (
+        'ReBUILD: A Phase 2/3, Randomized, Double-Masked, Vehicle-Controlled, Dose-Ranging Clinical Trial to Evaluate the Efficacy and Safety of Once Daily Bevemipretide Ophthalmic Topical Solution in Subjects who have Dry Age-Related Macular Degeneration (Dry AMD)'
+    );
 }
 
 function opsNotifyCopy({ siteName, surveyTitle, roleLabel, status }) {
@@ -528,6 +492,8 @@ module.exports = {
     deliverSurveyEmail,
     inviteEmailCopy,
     defaultInviteBodyTemplate,
+    defaultInviteSubjectTemplate,
+    defaultRebuildStudyTitle,
     formatInviteCloseDate,
     opsNotifyCopy,
     emailProviderStatus,
