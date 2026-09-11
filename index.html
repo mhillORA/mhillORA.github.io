@@ -2390,6 +2390,7 @@
             if (!window.ArtemisLegacy || typeof window.ArtemisLegacy.refreshArtemisLegacyIndex !== 'function') return;
             try {
                 await window.ArtemisLegacy.refreshArtemisLegacyIndex(allSites);
+                invalidateSiteLinkIndex();
             } catch (err) {
                 console.warn('Legacy site index refresh failed', err);
             }
@@ -2848,68 +2849,115 @@
             setTab(initialTab);
         };
 
-        const siteIdsForSurveyLookup = (siteId) => {
-            const ids = new Set([siteId].filter(Boolean));
-            const site = (allSites || []).find(s => s && s.id === siteId);
-            if (Array.isArray(site?.legacySiteIds)) {
-                site.legacySiteIds.forEach((id) => { if (id) ids.add(id); });
-            }
-            if (site?.promotedFromLegacySiteId) ids.add(site.promotedFromLegacySiteId);
-            // Any Master Site List row linked to this live site
-            legacySitesCatalog().forEach((leg) => {
-                if (leg?.linkedArtemisSiteId && (leg.linkedArtemisSiteId === siteId || leg.id === siteId)) {
-                    if (leg.id) ids.add(leg.id);
-                    if (leg.linkedArtemisSiteId) ids.add(leg.linkedArtemisSiteId);
-                }
-            });
-            // If looking up a legacy id, also pull its live twin + that twin's other legacy ids
-            const legSelf = legacySitesCatalog().find((s) => s && s.id === siteId);
-            if (legSelf?.linkedArtemisSiteId) {
-                ids.add(legSelf.linkedArtemisSiteId);
-                const twin = (allSites || []).find((s) => s && s.id === legSelf.linkedArtemisSiteId);
-                if (Array.isArray(twin?.legacySiteIds)) {
-                    twin.legacySiteIds.forEach((id) => { if (id) ids.add(id); });
-                }
-            }
-            const legacy = getArtemisSiteLegacyStats(siteId);
-            if (Array.isArray(legacy?.legacySiteIds)) {
-                legacy.legacySiteIds.forEach((id) => { if (id) ids.add(id); });
-            }
-            return ids;
+        let __siteLinkIndex = null;
+        let __siteLinkRevision = 0;
+
+        const invalidateSiteLinkIndex = () => {
+            __siteLinkRevision += 1;
+            __siteLinkIndex = null;
         };
+
+        const getSiteLinkIndex = () => {
+            const live = Array.isArray(allSites) ? allSites : [];
+            const legacy = legacySitesCatalog();
+            if (__siteLinkIndex && __siteLinkIndex.revision === __siteLinkRevision) return __siteLinkIndex;
+
+            const liveById = new Map();
+            const legacyById = new Map();
+            const liveIdByAnyId = new Map();
+            const legacyIdsByLiveId = new Map();
+
+            const addLegacyToLive = (liveId, legacyId) => {
+                if (!liveId || !legacyId) return;
+                liveIdByAnyId.set(legacyId, liveId);
+                const arr = legacyIdsByLiveId.get(liveId) || [];
+                if (!arr.includes(legacyId)) arr.push(legacyId);
+                legacyIdsByLiveId.set(liveId, arr);
+            };
+
+            live.forEach((s) => {
+                if (!s?.id) return;
+                liveById.set(s.id, s);
+                liveIdByAnyId.set(s.id, s.id);
+                if (s.promotedFromLegacySiteId) addLegacyToLive(s.id, s.promotedFromLegacySiteId);
+                (s.legacySiteIds || []).forEach((id) => addLegacyToLive(s.id, id));
+            });
+            legacy.forEach((leg) => {
+                if (!leg?.id) return;
+                legacyById.set(leg.id, leg);
+                if (leg.linkedArtemisSiteId) addLegacyToLive(leg.linkedArtemisSiteId, leg.id);
+            });
+
+            const aliasCache = new Map();
+            const aliasesFor = (siteId) => {
+                if (!siteId) return new Set();
+                if (aliasCache.has(siteId)) return aliasCache.get(siteId);
+                const ids = new Set([siteId]);
+                const liveId = liveIdByAnyId.get(siteId) || (liveById.has(siteId) ? siteId : null);
+                if (liveId) {
+                    ids.add(liveId);
+                    (legacyIdsByLiveId.get(liveId) || []).forEach((id) => ids.add(id));
+                    const liveDoc = liveById.get(liveId);
+                    if (liveDoc?.promotedFromLegacySiteId) ids.add(liveDoc.promotedFromLegacySiteId);
+                    (liveDoc?.legacySiteIds || []).forEach((id) => { if (id) ids.add(id); });
+                }
+                const leg = legacyById.get(siteId);
+                if (leg?.linkedArtemisSiteId) {
+                    ids.add(leg.linkedArtemisSiteId);
+                    (legacyIdsByLiveId.get(leg.linkedArtemisSiteId) || []).forEach((id) => ids.add(id));
+                }
+                aliasCache.set(siteId, ids);
+                return ids;
+            };
+
+            const canonicalId = (siteId) => {
+                if (!siteId) return null;
+                return liveIdByAnyId.get(siteId) || (liveById.has(siteId) ? siteId : siteId);
+            };
+
+            __siteLinkIndex = {
+                revision: __siteLinkRevision,
+                live,
+                legacy,
+                liveById,
+                legacyById,
+                liveIdByAnyId,
+                legacyIdsByLiveId,
+                aliasesFor,
+                canonicalId,
+                unified: null,
+            };
+            return __siteLinkIndex;
+        };
+
+        const siteIdsForSurveyLookup = (siteId) => getSiteLinkIndex().aliasesFor(siteId);
 
         /**
          * One list for Sites tab + survey send: live sites, plus unlinked Master Site List rows.
          * Linked legacy rows collapse into their live twin (history still reachable via siteIdsForSurveyLookup).
          */
         const buildUnifiedSitesCatalog = () => {
-            const live = Array.isArray(allSites) ? allSites : [];
-            const legacy = legacySitesCatalog();
-            const linkedLegacyIds = new Set(
-                legacy.filter((s) => s?.linkedArtemisSiteId).map((s) => s.id)
-            );
+            const idx = getSiteLinkIndex();
+            if (idx.unified) return idx.unified;
+            const { live, legacy, liveById, legacyIdsByLiveId } = idx;
+            const linkedLegacyIds = new Set();
+            legacy.forEach((s) => {
+                if (s?.linkedArtemisSiteId && s.id) linkedLegacyIds.add(s.id);
+            });
             const rows = live.map((s) => {
-                const linked = legacy.filter((l) => l && (
-                    l.linkedArtemisSiteId === s.id
-                    || (Array.isArray(s.legacySiteIds) && s.legacySiteIds.includes(l.id))
-                    || s.promotedFromLegacySiteId === l.id
-                ));
+                const linkedIds = legacyIdsByLiveId.get(s.id) || [];
+                const linked = linkedIds.map((id) => idx.legacyById.get(id)).filter(Boolean);
                 return {
                     ...s,
                     _catalog: linked.length ? 'linked' : 'live',
                     _source: 'live',
-                    _linkedLegacyIds: linked.map((l) => l.id),
+                    _linkedLegacyIds: linkedIds.slice(),
                     _linkedLegacyNames: linked.map((l) => l.name).filter(Boolean),
                 };
             });
             legacy.forEach((leg) => {
                 if (!leg?.id || linkedLegacyIds.has(leg.id)) return;
-                // Also skip if already represented via live.legacySiteIds without linkedArtemisSiteId set
-                const covered = live.some((s) =>
-                    s.promotedFromLegacySiteId === leg.id
-                    || (Array.isArray(s.legacySiteIds) && s.legacySiteIds.includes(leg.id))
-                );
-                if (covered) return;
+                if (idx.liveIdByAnyId.has(leg.id) && liveById.has(idx.liveIdByAnyId.get(leg.id))) return;
                 rows.push({
                     id: leg.id,
                     name: leg.name || leg.institution_name || leg.id,
@@ -2928,22 +2976,12 @@
                     _legacyDoc: leg,
                 });
             });
-            return rows.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+            idx.unified = rows.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+            return idx.unified;
         };
 
         /** Prefer live site id whenever a Master Site List row is linked/promoted. */
-        const canonicalSiteIdForReporting = (siteId) => {
-            if (!siteId) return null;
-            const liveHit = (allSites || []).find((s) => s && (
-                s.id === siteId
-                || s.promotedFromLegacySiteId === siteId
-                || (Array.isArray(s.legacySiteIds) && s.legacySiteIds.includes(siteId))
-            ));
-            if (liveHit?.id) return liveHit.id;
-            const leg = legacySitesCatalog().find((s) => s && s.id === siteId);
-            if (leg?.linkedArtemisSiteId) return leg.linkedArtemisSiteId;
-            return siteId;
-        };
+        const canonicalSiteIdForReporting = (siteId) => getSiteLinkIndex().canonicalId(siteId);
 
         const latestSurveyResponsesBySurvey = (siteId) => {
             const ids = siteIdsForSurveyLookup(siteId);
@@ -3305,8 +3343,8 @@
                 return t;
             };
 
-            const live = (allSites || []).find((s) => s && s.id === siteId);
-            const legacy = legacySitesCatalog().find((s) => s && s.id === siteId);
+            const live = getSiteLinkIndex().liveById.get(siteId) || (allSites || []).find((s) => s && s.id === siteId);
+            const legacy = getSiteLinkIndex().legacyById.get(siteId) || legacySitesCatalog().find((s) => s && s.id === siteId);
 
             const candidates = [
                 live?.name,
@@ -3663,10 +3701,11 @@
             });
 
             // Site / master-list record fields (live Sites + legacy Master Site List)
-            const liveSite = (allSites || []).find((s) => s && ids.has(s.id));
-            const legacySite = legacySitesCatalog().find((s) => s && (s.id === siteId || ids.has(s.id)
-                || (liveSite && s.linkedArtemisSiteId === liveSite.id)
-                || (s.linkedArtemisSiteId && ids.has(s.linkedArtemisSiteId))));
+            const idx = getSiteLinkIndex();
+            const liveSite = [...ids].map((id) => idx.liveById.get(id)).find(Boolean) || null;
+            const legacySite = [...ids].map((id) => idx.legacyById.get(id)).find(Boolean)
+                || (liveSite ? (idx.legacyIdsByLiveId.get(liveSite.id) || []).map((id) => idx.legacyById.get(id)).find(Boolean) : null)
+                || null;
             const record = liveSite || legacySite || null;
             if (record) {
                 const recordLib = {
@@ -3743,33 +3782,38 @@
             };
         };
 
-        const buildFeasibilityQuestionReport = (surveyId, targetRole = 'all') => {
+        const buildFeasibilityQuestionReport = (surveyId, targetRole = 'all', opts = {}) => {
+            const includeEmptySites = opts.includeEmptySites === true;
             const def = (allSiteSurveyDefinitions || []).find(d => d && d.id === surveyId) || null;
             const questions = asSurveyList(def?.questions);
             const roleFilter = String(targetRole || 'all').trim().toLowerCase();
             const isGf = surveyId === 'survey-general-feasibility'
                 || surveyId === 'survey-general-feasibility-short';
 
-            // One logical site per row — same catalog as Sites tab (linked master rows collapse into live).
-            const canonicalSites = new Set(
-                buildUnifiedSitesCatalog().map((s) => s?.id).filter(Boolean)
-            );
-            const coveredAliases = new Set();
-            canonicalSites.forEach((id) => {
-                siteIdsForSurveyLookup(id).forEach((alias) => coveredAliases.add(alias));
-            });
+            // Interactive UI: only sites with answers (keeps Reporting responsive with 400+ sites).
+            // Export "everyone" passes includeEmptySites:true for the full unified catalog.
+            const canonicalSites = new Set();
+            if (includeEmptySites) {
+                buildUnifiedSitesCatalog().forEach((s) => { if (s?.id) canonicalSites.add(s.id); });
+            }
             (allSiteSurveyResponses || []).forEach((r) => {
                 if (!r || r._archived || !r.siteId) return;
                 if (roleFilter && roleFilter !== 'all'
                     && String(r.targetRole || '').toLowerCase() !== roleFilter) return;
                 if (!(isGf || r.surveyId === surveyId)) return;
-                if (coveredAliases.has(r.siteId)) return;
                 const cid = canonicalSiteIdForReporting(r.siteId);
-                if (cid) {
-                    canonicalSites.add(cid);
-                    siteIdsForSurveyLookup(cid).forEach((alias) => coveredAliases.add(alias));
-                }
+                if (cid) canonicalSites.add(cid);
             });
+            if (includeEmptySites) {
+                // Keep invited-but-blank sites on full exports
+                (allSiteSurveyAssignments || []).forEach((a) => {
+                    if (!a?.siteId || a.surveyId !== surveyId) return;
+                    if (roleFilter && roleFilter !== 'all'
+                        && String(a.targetRole || '').toLowerCase() !== roleFilter) return;
+                    const cid = canonicalSiteIdForReporting(a.siteId);
+                    if (cid) canonicalSites.add(cid);
+                });
+            }
 
             const siteRows = [];
             canonicalSites.forEach((siteId) => {
@@ -4107,7 +4151,12 @@
                     showNotification('Select a survey first.', 'info');
                     return;
                 }
-                const report = buildFeasibilityQuestionReport(sid, targetRole || feasibilityReportRole);
+                const wantEveryone = mode === 'wide' || mode === 'everyone';
+                const report = buildFeasibilityQuestionReport(
+                    sid,
+                    targetRole || feasibilityReportRole,
+                    { includeEmptySites: wantEveryone }
+                );
                 if (!report.def) {
                     showNotification('Survey definition not found.', 'error');
                     return;
@@ -4809,10 +4858,27 @@
                 || (allSiteSurveyDefinitions || [])[0]?.id
                 || null;
             feasibilityReportSurveyId = surveyId;
-            const report = surveyId
-                ? buildFeasibilityQuestionReport(surveyId, feasibilityReportRole)
-                : null;
-            root.innerHTML = renderFeasibilityReportBodyHtml(report);
+            const token = `${surveyId || ''}::${feasibilityReportRole || 'all'}::${__siteLinkRevision}`;
+            root.dataset.reportToken = token;
+            root.innerHTML = `
+                <div class="rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 px-4 py-8 text-center">
+                    <div class="text-sm font-medium text-gray-800 dark:text-gray-100">Building feasibility report…</div>
+                    <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">Dropdown stays responsive — report loads in the background.</div>
+                </div>`;
+            const run = () => {
+                if (root.dataset.reportToken !== token) return;
+                const report = surveyId
+                    ? buildFeasibilityQuestionReport(surveyId, feasibilityReportRole, { includeEmptySites: false })
+                    : null;
+                if (root.dataset.reportToken !== token) return;
+                root.innerHTML = renderFeasibilityReportBodyHtml(report);
+            };
+            // Yield so the survey select can open/change before heavy merge work.
+            if (typeof requestIdleCallback === 'function') {
+                requestIdleCallback(() => run(), { timeout: 400 });
+            } else {
+                setTimeout(run, 0);
+            }
         };
 
         const mountFeasibilityReport = () => {
@@ -7208,23 +7274,26 @@
 
 
 
+            const surveyActivityByCanonical = (() => {
+                const map = new Map();
+                const bump = (siteId, kind, row) => {
+                    const cid = canonicalSiteIdForReporting(siteId) || siteId;
+                    if (!cid) return;
+                    let entry = map.get(cid);
+                    if (!entry) {
+                        entry = { assignments: [], responses: [] };
+                        map.set(cid, entry);
+                    }
+                    entry[kind].push(row);
+                };
+                (allSiteSurveyAssignments || []).forEach((a) => { if (a?.siteId) bump(a.siteId, 'assignments', a); });
+                (allSiteSurveyResponses || []).forEach((r) => { if (r?.siteId && !r._archived) bump(r.siteId, 'responses', r); });
+                return map;
+            })();
+
             const surveySiteRows = buildUnifiedSitesCatalog().slice()
 
-                .filter(site => {
-
-                    const siteId = site?.id;
-
-                    if (!siteId) return false;
-
-                    const ids = siteIdsForSurveyLookup(siteId);
-
-                    const assignments = (allSiteSurveyAssignments || []).filter(a => a && ids.has(a.siteId));
-
-                    const responses = (allSiteSurveyResponses || []).filter(r => r && ids.has(r.siteId));
-
-                    return assignments.length > 0 || responses.length > 0;
-
-                })
+                .filter(site => surveyActivityByCanonical.has(site?.id))
 
                 .sort((a, b) => String(a?.name || '').localeCompare(String(b?.name || '')))
 
@@ -7232,13 +7301,11 @@
 
                     const siteId = site.id;
 
-                    const ids = siteIdsForSurveyLookup(siteId);
+                    const bucket = surveyActivityByCanonical.get(siteId) || { assignments: [], responses: [] };
 
-                    const assignments = (allSiteSurveyAssignments || []).filter(a => a && ids.has(a.siteId));
+                    const assignments = bucket.assignments;
 
-                    const responses = (allSiteSurveyResponses || []).filter(r => r && ids.has(r.siteId))
-
-                        .slice()
+                    const responses = bucket.responses.slice()
 
                         .sort((x, y) => String(y.submittedAt || y.createdAt || '').localeCompare(String(x.submittedAt || x.createdAt || '')));
 
@@ -8075,12 +8142,26 @@
                 return;
             }
             const sortedSites = [...filteredSites].sort((a, b) => (a.name || '').localeCompare(b.name || ''));
-            sitesTableBody.innerHTML = sortedSites.map(site => {
+            const PAGE = 75;
+            const page = Math.max(0, Number(window.__sitesTablePage || 0));
+            const maxPage = Math.max(0, Math.ceil(sortedSites.length / PAGE) - 1);
+            const safePage = Math.min(page, maxPage);
+            window.__sitesTablePage = safePage;
+            const pageRows = sortedSites.slice(safePage * PAGE, safePage * PAGE + PAGE);
+
+            const patientsBySite = new Map();
+            (allPatients || []).forEach((p) => {
+                const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
+                const sid = currentEnrollment?.siteId;
+                if (!sid) return;
+                let bucket = patientsBySite.get(sid);
+                if (!bucket) { bucket = []; patientsBySite.set(sid, bucket); }
+                bucket.push(p);
+            });
+
+            sitesTableBody.innerHTML = pageRows.map(site => {
                 const isLegacyOnly = site._catalog === 'legacy';
-                const sitePatients = isLegacyOnly ? [] : allPatients.filter(p => {
-                    const currentEnrollment = p.enrollments?.find(e => e.status === 'current');
-                    return currentEnrollment?.siteId === site.id;
-                });
+                const sitePatients = isLegacyOnly ? [] : (patientsBySite.get(site.id) || []);
                 const enrolled = sitePatients.filter(p => p.status && p.status.toLowerCase() === 'enrolled').length;
                 const screenFailed = sitePatients.filter(p => p.status && p.status.toLowerCase() === 'screen fail').length;
                 const totalScreened = enrolled + screenFailed;
@@ -8141,6 +8222,35 @@
                     </tr>
                 `;
             }).join('');
+
+            let pager = document.getElementById('sites-table-pager');
+            if (!pager) {
+                const wrap = sitesTableBody.closest('.overflow-x-auto') || sitesTableBody.parentElement;
+                if (wrap?.parentElement) {
+                    pager = document.createElement('div');
+                    pager.id = 'sites-table-pager';
+                    pager.className = 'flex items-center justify-between gap-3 px-4 py-3 text-sm text-gray-600 dark:text-gray-300';
+                    wrap.parentElement.appendChild(pager);
+                }
+            }
+            if (pager) {
+                const from = sortedSites.length ? safePage * PAGE + 1 : 0;
+                const to = Math.min(sortedSites.length, (safePage + 1) * PAGE);
+                pager.innerHTML = `
+                    <span>Rows ${from}–${to} of ${sortedSites.length}</span>
+                    <div class="flex gap-2">
+                        <button type="button" id="sites-page-prev" class="px-3 py-1.5 rounded border dark:border-gray-600 disabled:opacity-40" ${safePage <= 0 ? 'disabled' : ''}>Previous</button>
+                        <button type="button" id="sites-page-next" class="px-3 py-1.5 rounded border dark:border-gray-600 disabled:opacity-40" ${safePage >= maxPage ? 'disabled' : ''}>Next</button>
+                    </div>`;
+                pager.querySelector('#sites-page-prev')?.addEventListener('click', () => {
+                    window.__sitesTablePage = Math.max(0, safePage - 1);
+                    renderAllSites(sitesToRender);
+                });
+                pager.querySelector('#sites-page-next')?.addEventListener('click', () => {
+                    window.__sitesTablePage = Math.min(maxPage, safePage + 1);
+                    renderAllSites(sitesToRender);
+                });
+            }
         };
 
         const renderAllStudies = () => {
@@ -8777,8 +8887,28 @@
             
             // ALWAYS use addresses instead of coordinates - geocode everything
             // Filter sites - use addresses only (ignore coordinates)
-            let sitesWithAddress = allSites.filter(site => site && (site.address1 || site.city || site.state));
+            let sitesWithAddress = allSites.filter(site => site && (site.address1 || site.city || site.state || site.address));
             let sitesWithCoords = []; // Don't use coordinates, always geocode from addresses
+
+            // Cap geocode volume — after master-list promote we have 400+ address rows.
+            // Prefer operational sites (not bulk-promoted stubs) so the map stays usable.
+            const MAP_GEOCODE_CAP = 80;
+            const mapLoadGen = (window.__artemisMapLoadGen = (window.__artemisMapLoadGen || 0) + 1);
+            const rankSiteForMap = (s) => {
+                let score = 0;
+                if (s.source !== 'promoted-from-legacy') score += 50;
+                if (Array.isArray(s.studyIds) && s.studyIds.length) score += 30;
+                if (s.status === 'Active') score += 5;
+                if (s.latitude && s.longitude) score += 2;
+                return score;
+            };
+            if (sitesWithAddress.length > MAP_GEOCODE_CAP) {
+                sitesWithAddress = sitesWithAddress
+                    .slice()
+                    .sort((a, b) => rankSiteForMap(b) - rankSiteForMap(a) || String(a.name || '').localeCompare(String(b.name || '')))
+                    .slice(0, MAP_GEOCODE_CAP);
+                console.warn(`Map geocode capped to ${MAP_GEOCODE_CAP} of ${allSites.length} sites (promoted stubs deferred).`);
+            }
             
             // Filter CRCs - use addresses only (ignore coordinates)
             let crcsWithAddress = allCrcs.filter(crc => crc && crc.homeLocation);
@@ -8841,8 +8971,12 @@
             // Geocode sites with addresses only (async) - process after initial markers are added
             const geocodeSitesWithAddress = async () => {
                 if (sitesWithAddress.length > 0 && AZURE_MAPS_KEY && azureMap) {
-                    console.log('Geocoding sites with addresses...');
+                    console.log('Geocoding sites with addresses...', sitesWithAddress.length);
                     for (const site of sitesWithAddress) {
+                        if (window.__artemisMapLoadGen !== mapLoadGen) {
+                            console.log('Map geocode aborted (newer load started)');
+                            return;
+                        }
                         try {
                             // Check both zip and zipCode for compatibility
                             const zip = site.zipCode || site.zip || '';
@@ -13189,6 +13323,7 @@
 
                 allStudies = studies.sort((a,b) => (a.title > b.title) ? 1 : -1);
                 allSites = sites.sort((a,b) => (a.name > b.name) ? 1 : -1);
+                invalidateSiteLinkIndex();
                 allCrcs = crcs;
                 refreshArtemisLegacySiteIndex().catch(() => {});
                 allPatients = allPatients || [];
@@ -13233,8 +13368,19 @@
                         allSiteSurveyQuestionLibrary = asSurveyList(siteSurveyQuestionLibrary);
                         window.__siteSurveyNotifications = Array.isArray(siteSurveyNotifications) ? siteSurveyNotifications : [];
                         console.log('Secondary ARTEMIS data loaded (deferred)');
+                        invalidateSiteLinkIndex();
                         refreshArtemisLegacySiteIndex().catch(() => {});
-                        if (['dashboard', 'sites', 'scheduling', 'feasibility', 'staff', 'reporting'].includes(activeTab)) {
+                        // Avoid full dashboard remount (re-geocodes hundreds of sites and freezes UI).
+                        if (activeTab === 'sites') {
+                            renderAllSites();
+                        } else if (activeTab === 'reporting') {
+                            refreshFeasibilityReportRoot();
+                        } else if (activeTab === 'feasibility' || activeTab === 'staff' || activeTab === 'scheduling') {
+                            render();
+                        } else if (activeTab === 'dashboard') {
+                            // Soft refresh only — map markers stay as-is until user changes filters.
+                            try { renderHeaderButtons(); } catch (_) { /* ignore */ }
+                        } else {
                             render();
                         }
                     } catch (err) {
