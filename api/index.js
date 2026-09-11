@@ -1852,18 +1852,21 @@ const runPatientsQuery = async (request, context) => {
 
 const runPatientsToday = async (request, context) => {
     const requestContext = await resolveRequestContext(request);
-    const today = new Date().toISOString().split('T')[0];
+    const rawDate = String(request.query?.get?.('date') || '').trim();
+    const dayKey = /^\d{4}-\d{2}-\d{2}$/.test(rawDate)
+        ? rawDate
+        : new Date().toISOString().split('T')[0];
     const result = await queryPatients({
         scope: requestContext.scope,
         criteria: {
             logic: 'AND',
-            conditions: [{ field: 'primaryAppointmentDate', op: 'appointment_on_date', value: today }],
+            conditions: [{ field: 'primaryAppointmentDate', op: 'appointment_on_date', value: dayKey }],
         },
         limit: 500,
         offset: 0,
         includeTotal: true,
     });
-    return { jsonBody: result, headers: jsonHeaders };
+    return { jsonBody: { ...result, date: dayKey }, headers: jsonHeaders };
 };
 
 const runPatientsActions = async (request, context) => {

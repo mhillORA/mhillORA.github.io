@@ -844,6 +844,7 @@ let state = {
     subjectImportDraft: null, // { headers, rows, fileName, mappedSubjects }
     calendarDate: new Date(),
     bookingCalendarDate: new Date(), // For the patient booking modal
+    dashboardApptDateKey: null, // YYYY-MM-DD local; null = today
     studies: [],
     patients: [],
     sites: [],
@@ -3590,20 +3591,73 @@ const patientActionServer = async (action, patientId, extra = {}) => {
     }
 };
 
-const loadCrcTodayPatients = async () => {
+const getDashboardApptDateKey = () => state.dashboardApptDateKey || toLocalDateKey(new Date());
+
+const formatDashboardApptDateLabel = (dateKey) => {
+    const key = dateKey || getDashboardApptDateKey();
+    const d = new Date(`${key}T12:00:00`);
+    if (Number.isNaN(d.getTime())) return key;
+    const todayKey = toLocalDateKey(new Date());
+    const weekday = d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+    if (key === todayKey) return `Today · ${weekday}`;
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    if (key === toLocalDateKey(yesterday)) return `Yesterday · ${weekday}`;
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    if (key === toLocalDateKey(tomorrow)) return `Tomorrow · ${weekday}`;
+    return weekday;
+};
+
+const shiftDashboardApptDate = (deltaDays) => {
+    const d = new Date(`${getDashboardApptDateKey()}T12:00:00`);
+    d.setDate(d.getDate() + (Number(deltaDays) || 0));
+    state.dashboardApptDateKey = toLocalDateKey(d);
+};
+
+const getDashboardAppointmentsNavHTML = () => {
+    const key = getDashboardApptDateKey();
+    const todayKey = toLocalDateKey(new Date());
+    return `
+        <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-3 md:mb-4 gap-3">
+            <div>
+                <h3 class="text-lg md:text-xl font-semibold text-gray-700 dark:text-gray-300">Appointments</h3>
+                <p class="text-xs md:text-sm text-gray-500 dark:text-gray-400" id="dashboard-appt-date-label">${formatDashboardApptDateLabel(key)}</p>
+            </div>
+            <div class="flex flex-wrap items-center gap-2">
+                <button type="button" data-action="dashboard-appt-prev" class="px-2.5 py-1.5 rounded-md border dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white hover:bg-gray-50 dark:hover:bg-gray-600" title="Previous day">
+                    <i data-lucide="chevron-left" class="w-4 h-4"></i>
+                </button>
+                <input type="date" id="dashboard-appt-date" value="${key}" class="p-1.5 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-sm">
+                <button type="button" data-action="dashboard-appt-next" class="px-2.5 py-1.5 rounded-md border dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white hover:bg-gray-50 dark:hover:bg-gray-600" title="Next day">
+                    <i data-lucide="chevron-right" class="w-4 h-4"></i>
+                </button>
+                <button type="button" data-action="dashboard-appt-today" class="px-3 py-1.5 rounded-md text-sm ${key === todayKey ? 'bg-blue-600 text-white' : 'border dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-white hover:bg-gray-50 dark:hover:bg-gray-600'}">Today</button>
+            </div>
+        </div>
+    `;
+};
+
+const loadCrcTodayPatients = async (dateKey = null) => {
+    const key = dateKey || getDashboardApptDateKey();
+    const attachDayAppointment = (patient) => {
+        const appts = (typeof getPatientAppointments === 'function' ? getPatientAppointments(patient) : (patient.appointments || []))
+            .filter(a => a && a.time && (a.status || 'scheduled') !== 'cancelled');
+        const dayAppt = appts.find(a => toLocalDateKey(a.time) === key)
+            || (patient.appointment && toLocalDateKey(patient.appointment.time) === key ? patient.appointment : null);
+        return dayAppt ? { ...patient, appointment: dayAppt } : null;
+    };
     try {
-        const result = await apiCall('patients/today');
-        return (result.items || []).map(p => normalizePatientRecord(convertPatientFromAzureFormat(p)));
+        const result = await apiCall(`patients/today?date=${encodeURIComponent(key)}`);
+        return (result.items || [])
+            .map(p => normalizePatientRecord(convertPatientFromAzureFormat(p)))
+            .map(attachDayAppointment)
+            .filter(Boolean);
     } catch (err) {
-        console.warn('CRC today query failed, using local filter:', err.message);
-        const todayStart = new Date();
-        todayStart.setHours(0, 0, 0, 0);
-        return filterPatientsForCurrentUser(state.patients).filter(p => {
-            if (!p.appointment?.time) return false;
-            const apptDate = new Date(p.appointment.time);
-            apptDate.setHours(0, 0, 0, 0);
-            return apptDate.getTime() === todayStart.getTime();
-        });
+        console.warn('CRC day query failed, using local filter:', err.message);
+        return filterPatientsForCurrentUser(state.patients)
+            .map(attachDayAppointment)
+            .filter(Boolean);
     }
 };
 
@@ -4568,14 +4622,8 @@ const getCRCDashboardHTML = () => {
     return `
         <h2 class="text-xl md:text-2xl font-bold text-gray-800 dark:text-gray-200 mb-3 md:mb-4 px-2 md:px-0">CRC Dashboard</h2>
         
-        <!-- Today's Appointments Section -->
         <div class="mb-4 md:mb-6 bg-white dark:bg-gray-800 p-3 md:p-6 rounded-lg shadow-md">
-            <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-3 md:mb-4 gap-2">
-                <h3 class="text-lg md:text-xl font-semibold text-gray-700 dark:text-gray-300">Today's Appointments</h3>
-                <div class="text-xs md:text-sm text-gray-500 dark:text-gray-400">
-                    ${new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })}
-                </div>
-            </div>
+            ${getDashboardAppointmentsNavHTML()}
             <div id="todays-appointments-container"></div>
         </div>
     `;
@@ -4584,6 +4632,10 @@ const getCRCDashboardHTML = () => {
 const getRecruiterDashboardHTML = () => {
     return `
         <h2 class="text-xl md:text-2xl font-bold text-gray-800 dark:text-gray-200 mb-3 md:mb-4 px-2 md:px-0">Recruiter Dashboard</h2>
+        <div class="mb-4 md:mb-6 bg-white dark:bg-gray-800 p-3 md:p-6 rounded-lg shadow-md">
+            ${getDashboardAppointmentsNavHTML()}
+            <div id="todays-appointments-container"></div>
+        </div>
         <h3 class="text-lg md:text-xl font-semibold text-gray-700 dark:text-gray-300 mb-3 md:mb-4 px-2 md:px-0">Recruiting Studies - Enrollment Status</h3>
         <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3 md:gap-4">
             ${state.studies
@@ -4738,15 +4790,17 @@ const renderDashboardCharts = () => {
 const renderDashboardTodaysAppointments = async () => {
     const container = document.getElementById('todays-appointments-container');
     if (!container) return;
+    const dayKey = getDashboardApptDateKey();
+    const dayLabel = formatDashboardApptDateLabel(dayKey);
 
-    container.innerHTML = `<div class="text-center py-6 text-gray-500 dark:text-gray-400">Loading today's appointments...</div>`;
-    const todaysAppointments = await loadCrcTodayPatients();
+    container.innerHTML = `<div class="text-center py-6 text-gray-500 dark:text-gray-400">Loading appointments for ${dayLabel}...</div>`;
+    const todaysAppointments = await loadCrcTodayPatients(dayKey);
     
     if (todaysAppointments.length === 0) {
         container.innerHTML = `
             <div class="text-center py-8 text-gray-500 dark:text-gray-400">
                 <i data-lucide="calendar-check" class="w-12 h-12 mx-auto mb-3 opacity-50"></i>
-                <p>No appointments scheduled for today</p>
+                <p>No appointments scheduled for ${dayLabel}</p>
             </div>
         `;
         lucide.createIcons();
@@ -9700,6 +9754,24 @@ document.addEventListener('click', async (e) => {
             case 'next-month': state.calendarDate.setMonth(state.calendarDate.getMonth() + 1); render(); break;
             case 'prev-day': state.calendarDate.setDate(state.calendarDate.getDate() - 1); render(); break;
             case 'next-day': state.calendarDate.setDate(state.calendarDate.getDate() + 1); render(); break;
+            case 'dashboard-appt-prev': {
+                shiftDashboardApptDate(-1);
+                if (state.activeTab === 'crcDashboard' || state.activeTab === 'recruiterDashboard') render();
+                else renderDashboardTodaysAppointments();
+                break;
+            }
+            case 'dashboard-appt-next': {
+                shiftDashboardApptDate(1);
+                if (state.activeTab === 'crcDashboard' || state.activeTab === 'recruiterDashboard') render();
+                else renderDashboardTodaysAppointments();
+                break;
+            }
+            case 'dashboard-appt-today': {
+                state.dashboardApptDateKey = toLocalDateKey(new Date());
+                if (state.activeTab === 'crcDashboard' || state.activeTab === 'recruiterDashboard') render();
+                else renderDashboardTodaysAppointments();
+                break;
+            }
             case 'view-patient': {
                 closeModal();
                 const viewPatient = await resolvePatientById(id);
@@ -11115,6 +11187,15 @@ document.addEventListener('change', async (e) => {
                 }
             }
         } catch { /* ignore network errors */ }
+    }
+    if (e.target.id === 'dashboard-appt-date') {
+        const val = String(e.target.value || '').trim();
+        if (/^\d{4}-\d{2}-\d{2}$/.test(val)) {
+            state.dashboardApptDateKey = val;
+            if (state.activeTab === 'crcDashboard' || state.activeTab === 'recruiterDashboard') render();
+            else renderDashboardTodaysAppointments();
+        }
+        return;
     }
     if (e.target.id === 'contact-log-overall-status' || e.target.id === 'edit-patient-overall-status') {
         const val = e.target.value;
