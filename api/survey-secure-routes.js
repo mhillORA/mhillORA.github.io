@@ -120,6 +120,14 @@ function roleLabel(role) {
     return role || 'Staff';
 }
 
+/** Short role token for email subjects: MYTX… || Feasibility Survey || PI */
+function roleSubjectLabel(role) {
+    const r = normalizeRole(role);
+    if (r === 'pi') return 'PI';
+    if (r === 'coordinator') return 'SC';
+    return roleLabel(role);
+}
+
 function publicQuestionsFromList(questions) {
     const list = Array.isArray(questions) ? questions : [];
     return list.map((q, idx) => {
@@ -884,6 +892,12 @@ function registerSurveySecureRoutes(app, deps) {
                 const customSubject = String(body?.subject || body?.emailSubject || '')
                     .trim()
                     .slice(0, 200);
+                const invitePassword = String(body?.password || body?.emailPassword || '')
+                    .trim()
+                    .slice(0, 80);
+                const inviteDueDate = String(body?.dueDate || body?.emailDueDate || '')
+                    .trim()
+                    .slice(0, 80);
 
                 let attachmentMeta = [];
                 let emailFiles = [];
@@ -946,6 +960,13 @@ function registerSurveySecureRoutes(app, deps) {
                     };
                 }
 
+                const studyCode = String(
+                    body?.studyCode || body?.protocolNumber || definition.studyCode || ''
+                ).trim();
+                const studyTitle = String(
+                    body?.studyTitle || definition.studyTitle || definition.title || ''
+                ).trim();
+
                 const asgC = getContainer(ASSIGNMENTS);
                 const results = [];
                 const now = new Date().toISOString();
@@ -972,6 +993,9 @@ function registerSurveySecureRoutes(app, deps) {
                             attachments: attachmentMeta.length ? attachmentMeta : undefined,
                             emailCc: ccEmails.length ? ccEmails : undefined,
                             emailSubject: customSubject || undefined,
+                            emailDueDate: inviteDueDate || undefined,
+                            studyCode: studyCode || undefined,
+                            studyTitle: studyTitle || undefined,
                             createdAt: now,
                             updatedAt: now,
                             lastSentAt: now,
@@ -992,14 +1016,20 @@ function registerSurveySecureRoutes(app, deps) {
                             const copy = inviteEmailCopy({
                                 siteName,
                                 roleLabel: roleLabel(targetRole),
+                                roleSubjectLabel: roleSubjectLabel(targetRole),
                                 inviteUrl,
                                 expiresAt: assignment.expiresAt,
                                 attachmentNames,
+                                studyCode,
+                                studyTitle,
+                                password: invitePassword,
+                                dueDate: inviteDueDate,
+                                subjectOverride: customSubject,
                             });
                             emailResult = await deliverSurveyEmail({
                                 to: email,
                                 cc: ccEmails,
-                                subject: customSubject || copy.subject,
+                                subject: copy.subject,
                                 text: copy.text,
                                 html: copy.html,
                                 attachments: emailFiles,
@@ -1144,14 +1174,20 @@ function registerSurveySecureRoutes(app, deps) {
                     const copy = inviteEmailCopy({
                         siteName,
                         roleLabel: roleLabel(assignment.targetRole),
+                        roleSubjectLabel: roleSubjectLabel(assignment.targetRole),
                         inviteUrl,
                         expiresAt: assignment.expiresAt,
                         attachmentNames,
+                        studyCode: assignment.studyCode,
+                        studyTitle: assignment.studyTitle,
+                        password: String(body?.password || body?.emailPassword || '').trim(),
+                        dueDate: String(body?.dueDate || assignment.emailDueDate || '').trim(),
+                        subjectOverride: resendSubject,
                     });
                     emailResult = await deliverSurveyEmail({
                         to: email,
                         cc: resendCc,
-                        subject: resendSubject || copy.subject,
+                        subject: copy.subject,
                         text: copy.text,
                         html: copy.html,
                         attachments: resendFiles,

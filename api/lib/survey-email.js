@@ -259,40 +259,105 @@ async function deliverSurveyEmail({ to, subject, text, html, meta, cc, attachmen
     return { ok: false, mode: 'manual', error: 'no_email_provider' };
 }
 
-function inviteEmailCopy({ siteName, roleLabel, inviteUrl, expiresAt, attachmentNames }) {
-    const subject = 'ORA site survey — action requested';
-    const expiryLine = expiresAt
-        ? `\nThis link expires on ${new Date(expiresAt).toLocaleDateString()}.\n`
-        : '\n';
-    const names = Array.isArray(attachmentNames) ? attachmentNames.filter(Boolean) : [];
-    const attachText = names.length
-        ? `\nAttached for your reference:\n${names.map((n) => `- ${n}`).join('\n')}\n`
-        : '';
-    const attachHtml = names.length
-        ? `<p>Attached for your reference:</p><ul>${names
-              .map((n) => `<li>${escapeHtml(n)}</li>`)
-              .join('')}</ul>`
-        : '';
-    const text =
-        `Hello,\n\n` +
-        `Please complete the ${roleLabel} site survey for ${siteName || 'your site'} using this secure link:\n\n` +
-        `${inviteUrl}\n` +
-        expiryLine +
-        attachText +
-        `\nDo not forward this link — it is unique to you.\n` +
-        `\nThank you,\nORA Clinical Operations\n`;
-    const html =
-        `<p>Hello,</p>` +
-        `<p>Please complete the <strong>${escapeHtml(roleLabel)}</strong> site survey for ` +
-        `<strong>${escapeHtml(siteName || 'your site')}</strong> using this secure link:</p>` +
-        `<p><a href="${escapeAttr(inviteUrl)}">${escapeHtml(inviteUrl)}</a></p>` +
-        (expiresAt
-            ? `<p>This link expires on ${escapeHtml(new Date(expiresAt).toLocaleDateString())}.</p>`
-            : '') +
-        attachHtml +
-        `<p>Do not forward this link — it is unique to you.</p>` +
-        `<p>Thank you,<br/>ORA Clinical Operations</p>`;
-    return { subject, text, html };
+function inviteEmailCopy({
+    siteName,
+    roleLabel,
+    roleSubjectLabel,
+    inviteUrl,
+    expiresAt,
+    attachmentNames,
+    studyCode,
+    studyTitle,
+    protocolName,
+    password,
+    dueDate,
+    greeting,
+    opener,
+    closer,
+    subjectOverride,
+}) {
+    const rolePart = String(roleSubjectLabel || roleLabel || 'Site').trim() || 'Site';
+    const code = String(studyCode || '').trim();
+    const defaultSubject = code
+        ? `${code} || Feasibility Survey || ${rolePart}`
+        : `Feasibility Survey || ${rolePart}`;
+    const subject = String(subjectOverride || '').trim().slice(0, 200) || defaultSubject;
+
+    const greet = String(greeting || 'Dear PI and SC,').trim() || 'Dear PI and SC,';
+    const studyLine =
+        String(studyTitle || '').trim() ||
+        (String(protocolName || '').trim()
+            ? String(protocolName).trim()
+            : 'this clinical trial');
+    const openText =
+        String(opener || '').trim() ||
+        `Thank you again for your interest in ${studyLine}.`;
+    const names = Array.isArray(attachmentNames)
+        ? attachmentNames.map((n) => String(n || '').trim()).filter(Boolean)
+        : [];
+    const due = String(dueDate || '').trim();
+    const pwd = String(password || '').trim();
+    const closeText =
+        String(closer || '').trim() ||
+        'Thank you again for your time. We look forward to working with you on this study!';
+
+    const attachIntro = names.length
+        ? `I have attached ${
+              names.length === 1 ? 'the following document' : 'the following documents'
+          } for your review and support of the next step, the Feasibility Survey: ${names.join(', ')}.`
+        : 'Please review any materials included with this invitation to support the next step, the Feasibility Survey.';
+
+    const dueLine = due
+        ? `Please complete this feasibility survey by ${due}.`
+        : expiresAt
+          ? `Please complete this feasibility survey by ${new Date(expiresAt).toLocaleDateString()}.`
+          : '';
+
+    const textParts = [
+        greet,
+        '',
+        openText,
+        '',
+        attachIntro,
+        'The survey will take approximately 30 minutes, depending on the answers. All information provided via this survey will be kept confidential.',
+        '',
+        'Here is a link to the survey:',
+        inviteUrl || '',
+        '',
+    ];
+    if (pwd) textParts.push(`Password is ${pwd}`, '');
+    if (dueLine) textParts.push(dueLine, '');
+    textParts.push(closeText, '', 'Best regards,', 'The Ora Team');
+    if (siteName) textParts.push('', `Site: ${siteName}`);
+
+    const htmlParts = [
+        `<p>${escapeHtml(greet)}</p>`,
+        `<p>${escapeHtml(openText)}</p>`,
+        `<p>${escapeHtml(attachIntro)}</p>`,
+        `<p>The survey will take approximately 30 minutes, depending on the answers. All information provided via this survey will be kept confidential.</p>`,
+        `<p>Here is a link to the survey:</p>`,
+        inviteUrl
+            ? `<p><a href="${escapeAttr(inviteUrl)}">${escapeHtml(inviteUrl)}</a></p>`
+            : '<p>(secure link)</p>',
+    ];
+    if (pwd) htmlParts.push(`<p><strong>Password is ${escapeHtml(pwd)}</strong></p>`);
+    if (dueLine) {
+        htmlParts.push(
+            `<p>Please complete this feasibility survey by <strong>${escapeHtml(
+                due || (expiresAt ? new Date(expiresAt).toLocaleDateString() : '')
+            )}</strong>.</p>`
+        );
+    }
+    htmlParts.push(`<p>${escapeHtml(closeText)}</p>`, `<p>Best regards,<br/>The Ora Team</p>`);
+    if (siteName) {
+        htmlParts.push(`<p style="color:#666;font-size:12px;">Site: ${escapeHtml(siteName)}</p>`);
+    }
+
+    return {
+        subject,
+        text: textParts.join('\n'),
+        html: htmlParts.join('\n'),
+    };
 }
 
 function opsNotifyCopy({ siteName, surveyTitle, roleLabel, status }) {

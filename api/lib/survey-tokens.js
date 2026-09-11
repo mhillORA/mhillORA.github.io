@@ -59,12 +59,7 @@ function isPastHardExpiry(iso, graceDays = EXPIRY_GRACE_DAYS) {
 /** Strip secrets before returning assignment docs to any client. */
 function redactAssignment(doc) {
     if (!doc || typeof doc !== 'object') return doc;
-    const {
-        tokenHash,
-        tokenRaw,
-        inviteToken,
-        ...safe
-    } = doc;
+    const { tokenHash, tokenRaw, inviteToken, ...safe } = doc;
     return {
         ...safe,
         hasInviteToken: Boolean(tokenHash),
