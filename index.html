@@ -3870,11 +3870,15 @@
             const includeEmptySites = opts.includeEmptySites === true;
             const def = (allSiteSurveyDefinitions || []).find(d => d && d.id === surveyId) || null;
             const questions = asSurveyList(def?.questions);
+            const questionTotal = questions.length;
             const roleFilter = String(targetRole || 'all').trim().toLowerCase();
             const isGf = surveyId === 'survey-general-feasibility'
                 || surveyId === 'survey-general-feasibility-short';
+            // Map prior answers from any survey onto this template's question set
+            // (same idea as Send Survey coverage %). Exact survey responses still preferred.
+            const crossSurvey = true;
 
-            // Interactive UI: only sites with answers (keeps Reporting responsive with 400+ sites).
+            // Interactive UI: sites with any response on file (then drop 0% after merge).
             // Export "everyone" passes includeEmptySites:true for the full unified catalog.
             const canonicalSites = new Set();
             if (includeEmptySites) {
@@ -3884,7 +3888,9 @@
                 if (!r || r._archived || !r.siteId) return;
                 if (roleFilter && roleFilter !== 'all'
                     && String(r.targetRole || '').toLowerCase() !== roleFilter) return;
-                if (!(isGf || r.surveyId === surveyId)) return;
+                // Prefer same-survey sites always; also take any response so prior GF/Long
+                // can show coverage against Mighty / study templates.
+                if (!(crossSurvey || isGf || r.surveyId === surveyId)) return;
                 const cid = canonicalSiteIdForReporting(r.siteId);
                 if (cid) canonicalSites.add(cid);
             });
@@ -3904,8 +3910,13 @@
                 const merged = buildMergedFeasibilityAnswersForSite(siteId, questions, {
                     preferSurveyId: surveyId,
                     preferRole: roleFilter,
-                    crossSurvey: isGf,
+                    crossSurvey,
                 });
+                const answeredCount = Number(merged.filled) || 0;
+                if (!includeEmptySites && answeredCount <= 0) return;
+                const answeredPct = questionTotal > 0
+                    ? Math.round((answeredCount / questionTotal) * 100)
+                    : 0;
                 // Include every master-list site even when still blank
                 const response = {
                     id: merged.responseId,
@@ -3930,15 +3941,17 @@
                     outcome,
                     pct,
                     knockouts,
-                    answeredCount: merged.filled,
+                    answeredCount,
+                    answeredTotal: questionTotal,
+                    answeredPct,
                 });
             });
 
-            const outcomeRank = { pass: 0, borderline: 1, fail: 2, unscored: 3 };
+            // Default sort: who answered most of this survey's questions
             siteRows.sort((a, b) => {
-                const oa = outcomeRank[a.outcome] ?? 9;
-                const ob = outcomeRank[b.outcome] ?? 9;
-                if (oa !== ob) return oa - ob;
+                const aa = a.answeredPct ?? 0;
+                const bb = b.answeredPct ?? 0;
+                if (bb !== aa) return bb - aa;
                 const pa = a.pct == null ? -1 : a.pct;
                 const pb = b.pct == null ? -1 : b.pct;
                 if (pb !== pa) return pb - pa;
@@ -3974,7 +3987,82 @@
                 return { question: q, answered, skipped, distribution, samples, isLongText };
             });
 
-            return { def, questions, siteRows, questionStats, hasScoring: surveyDefinitionHasScoring(def) };
+            return { def, questions, siteRows, questionStats, hasScoring: surveyDefinitionHasScoring(def), questionTotal };
+        };
+
+        const answeredPctBadgeHtml = (pct) => {
+            const n = Number(pct) || 0;
+            const cls = n >= 70
+                ? 'bg-emerald-100 text-emerald-900 dark:bg-emerald-900/40 dark:text-emerald-200'
+                : n >= 30
+                    ? 'bg-amber-100 text-amber-900 dark:bg-amber-900/40 dark:text-amber-200'
+                    : 'bg-slate-100 text-slate-700 dark:bg-slate-700 dark:text-slate-200';
+            return `<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold ${cls}">${n}%</span>`;
+        };
+
+        const renderFeasibilityCoverageBoardHtml = (report) => {
+            if (!report?.siteRows?.length) return '';
+            const totalQ = report.questionTotal || report.questions?.length || 0;
+            const high = report.siteRows.filter((r) => (r.answeredPct || 0) >= 70).length;
+            const mid = report.siteRows.filter((r) => {
+                const p = r.answeredPct || 0;
+                return p >= 30 && p < 70;
+            }).length;
+            const low = report.siteRows.filter((r) => (r.answeredPct || 0) < 30).length;
+            const rows = report.siteRows.map((row) => {
+                const when = row.when
+                    ? new Date(row.when).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
+                    : '—';
+                const filled = `${row.answeredCount ?? 0}/${row.answeredTotal ?? totalQ}`;
+                return `
+                    <tr class="hover:bg-gray-50 dark:hover:bg-gray-700/40">
+                        <td class="px-3 py-2 text-sm text-gray-500 dark:text-gray-400">${row.rank}</td>
+                        <td class="px-3 py-2 text-sm font-medium text-gray-900 dark:text-gray-100">
+                            <button type="button" class="view-site-details-btn hover:underline" data-site-id="${escapeHtml(row.siteId)}">${escapeHtml(row.siteName)}</button>
+                        </td>
+                        <td class="px-3 py-2 text-sm">${answeredPctBadgeHtml(row.answeredPct)}</td>
+                        <td class="px-3 py-2 text-xs text-gray-600 dark:text-gray-300 whitespace-nowrap">${escapeHtml(filled)}</td>
+                        <td class="px-3 py-2 text-xs text-gray-600 dark:text-gray-300">
+                            <button type="button" class="view-site-survey-response-btn text-indigo-600 dark:text-indigo-400 hover:underline" data-response-id="${escapeHtml(row.response.id)}">${escapeHtml(formatSiteSurveyRoleLabel(row.response.targetRole))}</button>
+                        </td>
+                        <td class="px-3 py-2 text-xs text-gray-500 dark:text-gray-400 whitespace-nowrap">${escapeHtml(when)}</td>
+                        <td class="px-3 py-2 text-xs whitespace-nowrap">${surveyOutcomeBadgeHtml(row.response, report.def)}</td>
+                    </tr>`;
+            }).join('');
+
+            return `
+                <div class="mb-6 rounded-xl border border-[#0F6E56]/25 dark:border-[#0F6E56]/40 overflow-hidden">
+                    <div class="bg-[#0F6E56] text-white px-4 py-3 flex flex-wrap items-center justify-between gap-2">
+                        <div>
+                            <div class="font-semibold">Who already answered</div>
+                            <div class="text-xs text-white/80 mt-0.5">
+                                Share of this survey’s ${totalQ} questions already on file per site
+                                (includes prior Long/Short/Mighty answers mapped by library id / label). Sorted highest first.
+                            </div>
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-3 gap-0 divide-x divide-gray-200 dark:divide-gray-700 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900/40">
+                        <div class="p-3 text-center"><div class="text-[10px] uppercase text-gray-500">≥ 70% filled</div><div class="text-lg font-bold text-emerald-700 dark:text-emerald-300">${high}</div></div>
+                        <div class="p-3 text-center"><div class="text-[10px] uppercase text-gray-500">30–69%</div><div class="text-lg font-bold text-amber-700 dark:text-amber-300">${mid}</div></div>
+                        <div class="p-3 text-center"><div class="text-[10px] uppercase text-gray-500">&lt; 30%</div><div class="text-lg font-bold text-slate-600 dark:text-slate-300">${low}</div></div>
+                    </div>
+                    <div class="overflow-x-auto max-h-[28rem]">
+                        <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
+                            <thead class="bg-gray-50 dark:bg-gray-700 sticky top-0 z-10">
+                                <tr>
+                                    <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">#</th>
+                                    <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Site</th>
+                                    <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Answered %</th>
+                                    <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Filled</th>
+                                    <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Role</th>
+                                    <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Last activity</th>
+                                    <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Score outcome</th>
+                                </tr>
+                            </thead>
+                            <tbody class="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">${rows}</tbody>
+                        </table>
+                    </div>
+                </div>`;
         };
 
         const renderFeasibilityRankBoardHtml = (report) => {
@@ -4164,6 +4252,7 @@
 
             const matrixHead = `
                 <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase sticky left-0 bg-gray-50 dark:bg-gray-700 z-10">Site</th>
+                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Answered %</th>
                 <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Outcome</th>
                 <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Role</th>
                 ${report.questions.map(q => `
@@ -4182,6 +4271,7 @@
                             <button type="button" class="view-site-details-btn hover:underline" data-site-id="${escapeHtml(row.siteId)}">${escapeHtml(row.siteName)}</button>
                             <div class="text-[10px] text-gray-400 font-normal">${escapeHtml(when)}</div>
                         </td>
+                        <td class="px-3 py-2 text-xs whitespace-nowrap">${answeredPctBadgeHtml(row.answeredPct)}</td>
                         <td class="px-3 py-2 text-xs whitespace-nowrap">${surveyOutcomeBadgeHtml(row.response, report.def)}</td>
                         <td class="px-3 py-2 text-xs text-gray-600 dark:text-gray-300 whitespace-nowrap">
                             <button type="button" class="view-site-survey-response-btn text-indigo-600 dark:text-indigo-400 hover:underline" data-response-id="${escapeHtml(row.response.id)}">${escapeHtml(formatSiteSurveyRoleLabel(row.response.targetRole))}</button>
@@ -4191,6 +4281,7 @@
             }).join('');
 
             return `
+                ${renderFeasibilityCoverageBoardHtml(report)}
                 ${renderFeasibilityRankBoardHtml(report)}
                 <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-4">
                     <div class="p-3 rounded-lg border border-gray-200 dark:border-gray-700 text-center">
@@ -4198,7 +4289,7 @@
                         <div class="text-xl font-bold text-gray-900 dark:text-gray-100">${report.questions.length}</div>
                     </div>
                     <div class="p-3 rounded-lg border border-gray-200 dark:border-gray-700 text-center">
-                        <div class="text-xs text-gray-500 dark:text-gray-400">Sites responded</div>
+                        <div class="text-xs text-gray-500 dark:text-gray-400">Sites with answers</div>
                         <div class="text-xl font-bold text-gray-900 dark:text-gray-100">${report.siteRows.length}</div>
                     </div>
                     <div class="p-3 rounded-lg border border-gray-200 dark:border-gray-700 text-center">
@@ -4254,7 +4345,7 @@
                 const lines = [];
                 if (mode === 'long') {
                     lines.push(['Generated', new Date().toISOString()].map(csvEscapeCell).join(','));
-                    lines.push(['Site', 'SiteId', 'Role', 'SubmittedAt', 'AnsweredCount', 'Question', 'Answer'].map(csvEscapeCell).join(','));
+                    lines.push(['Site', 'SiteId', 'Role', 'SubmittedAt', 'AnsweredCount', 'AnsweredPct', 'Question', 'Answer'].map(csvEscapeCell).join(','));
                     report.siteRows.forEach(row => {
                         report.questions.forEach(q => {
                             const { value, skipped } = findAnswerForQuestion(row.response, q);
@@ -4265,6 +4356,7 @@
                                 formatSiteSurveyRoleLabel(row.response.targetRole),
                                 row.when || '',
                                 row.answeredCount ?? '',
+                                row.answeredPct ?? '',
                                 q.label || q.id || '',
                                 value
                             ].map(csvEscapeCell).join(','));
@@ -4273,7 +4365,7 @@
                     downloadCsvText(`feasibility_${safeTitle}_answered_${generatedStamp}.csv`, lines.join('\n'));
                 } else {
                     lines.push(['Generated', new Date().toISOString()].map(csvEscapeCell).join(','));
-                    const headers = ['Site', 'SiteId', 'Role', 'SubmittedAt', 'AnsweredCount', ...report.questions.map(q => q.label || q.id || '')];
+                    const headers = ['Site', 'SiteId', 'Role', 'SubmittedAt', 'AnsweredCount', 'AnsweredPct', ...report.questions.map(q => q.label || q.id || '')];
                     lines.push(headers.map(csvEscapeCell).join(','));
                     report.siteRows.forEach(row => {
                         const cells = report.questions.map(q => findAnswerForQuestion(row.response, q).value);
@@ -4283,6 +4375,7 @@
                             formatSiteSurveyRoleLabel(row.response.targetRole),
                             row.when || '',
                             row.answeredCount ?? cells.filter(Boolean).length,
+                            row.answeredPct ?? '',
                             ...cells
                         ].map(csvEscapeCell).join(','));
                     });
@@ -7953,7 +8046,7 @@
 
                                     <h3 class="text-lg font-semibold text-gray-800 dark:text-gray-200">Sponsor feasibility pack</h3>
 
-                                    <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">All sites with answers on file — including prior Long/Short responses mapped onto the current question set. Export CSV for everyone, or a polished pack for sponsors.</p>
+                                    <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Pick a survey (e.g. ReBUILD / Mighty) to see who already answered those questions — answered % per site, then score ranking and the full matrix. Prior Long/Short answers map on when labels/library ids match.</p>
 
                                 </div>
 
