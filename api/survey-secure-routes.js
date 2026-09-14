@@ -164,6 +164,20 @@ function passwordGateFailure(assignment, providedPassword) {
     };
 }
 
+/** Help is opt-in only — drop DOCX/SurveyMonkey type labels (e.g. "Short Response — unique identifying data"). */
+function meaningfulQuestionHelp(raw) {
+    const t = String(raw ?? '').replace(/\s+/g, ' ').trim();
+    if (!t) return undefined;
+    const n = t.toLowerCase().replace(/[–—]/g, '-').replace(/^question type:\s*/, '');
+    if (/^shown (when|only when)\b/.test(n)) return undefined;
+    if (/^(select all that apply\.?\s*)+(shown (when|only when).*)?$/.test(n)) return undefined;
+    if (/^(yes\s*\/\s*no|short response|long response|multi-?select|single select|range select|numeric entry|date|rating)\b/.test(n)) {
+        return undefined;
+    }
+    if (/^(select all that apply)\.?$/.test(n)) return undefined;
+    return t;
+}
+
 function publicQuestionsFromList(questions) {
     const list = Array.isArray(questions) ? questions : [];
     return list.map((q, idx) => {
@@ -184,7 +198,7 @@ function publicQuestionsFromList(questions) {
             // Section / paging metadata for the public multi-page form
             category: q.category || q.section || undefined,
             section: q.section || q.category || undefined,
-            help: q.help || q.context || q.description || undefined,
+            help: meaningfulQuestionHelp(q.help || q.context || q.description),
             maxStars: q.maxStars || q.max || undefined,
             docxNum: typeof q.docxNum === 'number' ? q.docxNum : undefined,
         };
@@ -1476,7 +1490,11 @@ function registerSurveySecureRoutes(app, deps) {
                     const latestTwo = siteResponses.slice(0, 2);
                     if (latestTwo.length >= 2) {
                         try {
-                            delta = compareSurveyResponses(latestTwo[0], latestTwo[1], questions);
+                            delta = compareSurveyResponses({
+                                current: latestTwo[0],
+                                previous: latestTwo[1],
+                                questions,
+                            });
                         } catch (_) {
                             delta = null;
                         }

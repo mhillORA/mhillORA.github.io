@@ -360,19 +360,27 @@ async function computeScore(getContainer, surveyId, answers) {
     }
 }
 
-async function findLatestLiveResponse(getContainer, { siteId, surveyId, targetRole }) {
+async function findLatestLiveResponse(getContainer, { siteId, siteIds, surveyId, targetRole }) {
     const rspC = getContainer('site-survey-responses');
     const role = normalizeRole(targetRole);
+    const ids = [...new Set(
+        (Array.isArray(siteIds) && siteIds.length ? siteIds : [siteId])
+            .map((id) => String(id || '').trim())
+            .filter(Boolean)
+    )];
+    if (!ids.length || !surveyId) return null;
+    const clauses = ids.map((_, i) => `c.siteId = @s${i}`);
+    const parameters = [
+        ...ids.map((id, i) => ({ name: `@s${i}`, value: id })),
+        { name: '@surveyId', value: String(surveyId) },
+        { name: '@targetRole', value: role },
+    ];
     const { resources } = await rspC.items
         .query(
             {
                 query:
-                    'SELECT * FROM c WHERE c.siteId = @siteId AND c.surveyId = @surveyId AND LOWER(c.targetRole) = @targetRole AND (NOT IS_DEFINED(c._archived) OR c._archived != true)',
-                parameters: [
-                    { name: '@siteId', value: String(siteId) },
-                    { name: '@surveyId', value: String(surveyId) },
-                    { name: '@targetRole', value: role },
-                ],
+                    `SELECT * FROM c WHERE (${clauses.join(' OR ')}) AND c.surveyId = @surveyId AND LOWER(c.targetRole) = @targetRole AND (NOT IS_DEFINED(c._archived) OR c._archived != true)`,
+                parameters,
             },
             { enableCrossPartitionQuery: true }
         )
@@ -427,20 +435,116 @@ async function findSiteLiveResponses(getContainer, { siteIds, limit = 80 }) {
     return sorted.slice(0, cap);
 }
 
+function normalizeSiteNameForLink(name) {
+    return String(name || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, ' ')
+        .replace(/\b(llc|inc|ltd|pc|pa|pllc|corp|co|the)\b/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
 async function resolveRelatedSiteIds(getContainer, siteId) {
     const ids = new Set([String(siteId)]);
+    let seedName = '';
     try {
         const read = await getContainer('sites').item(String(siteId), String(siteId)).read();
         const site = read.resource;
-        if (Array.isArray(site?.legacySiteIds)) {
-            site.legacySiteIds.forEach((id) => {
-                if (id) ids.add(String(id));
-            });
+        if (site) {
+            seedName = site.name || '';
+            if (Array.isArray(site.legacySiteIds)) {
+                site.legacySiteIds.forEach((id) => {
+                    if (id) ids.add(String(id));
+                });
+            }
+            if (site.promotedFromLegacySiteId) ids.add(String(site.promotedFromLegacySiteId));
         }
-        if (site?.promotedFromLegacySiteId) ids.add(String(site.promotedFromLegacySiteId));
+    } catch (_) {
+        /* may be a legacy id */
+    }
+
+    // Reverse: legacy rows pointing at this live site
+    try {
+        const { resources } = await getContainer('legacy-sites')
+            .items.query(
+                {
+                    query: 'SELECT c.id, c.name, c.linkedArtemisSiteId FROM c WHERE c.linkedArtemisSiteId = @liveId',
+                    parameters: [{ name: '@liveId', value: String(siteId) }],
+                },
+                { enableCrossPartitionQuery: true }
+            )
+            .fetchAll();
+        (resources || []).forEach((leg) => {
+            if (leg?.id) ids.add(String(leg.id));
+            if (!seedName && leg?.name) seedName = leg.name;
+        });
     } catch (_) {
         /* ignore */
     }
+
+    // If assignment/response used a legacy id, pull its linked live twin + siblings
+    try {
+        const legRead = await getContainer('legacy-sites').item(String(siteId), String(siteId)).read();
+        const leg = legRead.resource;
+        if (leg) {
+            if (!seedName) seedName = leg.name || '';
+            if (leg.linkedArtemisSiteId) {
+                ids.add(String(leg.linkedArtemisSiteId));
+                try {
+                    const liveRead = await getContainer('sites')
+                        .item(String(leg.linkedArtemisSiteId), String(leg.linkedArtemisSiteId))
+                        .read();
+                    const live = liveRead.resource;
+                    if (live) {
+                        if (Array.isArray(live.legacySiteIds)) {
+                            live.legacySiteIds.forEach((id) => {
+                                if (id) ids.add(String(id));
+                            });
+                        }
+                        if (live.promotedFromLegacySiteId) ids.add(String(live.promotedFromLegacySiteId));
+                    }
+                } catch (_) {
+                    /* ignore */
+                }
+            }
+        }
+    } catch (_) {
+        /* not a legacy id */
+    }
+
+    // Name fallback when explicit links are missing (unique match only)
+    const key = normalizeSiteNameForLink(seedName);
+    if (key) {
+        try {
+            const { resources: liveHits } = await getContainer('sites')
+                .items.query({ query: 'SELECT c.id, c.name, c.legacySiteIds, c.promotedFromLegacySiteId FROM c' }, { enableCrossPartitionQuery: true })
+                .fetchAll();
+            const nameHits = (liveHits || []).filter((s) => normalizeSiteNameForLink(s?.name) === key);
+            if (nameHits.length === 1) {
+                const live = nameHits[0];
+                ids.add(String(live.id));
+                (live.legacySiteIds || []).forEach((id) => {
+                    if (id) ids.add(String(id));
+                });
+                if (live.promotedFromLegacySiteId) ids.add(String(live.promotedFromLegacySiteId));
+            }
+        } catch (_) {
+            /* ignore */
+        }
+        try {
+            const { resources: legHits } = await getContainer('legacy-sites')
+                .items.query({ query: 'SELECT c.id, c.name, c.linkedArtemisSiteId FROM c' }, { enableCrossPartitionQuery: true })
+                .fetchAll();
+            const nameHits = (legHits || []).filter((s) => normalizeSiteNameForLink(s?.name) === key);
+            if (nameHits.length === 1 && nameHits[0]?.id) {
+                ids.add(String(nameHits[0].id));
+                if (nameHits[0].linkedArtemisSiteId) ids.add(String(nameHits[0].linkedArtemisSiteId));
+            }
+        } catch (_) {
+            /* ignore */
+        }
+    }
+
     return [...ids];
 }
 
@@ -543,7 +647,11 @@ async function writeSurveyResponse(deps, { assignment, answers, email, displayNa
     }
 
     body.submittedAt = now;
-    const prior = await findLatestLiveResponse(getContainer, body);
+    const relatedSiteIds = await resolveRelatedSiteIds(getContainer, body.siteId);
+    const prior = await findLatestLiveResponse(getContainer, {
+        ...body,
+        siteIds: relatedSiteIds,
+    });
     const score = await computeScore(getContainer, body.surveyId, body.answers);
     if (score !== null) body.score = score;
 

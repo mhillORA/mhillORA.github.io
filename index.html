@@ -2667,43 +2667,60 @@
         const compareSiteSurveyResponses = (current, previous, questions = []) => {
             const buildLookup = (answers) => {
                 const byId = new Map();
+                const byLib = new Map();
                 const byLabel = new Map();
                 asSurveyList(answers).forEach((a) => {
                     if (!a) return;
                     const value = readSurveyAnswerValue(a);
                     const filled = value !== '';
+                    const lib = resolveAnswerLibraryId(a) || (a.libraryQuestionId ? String(a.libraryQuestionId) : '');
                     const entry = {
                         value,
                         filled,
                         questionId: String(a.questionId ?? a.id ?? ''),
+                        libraryQuestionId: lib,
                         label: String(a.label || '').trim(),
                     };
                     if (entry.questionId) byId.set(entry.questionId, entry);
+                    if (entry.libraryQuestionId) byLib.set(entry.libraryQuestionId, entry);
                     const norm = normalizeSurveyDeltaLabel(entry.label);
                     if (norm) byLabel.set(norm, entry);
+                    if (norm.includes(' | ')) byLabel.set(norm.split(' | ')[0].trim(), entry);
                 });
-                return { byId, byLabel };
+                return { byId, byLib, byLabel };
             };
             const cur = buildLookup(current?.answers);
             const prev = buildLookup(previous?.answers);
             const keys = new Map();
             const remember = (meta) => {
                 const qid = meta.questionId ? String(meta.questionId) : '';
+                const lib = meta.libraryQuestionId ? String(meta.libraryQuestionId) : '';
                 const norm = normalizeSurveyDeltaLabel(meta.label);
-                const key = qid || (norm ? `label:${norm}` : '');
+                const key = qid || (lib ? `lib:${lib}` : '') || (norm ? `label:${norm}` : '');
                 if (!key || keys.has(key)) return;
-                keys.set(key, { questionId: qid || null, label: meta.label || qid || 'Question' });
+                keys.set(key, { questionId: qid || null, libraryQuestionId: lib || null, label: meta.label || qid || 'Question' });
             };
-            asSurveyList(questions).forEach((q, idx) => remember({ questionId: q.id || `q_${idx}`, label: q.label || q.title || '' }));
+            asSurveyList(questions).forEach((q, idx) => remember({
+                questionId: q.id || `q_${idx}`,
+                libraryQuestionId: q.libraryQuestionId || '',
+                label: q.label || q.title || '',
+            }));
             for (const e of cur.byId.values()) remember(e);
             for (const e of prev.byId.values()) remember(e);
+            for (const e of cur.byLib.values()) remember(e);
+            for (const e of prev.byLib.values()) remember(e);
             for (const e of cur.byLabel.values()) remember(e);
             for (const e of prev.byLabel.values()) remember(e);
 
             const resolve = (lookup, meta) => {
                 if (meta.questionId && lookup.byId.has(meta.questionId)) return lookup.byId.get(meta.questionId);
+                if (meta.libraryQuestionId && lookup.byLib.has(meta.libraryQuestionId)) return lookup.byLib.get(meta.libraryQuestionId);
                 const norm = normalizeSurveyDeltaLabel(meta.label);
                 if (norm && lookup.byLabel.has(norm)) return lookup.byLabel.get(norm);
+                if (norm.includes(' | ')) {
+                    const base = norm.split(' | ')[0].trim();
+                    if (base && lookup.byLabel.has(base)) return lookup.byLabel.get(base);
+                }
                 return null;
             };
 
@@ -2896,6 +2913,13 @@
             __siteLinkIndex = null;
         };
 
+        const normalizeSiteNameForLink = (name) => String(name || '')
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, ' ')
+            .replace(/\b(llc|inc|ltd|pc|pa|pllc|corp|co|the)\b/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+
         const getSiteLinkIndex = () => {
             const live = Array.isArray(allSites) ? allSites : [];
             const legacy = legacySitesCatalog();
@@ -2925,6 +2949,25 @@
                 if (!leg?.id) return;
                 legacyById.set(leg.id, leg);
                 if (leg.linkedArtemisSiteId) addLegacyToLive(leg.linkedArtemisSiteId, leg.id);
+            });
+
+            // Master feasibility ingest answers live on legacy-site-* ids. Auto-link when the
+            // normalized site name uniquely matches a live Artemis site (no ambiguous ties).
+            const liveByName = new Map();
+            live.forEach((s) => {
+                const key = normalizeSiteNameForLink(s?.name);
+                if (!key) return;
+                const arr = liveByName.get(key) || [];
+                arr.push(s);
+                liveByName.set(key, arr);
+            });
+            legacy.forEach((leg) => {
+                if (!leg?.id || liveIdByAnyId.has(leg.id)) return;
+                const key = normalizeSiteNameForLink(leg?.name);
+                if (!key) return;
+                const hits = liveByName.get(key) || [];
+                if (hits.length !== 1) return;
+                addLegacyToLive(hits[0].id, leg.id);
             });
 
             const aliasCache = new Map();
@@ -3720,13 +3763,13 @@
                     const sourceLib = resolveSourceLibraryId(a);
                     const destLib = resolveAnswerLibraryId(a);
                     const shaped = reshapeBridgeAnswer(destLib, rawVal, sourceLib);
-                    if (!shaped) return;
+                    // Always keep raw answers for same-survey / label matching even when no GF bridge
                     const entry = {
-                        value: shaped.value,
+                        value: shaped ? shaped.value : rawVal,
                         type: a.type || 'text',
                         label: a.label || a.title || '',
                         questionId: String(a.questionId ?? a.id ?? ''),
-                        libraryQuestionId: shaped.libraryQuestionId,
+                        libraryQuestionId: (shaped && shaped.libraryQuestionId) || destLib || sourceLib || (a.libraryQuestionId ? String(a.libraryQuestionId) : ''),
                         surveyId: resp.surveyId,
                         responseId: resp.id,
                         submittedAt: resp.submittedAt || resp.updatedAt || resp.createdAt || '',
@@ -3735,7 +3778,9 @@
                     };
                     put(byId, entry.questionId, entry);
                     put(byLib, entry.libraryQuestionId, entry);
-                    put(byLabel, normalizeSurveyDeltaLabel(entry.label), entry);
+                    const lab = normalizeSurveyDeltaLabel(entry.label);
+                    put(byLabel, lab, entry);
+                    if (lab.includes(' | ')) put(byLabel, lab.split(' | ')[0].trim(), entry);
                 });
             });
 
@@ -5978,6 +6023,18 @@
             loadPrivacyAudit();
         };
 
+        /** Help under a question is opt-in only — never show DOCX type notes. */
+        const meaningfulQuestionHelp = (raw) => {
+            const t = String(raw ?? '').replace(/\s+/g, ' ').trim();
+            if (!t) return '';
+            const n = t.toLowerCase().replace(/[–—]/g, '-').replace(/^question type:\s*/, '');
+            if (/^shown (when|only when)\b/.test(n)) return '';
+            if (/^(select all that apply\.?\s*)+(shown (when|only when).*)?$/.test(n)) return '';
+            if (/^(yes\s*\/\s*no|short response|long response|multi-?select|single select|range select|numeric entry|date|rating)\b/.test(n)) return '';
+            if (/^(select all that apply)\.?$/.test(n)) return '';
+            return t;
+        };
+
         const createLibraryQuestionModal = (existing = null) => {
             const isEdit = !!(existing && existing.id);
             const opts = Array.isArray(existing?.options) ? existing.options : ['Yes', 'No'];
@@ -5997,8 +6054,8 @@
                                 </div>
                                 <div>
                                     <label class="block text-sm font-medium">Help text under question</label>
-                                    <input name="help" value="${escapeHtml(existing?.help || existing?.context || existing?.description || '')}"
-                                        placeholder="Optional — shown under the question on the public survey"
+                                    <input name="help" value="${escapeHtml(meaningfulQuestionHelp(existing?.help || existing?.context || existing?.description) || '')}"
+                                        placeholder="Optional — leave blank to hide on surveys"
                                         class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm" />
                                 </div>
                                 <div class="grid grid-cols-2 gap-3">
@@ -6071,7 +6128,7 @@
             return {
                 id: `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
                 label: String(lib?.label || '').trim(),
-                help: String(lib?.help || lib?.context || lib?.description || '').trim(),
+                help: meaningfulQuestionHelp(lib?.help || lib?.context || lib?.description) || '',
                 type,
                 required: lib?.required !== false,
                 options: (type === 'select' || type === 'radio' || type === 'multiselect') ? options : [],
@@ -6554,10 +6611,10 @@
                                 </div>
                                 <div>
                                     <label class="block text-sm font-medium text-gray-800 dark:text-gray-100">Help text under question</label>
-                                    <input name="q_help_${idx}" value="${escapeHtml(q.help || q.context || q.description || '')}"
-                                        placeholder="Optional — shown under the question (leave blank to hide)"
+                                    <input name="q_help_${idx}" value="${escapeHtml(meaningfulQuestionHelp(q.help || q.context || q.description) || '')}"
+                                        placeholder="Optional — leave blank to hide (no type notes)"
                                         class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm" />
-                                    <p class="text-[11px] text-gray-500 dark:text-gray-400 mt-1">Replaces DOCX type notes like “Short Response – unique identifying data”.</p>
+                                    <p class="text-[11px] text-gray-500 dark:text-gray-400 mt-1">Only shown on the survey when you write something here.</p>
                                 </div>
 
                                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -6712,7 +6769,7 @@
                     const card = root.querySelector(`[data-q-idx="${idx}"]`);
                     if (!card) return;
                     q.label = (card.querySelector(`[name="q_label_${idx}"]`)?.value || '').trim();
-                    q.help = (card.querySelector(`[name="q_help_${idx}"]`)?.value || '').trim();
+                    q.help = meaningfulQuestionHelp(card.querySelector(`[name="q_help_${idx}"]`)?.value || '');
                     q.type = normalizeSurveyQuestionType(card.querySelector(`[name="q_type_${idx}"]`)?.value || 'text');
                     q.required = card.querySelector(`#q_required_${idx}`)?.checked !== false;
                     q.category = (card.querySelector(`[name="q_category_${idx}"]`)?.value || 'General').trim() || 'General';
@@ -6947,30 +7004,56 @@
                 return site.siteCoordinatorEmail || '';
             };
 
-            /** Match keys for the selected survey: libraryQuestionId and/or question id. */
-            const surveyMatchIndexFor = (surveyId) => {
+            /** Questions that will actually go out on send (study + GF Long prepended). */
+            const questionsForSendCoverage = (surveyId) => {
                 const def = (allDefs || []).find((d) => d && d.id === surveyId);
+                const studyQs = asSurveyList(def?.questions);
+                if (!def) return [];
+                if (String(surveyId || '').startsWith('survey-general-feasibility')) return studyQs;
+                const gfDef = (allDefs || []).find((d) => d && d.id === 'survey-general-feasibility');
+                const gfQs = asSurveyList(gfDef?.questions);
+                const out = [];
+                const seen = new Set();
+                [...gfQs, ...studyQs].forEach((q, idx) => {
+                    if (!q) return;
+                    const key = String(q.libraryQuestionId || '').trim()
+                        || normalizeSurveyDeltaLabel(q.label || q.title)
+                        || String(q.id || `q_${idx}`);
+                    if (!key || seen.has(key)) return;
+                    seen.add(key);
+                    out.push(q);
+                });
+                return out;
+            };
+
+            const surveyMatchIndexFor = (questions) => {
                 const qidSet = new Set();
                 const libToQid = new Map();
-                asSurveyList(def?.questions).forEach((q, idx) => {
+                const labelToQid = new Map();
+                asSurveyList(questions).forEach((q, idx) => {
                     const qid = String(q?.id || `q_${idx}`);
+                    if (!qid) return;
                     qidSet.add(qid);
                     const lib = String(q?.libraryQuestionId || '').trim();
                     if (lib) libToQid.set(lib, qid);
+                    const lab = normalizeSurveyDeltaLabel(q?.label || q?.title);
+                    if (lab && !labelToQid.has(lab)) labelToQid.set(lab, qid);
+                    const base = lab.includes(' | ') ? lab.split(' | ')[0].trim() : lab;
+                    if (base && !labelToQid.has(base)) labelToQid.set(base, qid);
                 });
-                return { qidSet, libToQid, total: qidSet.size };
+                return { qidSet, libToQid, labelToQid, total: qidSet.size };
             };
 
-            const cosmosPriorLikelihoodForSite = (site, surveyId) => {
-                const index = surveyMatchIndexFor(surveyId);
-                if (!site?.id || !index.total) return null;
-                const ids = siteIdsForSurveyLookup(site.id);
+            const countMatchedAnswers = (siteId, index) => {
+                if (!siteId || !index?.total) return 0;
+                const ids = siteIdsForSurveyLookup(siteId);
                 const answered = new Set();
                 (allSiteSurveyResponses || []).forEach((r) => {
                     if (!r || r._archived || !ids.has(r.siteId)) return;
                     asSurveyList(r.answers).forEach((a) => {
                         if (!readSurveyAnswerValue(a)) return;
-                        const lib = String(a?.libraryQuestionId || '').trim();
+                        const bridgedLib = resolveAnswerLibraryId(a);
+                        const lib = bridgedLib || String(a?.libraryQuestionId || '').trim();
                         const qid = String(a?.questionId || a?.id || '').trim();
                         if (lib && index.libToQid.has(lib)) {
                             answered.add(index.libToQid.get(lib));
@@ -6978,22 +7061,94 @@
                         }
                         if (qid && index.qidSet.has(qid)) {
                             answered.add(qid);
+                            return;
+                        }
+                        const lab = normalizeSurveyDeltaLabel(a?.label || a?.title);
+                        if (lab && index.labelToQid.has(lab)) {
+                            answered.add(index.labelToQid.get(lab));
+                            return;
+                        }
+                        const base = lab.includes(' | ') ? lab.split(' | ')[0].trim() : '';
+                        if (base && index.labelToQid.has(base)) {
+                            answered.add(index.labelToQid.get(base));
                         }
                     });
                 });
-                if (!answered.size) return null;
-                const pct = Math.round((1000 * answered.size) / index.total) / 10;
-                return {
-                    likelihoodPct: pct,
-                    mappedLikelihoodPct: pct,
-                    filled: answered.size,
-                    total: index.total,
+                return answered.size;
+            };
+
+            /** Prefer real prior feasibility completion; also track prefill for this send packet. */
+            const priorLikelihoodCache = new Map();
+            const cosmosPriorLikelihoodForSite = (site, surveyId) => {
+                if (!site?.id || !surveyId) return null;
+                const cacheKey = `${surveyId}::${site.id}`;
+                if (priorLikelihoodCache.has(cacheKey)) return priorLikelihoodCache.get(cacheKey);
+
+                const sendQs = questionsForSendCoverage(surveyId);
+                const sendIndex = surveyMatchIndexFor(sendQs);
+                const sendFilled = countMatchedAnswers(site.id, sendIndex);
+                const sendPct = sendIndex.total
+                    ? Math.round((1000 * sendFilled) / sendIndex.total) / 10
+                    : 0;
+
+                // Best completion among surveys this site actually answered (qid/label overlap).
+                const ids = siteIdsForSurveyLookup(site.id);
+                const answeredSurveyIds = new Set();
+                (allSiteSurveyResponses || []).forEach((r) => {
+                    if (!r || r._archived || !ids.has(r.siteId) || !r.surveyId) return;
+                    if (asSurveyList(r.answers).some((a) => readSurveyAnswerValue(a))) {
+                        answeredSurveyIds.add(String(r.surveyId));
+                    }
+                });
+                // Always consider GF as a coverage target when history exists
+                if (answeredSurveyIds.size) answeredSurveyIds.add('survey-general-feasibility');
+
+                let best = null;
+                answeredSurveyIds.forEach((sid) => {
+                    const def = (allDefs || []).find((d) => d && d.id === sid);
+                    const qs = asSurveyList(def?.questions);
+                    if (!qs.length) return;
+                    const index = surveyMatchIndexFor(qs);
+                    const filled = countMatchedAnswers(site.id, index);
+                    if (!filled || !index.total) return;
+                    const pct = Math.round((1000 * filled) / index.total) / 10;
+                    if (!best || pct > best.pct) {
+                        best = {
+                            pct,
+                            filled,
+                            total: index.total,
+                            surveyId: sid,
+                            title: def?.title || sid,
+                        };
+                    }
+                });
+
+                const historyPct = best ? best.pct : 0;
+                const displayPct = Math.max(sendPct, historyPct);
+                if (!displayPct) {
+                    priorLikelihoodCache.set(cacheKey, null);
+                    return null;
+                }
+                const row = {
+                    likelihoodPct: displayPct,
+                    mappedLikelihoodPct: displayPct,
+                    filled: best && historyPct >= sendPct ? best.filled : sendFilled,
+                    total: best && historyPct >= sendPct ? best.total : sendIndex.total,
+                    sendPct,
+                    sendFilled,
+                    sendTotal: sendIndex.total,
+                    historyPct,
+                    historyTitle: best?.title || '',
+                    historyFilled: best?.filled || 0,
+                    historyTotal: best?.total || 0,
                 };
+                priorLikelihoodCache.set(cacheKey, row);
+                return row;
             };
 
             const likelihoodBadge = (row) => {
                 if (!row) {
-                    return `<span class="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 dark:bg-gray-700 dark:text-gray-300">0%</span>`;
+                    return `<span class="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 dark:bg-gray-700 dark:text-gray-300" title="No prior feasibility answers on file">0%</span>`;
                 }
                 const pct = Number(row.mappedLikelihoodPct ?? row.likelihoodPct) || 0;
                 const cls = pct >= 40
@@ -7001,7 +7156,15 @@
                     : pct >= 15
                         ? 'bg-amber-100 text-amber-900 dark:bg-amber-900/40 dark:text-amber-100'
                         : 'bg-slate-100 text-slate-700 dark:bg-slate-700 dark:text-slate-200';
-                return `<span class="text-[10px] font-semibold px-1.5 py-0.5 rounded ${cls}" title="${escapeHtml(String(row.filled || 0))}/${escapeHtml(String(row.total || 0))} survey fields already answered">${pct}%</span>`;
+                const tipParts = [];
+                if (row.historyPct) {
+                    tipParts.push(`Prior feasibility ${row.historyPct}% (${row.historyFilled}/${row.historyTotal}${row.historyTitle ? ` · ${row.historyTitle}` : ''})`);
+                }
+                if (row.sendTotal) {
+                    tipParts.push(`Prefill on this send ${row.sendPct || 0}% (${row.sendFilled || 0}/${row.sendTotal})`);
+                }
+                const tip = tipParts.join(' · ') || `${row.filled || 0}/${row.total || 0} answered`;
+                return `<span class="text-[10px] font-semibold px-1.5 py-0.5 rounded ${cls}" title="${escapeHtml(tip)}">${pct}%</span>`;
             };
 
             const checkedSiteIds = new Set(prefillSiteId ? [prefillSiteId] : []);
@@ -7118,6 +7281,7 @@
                                     <div>
                                         <div class="flex items-center justify-between gap-2 mb-2">
                                             <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Sites</label>
+                                            <p class="text-[11px] text-gray-500 dark:text-gray-400 mt-0.5">% = best prior feasibility completion on file (hover for send-prefill detail). Sorted highest first.</p>
                                             <div class="flex gap-2 text-xs">
                                                 <button type="button" id="survey-send-select-all" class="text-indigo-600 dark:text-indigo-400 hover:underline">Select all</button>
                                                 <button type="button" id="survey-send-select-none" class="text-indigo-600 dark:text-indigo-400 hover:underline">Clear</button>
@@ -12656,7 +12820,7 @@
                 try {
                     const editId = form.getAttribute('data-edit-id') || '';
                     const label = form.label.value.trim();
-                    const help = (form.help?.value || '').trim();
+                    const help = meaningfulQuestionHelp(form.help?.value || '');
                     const type = normalizeSurveyQuestionType(form.type.value || 'text');
                     const category = (form.category.value || 'General').trim() || 'General';
                     const required = form.required?.checked !== false;
