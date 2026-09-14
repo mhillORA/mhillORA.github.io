@@ -1262,7 +1262,7 @@
             ? 'This is a staff preview of the live survey form. Navigate sections and try answers — nothing is written to Cosmos.'
             : hasPrior
               ? 'This survey is split into sections. Fields are <strong>prefilled from prior answers</strong> when on file — confirm those, update anything that changed, and complete blanks as you go.'
-              : 'This survey is split into sections. Complete each page, then continue. All visible questions are required. Save a draft anytime — you can return with this same secure link before it expires.'}</p>
+              : 'This survey is split into sections. Complete each page, then continue. All visible questions are required. Progress saves automatically when you change sections — you can return with this same secure link before it expires.'}</p>
         </div>
       `;
 
@@ -1640,23 +1640,69 @@
         }
         if (pi >= pages.length - 1) {
           showPage(pi);
+          // Persist before review/submit so nothing is lost if they bounce
+          saveDraftOnPageChange('review');
           submitSection?.scrollIntoView({ behavior: 'smooth', block: 'center' });
           return;
         }
         dirty = true;
         showPage(pi + 1);
+        saveDraftOnPageChange('next');
       };
 
       let dirty = false;
+      let draftSaving = false;
+      let draftQueued = false;
+
+      const saveDraftOnPageChange = async (reason = 'page') => {
+        if (previewMode || !token) return;
+        if (draftSaving) {
+          draftQueued = true;
+          return;
+        }
+        draftSaving = true;
+        if (saveHint) saveHint.textContent = 'Saving…';
+        try {
+          const result = await api('/public/site-survey', {
+            method: 'POST',
+            body: JSON.stringify({
+              t: token,
+              action: 'draft',
+              answers: collectAnswers(form, questions),
+              pageIndex,
+              saveReason: reason,
+            }),
+          });
+          dirty = false;
+          const when = result.draftSavedAt ? new Date(result.draftSavedAt).toLocaleTimeString() : 'just now';
+          if (saveHint) saveHint.textContent = `Draft saved ${when}`;
+          setChip('Draft saved', 'ok');
+        } catch (err) {
+          dirty = true;
+          if (saveHint) saveHint.textContent = 'Draft save failed — tap Save draft';
+          console.warn('page-change draft save failed', err?.message || err);
+        } finally {
+          draftSaving = false;
+          if (draftQueued) {
+            draftQueued = false;
+            saveDraftOnPageChange('queued');
+          }
+        }
+      };
+
       pageBack?.addEventListener('click', () => {
         formError.innerHTML = '';
+        dirty = true;
         showPage(pageIndex - 1);
+        saveDraftOnPageChange('back');
       });
       pageNext?.addEventListener('click', () => goNextFrom(pageIndex));
       form.querySelectorAll('.page-back-btn').forEach((btn) => {
         btn.addEventListener('click', () => {
           formError.innerHTML = '';
+          dirty = true;
           showPage(Number(btn.getAttribute('data-from')) - 1);
+          saveDraftOnPageChange('back');
         });
       });
       form.querySelectorAll('.page-next-btn').forEach((btn) => {
@@ -1679,7 +1725,9 @@
             }
           }
           formError.innerHTML = '';
+          dirty = true;
           showPage(target);
+          saveDraftOnPageChange('jump');
         });
       });
 
@@ -1736,11 +1784,13 @@
             }),
           });
           if (action === 'draft' || action === 'save') {
+            dirty = false;
             const when = result.draftSavedAt ? new Date(result.draftSavedAt).toLocaleTimeString() : 'just now';
             saveHint.textContent = `Draft saved ${when}`;
             setChip('Draft saved', 'ok');
             return;
           }
+          dirty = false;
           renderDone(result);
         } catch (err) {
           const msg = err.status === 410
@@ -1766,11 +1816,23 @@
       });
 
       form.addEventListener('input', () => { dirty = true; });
+      form.addEventListener('change', () => { dirty = true; });
       setInterval(() => {
         if (previewMode || !dirty || !document.getElementById('survey-form')) return;
-        dirty = false;
-        post('draft');
-      }, 45000);
+        saveDraftOnPageChange('autosave');
+      }, 30000);
+      window.addEventListener('beforeunload', (e) => {
+        if (!dirty || previewMode) return;
+        // Best-effort: browser may ignore async; keep the warn as backup
+        e.preventDefault();
+        e.returnValue = '';
+        try { saveDraftOnPageChange('unload'); } catch (_) { /* ignore */ }
+      });
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden' && dirty && !previewMode) {
+          saveDraftOnPageChange('hidden');
+        }
+      });
       showPage(0, { scroll: false });
       updateProgress(form);
     }

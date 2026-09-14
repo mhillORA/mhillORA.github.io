@@ -7,6 +7,9 @@ Writes (no local-file dependency for runtime):
   3) site-profiles.mikePack                            (canonical answers on profile)
 
 Matches pack sites -> live sites (preferred) or legacy-sites (then linkedArtemisSiteId).
+Hand aliases cover known PI/practice renames; remaining unmatched rows get inert live
+stubs on --apply so all 39 pack sites land in Cosmos.
+
 Does NOT overwrite Chaos scheduling fields on live sites.
 Does NOT delete existing survey responses; upserts dedicated Mike response docs.
 
@@ -19,6 +22,8 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import secrets
+import time
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -32,6 +37,31 @@ SURVEY_ID = "survey-rebuild-mytx272am-201"
 SOURCE = "mike-rebuild-39-pack"
 FIELD_MAP_DOC_ID = "mike-mighty-field-map"
 REPORT = REPO / ".firecrawl" / "mike-pack-cosmos-ingest-report.json"
+
+# Confirmed live-site links (Mike pack id → Artemis sites.id). Do not map
+# Gary Lane → Richard Lane (RCOT) or Jeremiah Brown → Michael Singer.
+HAND_ALIASES: dict[str, dict] = {
+    "REBUILD-004": {
+        "siteId": "mpybtwssq8bk2t93cb",
+        "note": "Charles Wykoff / Retina Consultants of Texas (same org as Brown; separate Mike response)",
+    },
+    "REBUILD-010": {
+        "siteId": "1a0908afddb8383bb62",
+        "note": "Western Carolina Retinal Associates, division of Asheville Eye / William Bridges",
+    },
+    "REBUILD-011": {
+        "siteId": "1a0908a4d5117212421",
+        "note": "Carl Danzig - Deerfield Beach",
+    },
+    "REBUILD-015": {
+        "siteId": "1a0908a38d914190d24",
+        "note": "John Thordsen Site",
+    },
+    "REBUILD-039": {
+        "siteId": "mpybmg4prfu37clg7ls",
+        "note": "Duke (institution; pack PI Eleonora Lad)",
+    },
+}
 
 
 def iso_now() -> str:
@@ -80,6 +110,47 @@ def is_filled(val) -> bool:
 def slug(s: str) -> str:
     t = re.sub(r"[^a-z0-9]+", "-", str(s or "").lower()).strip("-")
     return t[:48] or "site"
+
+
+def generate_id() -> str:
+    return f"{int(time.time() * 1000):x}{secrets.token_hex(4)}"
+
+
+def parse_location(loc: str) -> tuple[str, str]:
+    text = str(loc or "").strip()
+    if "," in text:
+        city, state = text.rsplit(",", 1)
+        return city.strip(), state.strip()
+    return text, ""
+
+
+def build_live_stub(pack_site: dict) -> dict:
+    now = iso_now()
+    city, state = parse_location(pack_site.get("location") or "")
+    practice = str(pack_site.get("practice_name") or "").strip() or "Mike pack site"
+    pi = str(pack_site.get("pi_name") or "").strip()
+    return {
+        "id": generate_id(),
+        "name": practice,
+        "status": "Active",
+        "address": "",
+        "address1": "",
+        "address2": "",
+        "city": city,
+        "state": state,
+        "zip": "",
+        "zipCode": "",
+        "pi": pi,
+        "piName": pi,
+        "piEmail": "",
+        "siteCoordinator": "",
+        "siteCoordinatorEmail": "",
+        "notes": f"Created from Mike ReBUILD pack {pack_site.get('site_id')}",
+        "source": SOURCE,
+        "mikeRebuildPriorityId": pack_site.get("site_id"),
+        "createdAt": now,
+        "updatedAt": now,
+    }
 
 
 def match_site(practice: str, pi: str, live_sites: list, legacy_sites: list):
@@ -277,19 +348,31 @@ def main():
     survey_qs = survey.get("questions") or []
 
     now = iso_now()
+    live_by_id = {s.get("id"): s for s in live_sites if s.get("id")}
     rows = []
     for pack_site in pack.get("sites") or []:
-        site_id, how, score, match_name = match_site(
-            pack_site.get("practice_name") or "",
-            pack_site.get("pi_name") or "",
-            live_sites,
-            legacy_sites,
-        )
+        priority_id = pack_site.get("site_id") or ""
+        alias = HAND_ALIASES.get(priority_id)
+        if alias and alias.get("siteId") in live_by_id:
+            site = live_by_id[alias["siteId"]]
+            site_id, how, score, match_name = (
+                site["id"],
+                "hand-alias",
+                1.0,
+                site.get("name"),
+            )
+        else:
+            site_id, how, score, match_name = match_site(
+                pack_site.get("practice_name") or "",
+                pack_site.get("pi_name") or "",
+                live_sites,
+                legacy_sites,
+            )
         answers = build_answers(pack_site, field_map, survey_qs)
         with_lib = sum(1 for a in answers if a.get("libraryQuestionId"))
         rows.append(
             {
-                "priorityId": pack_site.get("site_id"),
+                "priorityId": priority_id,
                 "practiceName": pack_site.get("practice_name"),
                 "piName": pack_site.get("pi_name"),
                 "matchedSiteId": site_id,
@@ -299,6 +382,7 @@ def main():
                 "answerCount": len(answers),
                 "answersWithLibraryId": with_lib,
                 "unmatched": site_id is None,
+                "willCreateStub": site_id is None,
             }
         )
 
@@ -309,14 +393,15 @@ def main():
         f"Field map: {field_map.get('mappedPackPaths')}/{field_map.get('packPathCount')} "
         f"({field_map.get('mappedPct')}%)"
     )
-    for r in matched[:12]:
-        print(
-            f"  {r['matchScore']:.2f} {r['matchHow']:22s}  "
-            f"{r['practiceName'][:36]:36s} -> {r['matchedSiteName'][:36]}  "
-            f"({r['answerCount']} ans, {r['answersWithLibraryId']} lib)"
-        )
+    for r in matched:
+        if r["matchHow"] == "hand-alias" or r["matchScore"] >= 0.9:
+            print(
+                f"  {r['matchScore']:.2f} {r['matchHow']:22s}  "
+                f"{(r['practiceName'] or '')[:36]:36s} -> {(r['matchedSiteName'] or '')[:36]}  "
+                f"({r['answerCount']} ans, {r['answersWithLibraryId']} lib)"
+            )
     if unmatched:
-        print("Unmatched:")
+        print(f"Unmatched (will create live stubs on --apply): {len(unmatched)}")
         for r in unmatched:
             print(f"  {r['priorityId']}  {r['practiceName']} ({r['piName']})")
 
@@ -326,6 +411,7 @@ def main():
         "surveyId": SURVEY_ID,
         "matched": len(matched),
         "unmatched": len(unmatched),
+        "handAliases": list(HAND_ALIASES.keys()),
         "rows": rows,
     }
     REPORT.parent.mkdir(exist_ok=True)
@@ -352,14 +438,45 @@ def main():
     defs_c.upsert_item(map_doc)
     print(f"Upserted field map doc {FIELD_MAP_DOC_ID}")
 
+    # 2) Create live stubs for still-unmatched pack sites
+    created_stubs = []
+    pack_by_id = {s.get("site_id"): s for s in (pack.get("sites") or [])}
+    for row in rows:
+        if row["matchedSiteId"]:
+            continue
+        pack_site = pack_by_id.get(row["priorityId"])
+        if not pack_site:
+            continue
+        stub = build_live_stub(pack_site)
+        sites_c.create_item(stub)
+        live_sites.append(stub)
+        live_by_id[stub["id"]] = stub
+        row["matchedSiteId"] = stub["id"]
+        row["matchedSiteName"] = stub.get("name")
+        row["matchHow"] = "created-stub"
+        row["matchScore"] = 1.0
+        row["unmatched"] = False
+        row["willCreateStub"] = False
+        created_stubs.append(
+            {
+                "priorityId": row["priorityId"],
+                "siteId": stub["id"],
+                "name": stub.get("name"),
+                "pi": stub.get("pi"),
+            }
+        )
+        print(f"Created stub {stub['id']} for {row['priorityId']} {stub.get('name')}")
+
     written = 0
     for pack_site, row in zip(pack.get("sites") or [], rows):
         site_id = row["matchedSiteId"]
         if not site_id:
             continue
         answers = build_answers(pack_site, field_map, survey_qs)
-        asg_id = f"asg-mike-rebuild-{slug(site_id)}"
-        rsp_id = f"rsp-mike-rebuild-{slug(site_id)}"
+        # Key by Mike priority id so two pack PIs at one Artemis site never overwrite each other
+        priority_slug = slug(pack_site.get("site_id") or row["priorityId"] or site_id)
+        asg_id = f"asg-mike-rebuild-{priority_slug}"
+        rsp_id = f"rsp-mike-rebuild-{priority_slug}"
         assignment = {
             "id": asg_id,
             "surveyId": SURVEY_ID,
@@ -392,7 +509,7 @@ def main():
         asg_c.upsert_item(assignment)
         rsp_c.upsert_item(response)
 
-        # site-profiles: keyed by site id (live or legacy)
+        # site-profiles: one profile per Artemis site; merge Mike packs by priority id
         profile_id = site_id
         try:
             profile = profiles_c.read_item(profile_id, profile_id)
@@ -404,7 +521,12 @@ def main():
                 "createdAt": now,
                 "source": SOURCE,
             }
-        profile["mikePack"] = build_profile_mike_pack(pack_site, field_map, answers)
+        mike_pack = build_profile_mike_pack(pack_site, field_map, answers)
+        packs = dict(profile.get("mikePacks") or {})
+        packs[str(pack_site.get("site_id") or priority_slug)] = mike_pack
+        profile["mikePacks"] = packs
+        # Keep latest as mikePack for back-compat
+        profile["mikePack"] = mike_pack
         profile["updatedAt"] = now
         if pack_site.get("practice_name") and not profile.get("institution_name"):
             profile["institution_name"] = pack_site.get("practice_name")
@@ -416,7 +538,21 @@ def main():
         profiles_c.upsert_item(profile)
         written += 1
 
-    print(f"Applied: {written} site responses + profiles. Field map in Cosmos.")
+    report.update(
+        {
+            "status": "applied",
+            "createdStubs": created_stubs,
+            "written": written,
+            "matchedAfter": sum(1 for r in rows if r.get("matchedSiteId")),
+            "unmatchedAfter": sum(1 for r in rows if not r.get("matchedSiteId")),
+            "rows": rows,
+        }
+    )
+    REPORT.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(
+        f"Applied: {written} site responses + profiles; "
+        f"created {len(created_stubs)} stubs. Field map in Cosmos."
+    )
     print("No Chaos scheduling fields were modified.")
 
 

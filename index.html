@@ -4970,9 +4970,13 @@
             const roleSel = document.getElementById('feasibility-role-select');
             if (surveySel) {
                 const preferred = feasibilityReportSurveyId
+                    || (asSurveyList(allSiteSurveyDefinitions).some(d => d.id === 'survey-rebuild-mytx272am-201')
+                        ? 'survey-rebuild-mytx272am-201'
+                        : null)
                     || (asSurveyList(allSiteSurveyDefinitions).some(d => d.id === 'survey-general-feasibility')
                         ? 'survey-general-feasibility'
-                        : (allSiteSurveyDefinitions?.[0]?.id || ''));
+                        : null)
+                    || (allSiteSurveyDefinitions?.[0]?.id || '');
                 if (preferred && [...surveySel.options].some(o => o.value === preferred)) {
                     surveySel.value = preferred;
                 }
@@ -7168,23 +7172,38 @@
             };
 
             const checkedSiteIds = new Set(prefillSiteId ? [prefillSiteId] : []);
+            let sendSiteSort = 'coverage-desc'; // coverage-desc | coverage-asc | alpha-asc | alpha-desc
+            let sendSiteFilter = '';
 
-            const buildSiteRowsHtml = (surveyId) => {
-                const sitesRanked = sites.slice().sort((a, b) => {
-                    const la = cosmosPriorLikelihoodForSite(a, surveyId);
-                    const lb = cosmosPriorLikelihoodForSite(b, surveyId);
-                    const pa = Number(la?.mappedLikelihoodPct ?? la?.likelihoodPct) || 0;
-                    const pb = Number(lb?.mappedLikelihoodPct ?? lb?.likelihoodPct) || 0;
-                    return pb - pa || String(a.name || '').localeCompare(String(b.name || ''));
-                });
-                return sitesRanked.map((s) => {
+            const buildSiteRowsHtml = (surveyId, { sort = sendSiteSort, filter = sendSiteFilter } = {}) => {
+                const q = String(filter || '').trim().toLowerCase();
+                let sitesRanked = sites.slice();
+                const byName = (a, b) => String(a.name || '').localeCompare(String(b.name || ''), undefined, { sensitivity: 'base' });
+                const coverageOf = (s) => {
+                    const row = cosmosPriorLikelihoodForSite(s, surveyId);
+                    return Number(row?.mappedLikelihoodPct ?? row?.likelihoodPct) || 0;
+                };
+                if (sort === 'alpha-asc') {
+                    sitesRanked.sort(byName);
+                } else if (sort === 'alpha-desc') {
+                    sitesRanked.sort((a, b) => byName(b, a));
+                } else if (sort === 'coverage-asc') {
+                    sitesRanked.sort((a, b) => coverageOf(a) - coverageOf(b) || byName(a, b));
+                } else {
+                    // coverage-desc (default)
+                    sitesRanked.sort((a, b) => coverageOf(b) - coverageOf(a) || byName(a, b));
+                }
+                const rows = sitesRanked.map((s) => {
                     const checked = checkedSiteIds.has(s.id) ? 'checked' : '';
                     const pi = emailFor(s, 'pi');
                     const coord = emailFor(s, 'coordinator');
                     const tag = s._catalog === 'legacy' ? 'Master' : s._catalog === 'linked' ? 'Linked' : 'Live';
                     const prior = cosmosPriorLikelihoodForSite(s, surveyId);
+                    const searchBlob = `${s.name || ''} ${tag} ${coord || ''} ${pi || ''} ${s.id || ''}`.toLowerCase();
+                    const hidden = q && !searchBlob.includes(q);
+                    if (hidden) return '';
                     return `
-                    <label class="flex items-start gap-3 p-2 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700/50 border border-transparent hover:border-gray-200 dark:hover:border-gray-600" data-prior-pct="${prior ? (prior.mappedLikelihoodPct ?? prior.likelihoodPct) : ''}">
+                    <label class="send-site-row flex items-start gap-3 p-2 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700/50 border border-transparent hover:border-gray-200 dark:hover:border-gray-600" data-prior-pct="${prior ? (prior.mappedLikelihoodPct ?? prior.likelihoodPct) : ''}" data-search="${escapeHtml(searchBlob)}">
                         <input type="checkbox" name="siteIds" value="${escapeHtml(s.id)}" class="mt-1" ${checked} ${noSites ? 'disabled' : ''} />
                         <span class="min-w-0 flex-1">
                             <span class="flex items-center gap-2 flex-wrap">
@@ -7195,7 +7214,12 @@
                             <span class="block text-xs text-gray-500 dark:text-gray-400 truncate">Primary: ${escapeHtml(coord || 'no email')} · PI: ${escapeHtml(pi || 'no email')}</span>
                         </span>
                     </label>`;
-                }).join('');
+                }).filter(Boolean);
+                const visibleCount = rows.length;
+                if (!visibleCount) {
+                    return `<div class="text-sm text-gray-500 p-2">${sites.length ? 'No sites match your search.' : 'No sites'}</div>`;
+                }
+                return `${rows.join('')}<div class="text-[10px] text-gray-400 px-2 pt-1">${visibleCount} shown · ${sites.length} total</div>`;
             };
 
             const siteRows = buildSiteRowsHtml(preferredSurveyId);
@@ -7279,15 +7303,23 @@
                                         </div>
                                     </div>
                                     <div>
-                                        <div class="flex items-center justify-between gap-2 mb-2">
+                                        <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
                                             <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Sites</label>
-                                            <p class="text-[11px] text-gray-500 dark:text-gray-400 mt-0.5">% = best prior feasibility completion on file (hover for send-prefill detail). Sorted highest first.</p>
                                             <div class="flex gap-2 text-xs">
-                                                <button type="button" id="survey-send-select-all" class="text-indigo-600 dark:text-indigo-400 hover:underline">Select all</button>
+                                                <button type="button" id="survey-send-select-all" class="text-indigo-600 dark:text-indigo-400 hover:underline">Select all visible</button>
                                                 <button type="button" id="survey-send-select-none" class="text-indigo-600 dark:text-indigo-400 hover:underline">Clear</button>
                                             </div>
                                         </div>
-                                        <p class="text-[11px] text-gray-500 dark:text-gray-400 mb-2">Sorted by % of this survey’s fields already answered.</p>
+                                        <p class="text-[11px] text-gray-500 dark:text-gray-400 mb-2">% = prior feasibility on file (hover for detail). Search and sort below.</p>
+                                        <div class="flex flex-wrap gap-2 mb-2">
+                                            <input id="send-survey-site-search" type="search" placeholder="Search sites, email, PI…" class="flex-1 min-w-[12rem] rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-1.5 text-sm" />
+                                            <select id="send-survey-site-sort" class="rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-2 py-1.5 text-sm" title="Re-sort the site list">
+                                                <option value="coverage-desc" selected>Coverage % · high → low</option>
+                                                <option value="coverage-asc">Coverage % · low → high</option>
+                                                <option value="alpha-asc">Name · A–Z</option>
+                                                <option value="alpha-desc">Name · Z–A</option>
+                                            </select>
+                                        </div>
                                         <div id="send-survey-site-list" class="max-h-72 overflow-y-auto rounded-md border border-gray-200 dark:border-gray-600 p-2 space-y-1 bg-white dark:bg-gray-900/30">
                                             ${siteRows || '<div class="text-sm text-gray-500 p-2">No sites</div>'}
                                         </div>
@@ -7430,6 +7462,18 @@
                 e.target.dataset.touched = '1';
             });
 
+            const refreshSendSiteList = () => {
+                const list = document.getElementById('send-survey-site-list');
+                if (!list) return;
+                checkedSiteIds.clear();
+                form?.querySelectorAll('input[name="siteIds"]:checked').forEach((cb) => {
+                    checkedSiteIds.add(cb.value);
+                });
+                const sid = form?.querySelector('[name="surveyId"]')?.value || '';
+                list.innerHTML = buildSiteRowsHtml(sid, { sort: sendSiteSort, filter: sendSiteFilter })
+                    || '<div class="text-sm text-gray-500 p-2">No sites</div>';
+            };
+
             const refreshSendScoringNote = () => {
                 const note = document.getElementById('send-survey-scoring-note');
                 const gfNote = document.getElementById('send-gf-auto-note');
@@ -7437,15 +7481,7 @@
                 const isGf = sid === 'survey-general-feasibility' || sid === 'survey-general-feasibility-short';
                 if (gfNote) gfNote.classList.toggle('hidden', !sid || isGf);
                 refreshSendSubjectHint();
-                // Preserve checked sites, then re-rank badges for the selected survey
-                const list = document.getElementById('send-survey-site-list');
-                if (list) {
-                    checkedSiteIds.clear();
-                    form?.querySelectorAll('input[name="siteIds"]:checked').forEach((cb) => {
-                        checkedSiteIds.add(cb.value);
-                    });
-                    list.innerHTML = buildSiteRowsHtml(sid) || '<div class="text-sm text-gray-500 p-2">No sites</div>';
-                }
+                refreshSendSiteList();
                 if (!note) return;
                 if (!sid) {
                     note.innerHTML = '';
@@ -7463,6 +7499,17 @@
             form?.querySelector('[name="surveyId"]')?.addEventListener('change', refreshSendScoringNote);
             form?.querySelector('[name="role_pi"]')?.addEventListener('change', refreshSendSubjectHint);
             form?.querySelector('[name="role_coordinator"]')?.addEventListener('change', refreshSendSubjectHint);
+            document.getElementById('send-survey-site-search')?.addEventListener('input', (e) => {
+                sendSiteFilter = e.target.value || '';
+                refreshSendSiteList();
+            });
+            document.getElementById('send-survey-site-sort')?.addEventListener('change', (e) => {
+                const v = String(e.target.value || '');
+                sendSiteSort = ['coverage-desc', 'coverage-asc', 'alpha-asc', 'alpha-desc'].includes(v)
+                    ? v
+                    : 'coverage-desc';
+                refreshSendSiteList();
+            });
             const attInput = document.getElementById('send-survey-attachments');
             const attList = document.getElementById('send-survey-attachment-list');
             attInput?.addEventListener('change', () => {
@@ -7812,19 +7859,29 @@
 
 
 
+            const preferredReportSurveyId = feasibilityReportSurveyId
+                || ((allSiteSurveyDefinitions || []).some(d => d && d.id === 'survey-rebuild-mytx272am-201')
+                    ? 'survey-rebuild-mytx272am-201'
+                    : null)
+                || ((allSiteSurveyDefinitions || []).some(d => d && d.id === 'survey-general-feasibility')
+                    ? 'survey-general-feasibility'
+                    : null)
+                || (allSiteSurveyDefinitions || [])[0]?.id
+                || '';
+
             const surveyOptions = (allSiteSurveyDefinitions || []).slice()
 
                 .sort((a, b) => String(a.title || '').localeCompare(String(b.title || '')))
 
                 .map(d => {
 
-                    const selected = (d.id === 'survey-general-feasibility') ? ' selected' : '';
+                    const selected = (d.id === preferredReportSurveyId) ? ' selected' : '';
 
                     const label = d.title ? escapeHtml(d.title) : escapeHtml(d.id);
 
                     return `<option value="${escapeHtml(d.id)}"${selected}>${label}</option>`;
 
-                }).join('') || '<option value="">No surveys</option>';
+                }).join('') || '<option value="">No surveys loaded yet</option>';
 
 
 
@@ -13927,7 +13984,9 @@
                         if (activeTab === 'sites') {
                             renderAllSites();
                         } else if (activeTab === 'reporting') {
-                            refreshFeasibilityReportRoot();
+                            // Must remount: survey <select> + Site surveys counts are baked into
+                            // getReportingHTML() on first paint (before deferred defs/responses load).
+                            render();
                         } else if (activeTab === 'feasibility' || activeTab === 'staff' || activeTab === 'scheduling') {
                             render();
                         } else if (activeTab === 'dashboard') {
