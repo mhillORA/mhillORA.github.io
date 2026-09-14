@@ -37,8 +37,9 @@ except ImportError:
     sys.exit(1)
 
 DEFAULT_JSON = Path(
-    r"C:\Users\shue1\Downloads\drive-download-20260825T174506Z-1-001\Ora_Feasibility_Data_All_Sites_2.json"
+    r"c:\Users\shue1\Downloads\Ora_Feasibility_Data_All_Sites+12Sep26 Update2.json"
 )
+DEFAULT_XLSX = Path(r"c:\Users\shue1\Downloads\Master Feasibility File_21Aug26.xlsx")
 CROSSWALK_PATH = Path(__file__).resolve().parent / "feasibility_monday_profile_crosswalk.json"
 ALIASES_PATH = Path(__file__).resolve().parent / "general_feasibility_site_aliases.json"
 SCHEMA_PATH = Path(
