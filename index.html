@@ -6928,7 +6928,8 @@
             const noSites = sites.length === 0;
             const prefillSiteId = prefill.siteId || '';
             const preferredSurveyId = prefill.surveyId
-                || (predefined.find(d => d.id === 'survey-general-feasibility') || {}).id
+                || (allDefs.find((d) => d && d.id === 'survey-rebuild-mytx272am-201') || {}).id
+                || (predefined.find((d) => d.id === 'survey-general-feasibility') || {}).id
                 || (predefined[0] || {}).id
                 || (custom[0] || {}).id
                 || '';
@@ -6946,36 +6947,47 @@
                 return site.siteCoordinatorEmail || '';
             };
 
-            const surveyLibIds = (() => {
-                const sid = preferredSurveyId || '';
-                const def = (allDefs || []).find((d) => d && d.id === sid);
-                const libs = new Set();
-                asSurveyList(def?.questions).forEach((q) => {
-                    if (q?.libraryQuestionId) libs.add(String(q.libraryQuestionId));
+            /** Match keys for the selected survey: libraryQuestionId and/or question id. */
+            const surveyMatchIndexFor = (surveyId) => {
+                const def = (allDefs || []).find((d) => d && d.id === surveyId);
+                const qidSet = new Set();
+                const libToQid = new Map();
+                asSurveyList(def?.questions).forEach((q, idx) => {
+                    const qid = String(q?.id || `q_${idx}`);
+                    qidSet.add(qid);
+                    const lib = String(q?.libraryQuestionId || '').trim();
+                    if (lib) libToQid.set(lib, qid);
                 });
-                return libs;
-            })();
+                return { qidSet, libToQid, total: qidSet.size };
+            };
 
-            const cosmosPriorLikelihoodForSite = (site) => {
-                if (!site?.id || !surveyLibIds.size) return null;
+            const cosmosPriorLikelihoodForSite = (site, surveyId) => {
+                const index = surveyMatchIndexFor(surveyId);
+                if (!site?.id || !index.total) return null;
                 const ids = siteIdsForSurveyLookup(site.id);
                 const answered = new Set();
                 (allSiteSurveyResponses || []).forEach((r) => {
                     if (!r || r._archived || !ids.has(r.siteId)) return;
                     asSurveyList(r.answers).forEach((a) => {
-                        const lib = String(a?.libraryQuestionId || '');
-                        if (!lib || !surveyLibIds.has(lib)) return;
-                        const val = readSurveyAnswerValue(a);
-                        if (val) answered.add(lib);
+                        if (!readSurveyAnswerValue(a)) return;
+                        const lib = String(a?.libraryQuestionId || '').trim();
+                        const qid = String(a?.questionId || a?.id || '').trim();
+                        if (lib && index.libToQid.has(lib)) {
+                            answered.add(index.libToQid.get(lib));
+                            return;
+                        }
+                        if (qid && index.qidSet.has(qid)) {
+                            answered.add(qid);
+                        }
                     });
                 });
                 if (!answered.size) return null;
-                const pct = Math.round((1000 * answered.size) / surveyLibIds.size) / 10;
+                const pct = Math.round((1000 * answered.size) / index.total) / 10;
                 return {
                     likelihoodPct: pct,
                     mappedLikelihoodPct: pct,
                     filled: answered.size,
-                    total: surveyLibIds.size,
+                    total: index.total,
                 };
             };
 
@@ -6992,21 +7004,23 @@
                 return `<span class="text-[10px] font-semibold px-1.5 py-0.5 rounded ${cls}" title="${escapeHtml(String(row.filled || 0))}/${escapeHtml(String(row.total || 0))} survey fields already answered">${pct}%</span>`;
             };
 
-            const sitesRanked = sites.slice().sort((a, b) => {
-                const la = cosmosPriorLikelihoodForSite(a);
-                const lb = cosmosPriorLikelihoodForSite(b);
-                const pa = Number(la?.mappedLikelihoodPct ?? la?.likelihoodPct) || 0;
-                const pb = Number(lb?.mappedLikelihoodPct ?? lb?.likelihoodPct) || 0;
-                return pb - pa || String(a.name || '').localeCompare(String(b.name || ''));
-            });
+            const checkedSiteIds = new Set(prefillSiteId ? [prefillSiteId] : []);
 
-            const siteRows = sitesRanked.map(s => {
-                const checked = prefillSiteId && s.id === prefillSiteId ? 'checked' : (!prefillSiteId ? '' : '');
-                const pi = emailFor(s, 'pi');
-                const coord = emailFor(s, 'coordinator');
-                const tag = s._catalog === 'legacy' ? 'Master' : s._catalog === 'linked' ? 'Linked' : 'Live';
-                const prior = cosmosPriorLikelihoodForSite(s);
-                return `
+            const buildSiteRowsHtml = (surveyId) => {
+                const sitesRanked = sites.slice().sort((a, b) => {
+                    const la = cosmosPriorLikelihoodForSite(a, surveyId);
+                    const lb = cosmosPriorLikelihoodForSite(b, surveyId);
+                    const pa = Number(la?.mappedLikelihoodPct ?? la?.likelihoodPct) || 0;
+                    const pb = Number(lb?.mappedLikelihoodPct ?? lb?.likelihoodPct) || 0;
+                    return pb - pa || String(a.name || '').localeCompare(String(b.name || ''));
+                });
+                return sitesRanked.map((s) => {
+                    const checked = checkedSiteIds.has(s.id) ? 'checked' : '';
+                    const pi = emailFor(s, 'pi');
+                    const coord = emailFor(s, 'coordinator');
+                    const tag = s._catalog === 'legacy' ? 'Master' : s._catalog === 'linked' ? 'Linked' : 'Live';
+                    const prior = cosmosPriorLikelihoodForSite(s, surveyId);
+                    return `
                     <label class="flex items-start gap-3 p-2 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700/50 border border-transparent hover:border-gray-200 dark:hover:border-gray-600" data-prior-pct="${prior ? (prior.mappedLikelihoodPct ?? prior.likelihoodPct) : ''}">
                         <input type="checkbox" name="siteIds" value="${escapeHtml(s.id)}" class="mt-1" ${checked} ${noSites ? 'disabled' : ''} />
                         <span class="min-w-0 flex-1">
@@ -7018,7 +7032,10 @@
                             <span class="block text-xs text-gray-500 dark:text-gray-400 truncate">Primary: ${escapeHtml(coord || 'no email')} · PI: ${escapeHtml(pi || 'no email')}</span>
                         </span>
                     </label>`;
-            }).join('');
+                }).join('');
+            };
+
+            const siteRows = buildSiteRowsHtml(preferredSurveyId);
 
             const modalHTML = `
                 <div class="modal-backdrop">
@@ -7107,7 +7124,7 @@
                                             </div>
                                         </div>
                                         <p class="text-[11px] text-gray-500 dark:text-gray-400 mb-2">Sorted by % of this survey’s fields already answered.</p>
-                                        <div class="max-h-72 overflow-y-auto rounded-md border border-gray-200 dark:border-gray-600 p-2 space-y-1 bg-white dark:bg-gray-900/30">
+                                        <div id="send-survey-site-list" class="max-h-72 overflow-y-auto rounded-md border border-gray-200 dark:border-gray-600 p-2 space-y-1 bg-white dark:bg-gray-900/30">
                                             ${siteRows || '<div class="text-sm text-gray-500 p-2">No sites</div>'}
                                         </div>
                                     </div>
@@ -7256,6 +7273,15 @@
                 const isGf = sid === 'survey-general-feasibility' || sid === 'survey-general-feasibility-short';
                 if (gfNote) gfNote.classList.toggle('hidden', !sid || isGf);
                 refreshSendSubjectHint();
+                // Preserve checked sites, then re-rank badges for the selected survey
+                const list = document.getElementById('send-survey-site-list');
+                if (list) {
+                    checkedSiteIds.clear();
+                    form?.querySelectorAll('input[name="siteIds"]:checked').forEach((cb) => {
+                        checkedSiteIds.add(cb.value);
+                    });
+                    list.innerHTML = buildSiteRowsHtml(sid) || '<div class="text-sm text-gray-500 p-2">No sites</div>';
+                }
                 if (!note) return;
                 if (!sid) {
                     note.innerHTML = '';
