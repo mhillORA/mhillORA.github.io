@@ -1,52 +1,55 @@
 """
-Ingest ReBUILD / MYTX272AM-201 Feasibility Questionnaire into the question library.
+Sync Mighty / ReBUILD Feasibility Questionnaire (AF standardized DOCX) → Artemis.
 
-- Match to existing library items when the same concept already exists (explicit aliases
-  + high-confidence fuzzy label match).
-- Create new library questions only when no match.
-- Upsert survey definition `survey-rebuild-mytx272am-201` using those library ids.
+- Parse numbered questions from the AF DOCX
+- Expand Study #1/#2/#3 enrollment repeats into distinct questions
+- Lift inline "If other / Manufacturer/Model" option text into follow-up fields
+- Match existing library items when possible; create only when needed
+- Upsert survey definition `survey-rebuild-mytx272am-201`
 
 Usage:
   python ingest/sync_rebuild_from_docx.py
   python ingest/sync_rebuild_from_docx.py --apply
+  python ingest/sync_rebuild_from_docx.py "c:\\Users\\shue1\\Downloads\\ReBUILD_Feasibility_Questionnaire_AF (1).docx" --apply
 """
 from __future__ import annotations
 
 import argparse
 import json
 import re
+from collections import Counter
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 
 from azure.cosmos import CosmosClient
+from docx import Document
 
 REPO = Path(__file__).resolve().parents[1]
 DEFAULT_DOCX = Path(
-    r"c:\Users\shue1\Downloads\ReBUILD Feasibility Questionnaire_v0.1_10Sep2026_Draft.docx"
+    r"c:\Users\shue1\Downloads\ReBUILD_Feasibility_Questionnaire_AF (1).docx"
 )
 SURVEY_ID = "survey-rebuild-mytx272am-201"
-SOURCE = "rebuild-sfq-v0.1-10sep2026"
+SOURCE = "rebuild-af-std-14sep2026"
 
-# Explicit concept matches → existing library ids (do not invent duplicates)
 ALIASES = {
     "investigator name": "ql-pi-name",
     "investigator first and last name": "ql-pi-name",
     "investigator email": "ql-pi-email",
-    "investigator email address": "ql-pi-email",
     "investigator phone": "ql-pi-phone",
     "investigator phone number": "ql-pi-phone",
     "institution name": "ql-site-name",
     "site name": "ql-site-name",
-    "site legal name": "ql-site-name",
     "address": "ql-site-address",
     "street address": "ql-site-address",
-    "what is your site s street address": "ql-site-address",
+    "institution street address": "ql-site-address",
     "preferred site contact name": "ql-coord-name",
     "primary research point of contact first and last name": "ql-coord-name",
     "preferred site contact email": "ql-coord-email",
+    "primary research point of contact email": "ql-coord-email",
     "primary research contact email": "ql-coord-email",
     "preferred site contact phone": "ql-coord-phone",
+    "primary research point of contact phone number": "ql-coord-phone",
     "contract budget name": "ql-contracts-name",
     "contracting budgeting contact first and last name": "ql-contracts-name",
     "contract budget email": "ql-contracts-email",
@@ -58,14 +61,26 @@ ALIASES = {
     "are there other committees at your site that require protocol review prior to or after approval from": "ql-gf-22-other-committees",
     "in addition to the local irb ec review are there additional local committees": "ql-gf-22-other-committees",
     "will your site require translations": "ql-gf-24-translations",
-    "would your site s subjects benefit from language translations": "ql-gf-24-translations",
+    "would your site require translation of any study documents or patient facing materials": "ql-gf-24-translations",
     "is equipment routinely calibrated at your site": "ql-gsf_074_is-equipment-routinely-calibrated-at-your-site",
     "does your site maintain a regular calibration schedule": "ql-gsf_074_is-equipment-routinely-calibrated-at-your-site",
     "do you have experience with electronic data capture edc": "ql-gsf_065_please-select-which-of-the-following-edc-systems",
     "please select which of the following edc systems": "ql-gsf_065_please-select-which-of-the-following-edc-systems",
+    "please select which of the following edc systems your site has experience with": "ql-gsf_065_please-select-which-of-the-following-edc-systems",
     "do you have experience with interactive response technology irt": "ql-gsf_066_please-select-which-of-the-following-irt-rtsm-sy",
     "please select which of the following irt rtsm": "ql-gsf_066_please-select-which-of-the-following-irt-rtsm-sy",
+    "please select which of the following irt rtsm systems your site has experience with": "ql-gsf_066_please-select-which-of-the-following-irt-rtsm-sy",
 }
+
+Q_RE = re.compile(r"^(\d+)\.\s+(.+?)\s*(\*)?\s*$")
+TYPE_RE = re.compile(r"^Question Type:\s*(.+)$", re.I)
+BRANCH_RE = re.compile(r"^Branch Logic:\s*(.+)$", re.I)
+SECTION_RE = re.compile(r"^SECTION\s+\d+", re.I)
+STUDY_RE = re.compile(r"^Study\s*#?\s*(\d+)\s*$", re.I)
+FOLLOW_OPT_RE = re.compile(
+    r"^(If other|If no,|Manufacturer/Model|Make/Model|If yes, what percentage)",
+    re.I,
+)
 
 
 def cosmos():
@@ -94,657 +109,198 @@ def slug(label: str, idx: int) -> str:
     return f"ql-rebuild-{idx:03d}-{s}"
 
 
-def q(
-    label: str,
-    *,
-    type_: str = "text",
-    options: list | None = None,
-    required: bool = True,
-    category: str = "ReBUILD Feasibility",
-    help_: str = "",
-    alias_key: str | None = None,
-):
-    return {
-        "label": label.strip(),
-        "type": type_,
-        "options": options or [],
-        "required": required,
-        "category": category,
-        "help": help_,
-        "aliasKey": alias_key or norm(label),
+def clean_section(s: str) -> str:
+    s = re.sub(r"^SECTION\s+\d+\s*:\s*", "", str(s or ""), flags=re.I).strip()
+    return s or "ReBUILD"
+
+
+def map_type(raw: str) -> tuple[str, list[str]]:
+    t = (raw or "").lower()
+    if "yes/no" in t or "yes / no" in t:
+        return "radio", ["Yes", "No"]
+    if "multi-select" in t or "multi select" in t or "select all" in t:
+        return "multiselect", []
+    if "single select" in t or "single-select" in t or "range select" in t:
+        return "radio", []
+    if "long response" in t or "long text" in t:
+        return "textarea", []
+    if "numeric" in t or "number" in t:
+        return "number", []
+    if "short response" in t or "short text" in t:
+        return "text", []
+    return "text", []
+
+
+def parse_branch(branch: str, by_num: dict[int, str]) -> dict | None:
+    """Best-effort showIf from Branch Logic lines."""
+    b = str(branch or "")
+    if not b:
+        return None
+    # If "No," skip / go to …
+    m = re.search(r'If\s+"([^"]+)"\s*,?\s*(?:skip|go to)', b, re.I)
+    if m:
+        # Shown when NOT that value → inverse is hard; encode as show when opposite for Yes/No
+        val = m.group(1).strip()
+        # Most branches are "If No, skip next" → show follow-up when Yes
+        # Or "If Yes, skip to Section 2" on interest gate → show Q14 when No
+        return {"_raw": b, "triggerValue": val}
+    return {"_raw": b}
+
+
+def parse_docx(path: Path) -> tuple[list[dict], dict]:
+    d = Document(str(path))
+    paras = [(p.style.name if p.style else "", (p.text or "").strip()) for p in d.paragraphs]
+
+    section = "ReBUILD"
+    study_ctx = ""
+    questions: list[dict] = []
+    cur = None
+    docx_num_counts: Counter[int] = Counter()
+
+    def flush():
+        nonlocal cur
+        if cur:
+            questions.append(cur)
+            cur = None
+
+    for style, text in paras:
+        if not text:
+            continue
+        if SECTION_RE.match(text) or (style.startswith("Heading") and not STUDY_RE.match(text)):
+            flush()
+            section = clean_section(text)
+            study_ctx = ""
+            continue
+        sm = STUDY_RE.match(text)
+        if sm:
+            flush()
+            study_ctx = f"Study #{sm.group(1)}"
+            continue
+
+        m = Q_RE.match(text)
+        if m:
+            flush()
+            num = int(m.group(1))
+            docx_num_counts[num] += 1
+            label = re.sub(r"\s*\*\s*$", "", m.group(2).strip()).strip()
+            if study_ctx and num in (24, 25):
+                label = f"{study_ctx}: {label}"
+            required = bool(m.group(3)) or text.rstrip().endswith("*")
+            cur = {
+                "docxNum": num,
+                "label": label,
+                "required": required,
+                "category": section if not study_ctx else "Site Profile — Recent Dry AMD Studies",
+                "type": "text",
+                "options": [],
+                "branch": "",
+                "help": "",
+                "studyCtx": study_ctx,
+            }
+            continue
+
+        if cur is None:
+            continue
+
+        tm = TYPE_RE.match(text)
+        if tm:
+            typ, opts = map_type(tm.group(1))
+            cur["type"] = typ
+            if opts and not cur["options"]:
+                cur["options"] = list(opts)
+            cur["help"] = tm.group(1).strip()
+            continue
+
+        bm = BRANCH_RE.match(text)
+        if bm:
+            cur["branch"] = bm.group(1).strip()
+            continue
+
+        if style == "List Paragraph" or text.startswith(("•", "-", "\u2022")):
+            opt = re.sub(r"^[•\-\u2022]\s*", "", text).strip()
+            if opt and opt not in cur["options"]:
+                cur["options"].append(opt)
+            continue
+
+    flush()
+
+    # Normalize types when options present
+    for q in questions:
+        if q["options"] and q["type"] in ("text", "textarea", "number"):
+            opts_l = [o.lower() for o in q["options"]]
+            if {"yes", "no"}.issubset(set(opts_l)) and len(q["options"]) <= 4:
+                q["type"] = "radio"
+            else:
+                help_l = (q.get("help") or "").lower()
+                q["type"] = "multiselect" if ("multi" in help_l or "select all" in help_l) else "radio"
+
+    # Expand follow-up option text into separate questions
+    expanded: list[dict] = []
+    for q in questions:
+        followups = []
+        clean_opts = []
+        for opt in q.get("options") or []:
+            if FOLLOW_OPT_RE.search(opt) or "please specify" in opt.lower() or "please describe" in opt.lower():
+                # Keep "Other" as option when present separately; lift describe/spec into follow-up
+                if opt.lower().startswith("other"):
+                    clean_opts.append("Other")
+                followups.append(
+                    {
+                        "docxNum": q["docxNum"],
+                        "label": opt.rstrip(":").strip(),
+                        "required": False,
+                        "category": q["category"],
+                        "type": "text",
+                        "options": [],
+                        "branch": "",
+                        "help": f"Follow-up to: {q['label'][:80]}",
+                        "studyCtx": q.get("studyCtx") or "",
+                        "isFollowUp": True,
+                        "parentLabel": q["label"],
+                    }
+                )
+            else:
+                clean_opts.append(opt)
+        # Dedupe options preserving order
+        seen = set()
+        q["options"] = []
+        for o in clean_opts:
+            k = o.lower()
+            if k in seen:
+                continue
+            seen.add(k)
+            q["options"].append(o)
+        expanded.append(q)
+        expanded.extend(followups)
+
+    meta = {
+        "docxPath": str(path),
+        "rawParsed": len(questions),
+        "afterFollowUps": len(expanded),
+        "duplicateNumbers": sorted([n for n, c in docx_num_counts.items() if c > 1]),
+        "docxNumCounts": {str(k): v for k, v in sorted(docx_num_counts.items())},
+        "missingNumbers": [
+            i
+            for i in range(1, (max(docx_num_counts) if docx_num_counts else 0) + 1)
+            if i not in docx_num_counts
+        ],
     }
+    return expanded, meta
 
 
-def rebuild_questions() -> list[dict]:
-    """Curated SFQ fields from ReBUILD DOCX (tables + interest/comments)."""
-    qs: list[dict] = []
-    cat = "ReBUILD / MYTX272AM-201"
-
-    # Interest gate
-    qs.append(
-        q(
-            "Has the Investigator reviewed the protocol synopsis, and interested in participating in this study?",
-            type_="radio",
-            options=["Yes", "No"],
-            category=cat,
-        )
-    )
-    qs.append(
-        q(
-            "If NO, please provide the reason(s)",
-            type_="multiselect",
-            options=[
-                "Lack of Patients",
-                "Eligibility Criteria",
-                "Competing Studies either ongoing/planned",
-                "Lack of Time and/or Research Staff",
-                "Lack of Equipment",
-                "Protocol-related",
-                "Other",
-            ],
-            required=False,
-            category=cat,
-            help_="Shown when interest = No.",
-        )
-    )
-    qs.append(
-        q(
-            "If other reason for not participating, please describe",
-            type_="textarea",
-            required=False,
-            category=cat,
-        )
-    )
-
-    # Contact Information
-    qs += [
-        q("Investigator Name", type_="text", category="Contact Information", alias_key="investigator name"),
-        q("Investigator Phone", type_="text", category="Contact Information", alias_key="investigator phone"),
-        q("Investigator Email", type_="text", category="Contact Information", alias_key="investigator email"),
-        q("Institution Name", type_="text", category="Contact Information", alias_key="institution name"),
-        q("Site street address", type_="text", category="Contact Information", alias_key="street address"),
-        q("City / State / Country / Zip Code", type_="text", category="Contact Information"),
-        q(
-            "Preferred Site Contact Name",
-            type_="text",
-            category="Contact Information",
-            alias_key="preferred site contact name",
-        ),
-        q(
-            "Preferred Site Contact Phone",
-            type_="text",
-            category="Contact Information",
-            alias_key="preferred site contact phone",
-        ),
-        q(
-            "Preferred Site Contact Email",
-            type_="text",
-            category="Contact Information",
-            alias_key="preferred site contact email",
-        ),
-        q(
-            "Contract/Budget Name",
-            type_="text",
-            category="Contact Information",
-            alias_key="contract budget name",
-        ),
-        q(
-            "Contract/Budget Phone",
-            type_="text",
-            required=False,
-            category="Contact Information",
-        ),
-        q(
-            "Contract/Budget Email",
-            type_="text",
-            category="Contact Information",
-            alias_key="contract budget email",
-        ),
-    ]
-
-    # Site Information
-    qs.append(
-        q(
-            "Please choose a Practice Type which best describes your site",
-            type_="radio",
-            options=[
-                "University Hospital",
-                "General Hospital",
-                "Doctor’s Office (Group Practice)",
-                "Doctor’s Office (Private Practice)",
-                "Dedicated Research Center",
-                "Specialized Clinic/Institution",
-                "Other (please specify)",
-            ],
-            category="Site Information",
-            alias_key="please choose a practice type which best describes your site",
-        )
-    )
-    qs.append(
-        q(
-            "If other practice type, please specify",
-            type_="text",
-            required=False,
-            category="Site Information",
-        )
-    )
-    qs.append(
-        q(
-            "Does your site have satellite offices or other locations where study procedures will be performed?",
-            type_="radio",
-            options=["Yes", "No"],
-            category="Site Information",
-        )
-    )
-    qs.append(
-        q(
-            "Satellite / additional research location details (institution, address, independent satellite Y/N, procedures)",
-            type_="textarea",
-            required=False,
-            category="Site Information",
-        )
-    )
-
-    # Site Profile
-    qs += [
-        q(
-            "How many Dry AMD clinical trials have you conducted in the past 5 years?",
-            type_="radio",
-            options=["0", "1-2", "3-5", "≥6"],
-            category="Site Profile",
-        ),
-        q(
-            "Please indicate what development phase",
-            type_="multiselect",
-            options=["Phase I", "Phase 2", "Phase 3"],
-            required=False,
-            category="Site Profile",
-        ),
-        q(
-            "Do you have any ongoing trials in patients with dry AMD and GA? If so, how many?",
-            type_="radio",
-            options=["0", "1-2", "3-5", "≥6"],
-            category="Site Profile",
-        ),
-        q(
-            "If you answered the above question, would those trials interfere with recruitment?",
-            type_="radio",
-            options=["Yes", "No"],
-            required=False,
-            category="Site Profile",
-        ),
-        q(
-            "For the 3 most recent Dry AMD studies your site has conducted, please provide enrollment details",
-            type_="textarea",
-            required=False,
-            category="Site Profile",
-            help_="Study # / subjects enrolled / length of enrollment period (months).",
-        ),
-        q(
-            "Do you have dedicated staff to conduct this study?",
-            type_="radio",
-            options=["Yes", "No"],
-            category="Site Profile",
-        ),
-        q(
-            "If YES, please check all dedicated staff that apply",
-            type_="multiselect",
-            options=[
-                "Study Coordinator",
-                "Pharmacist",
-                "Sub-Investigators",
-                "Certified Photographers/Technicians",
-                "Certified BCVA Examiners",
-            ],
-            required=False,
-            category="Site Profile",
-        ),
-        q(
-            "How many Sub-Investigators do you plan to have involved in the trial?",
-            type_="text",
-            required=False,
-            category="Site Profile",
-        ),
-        q(
-            "Are you or any of your sub-I’s board-certified retinal specialists?",
-            type_="multiselect",
-            options=["PI", "Sub-I"],
-            required=False,
-            category="Site Profile",
-        ),
-        q(
-            "How many Certified Photographers do you plan to have involved in the trial?",
-            type_="number",
-            required=False,
-            category="Site Profile",
-        ),
-        q(
-            "Has your site staff/equipment ever been certified by Clario reading center?",
-            type_="radio",
-            options=["Yes", "No"],
-            category="Site Profile",
-        ),
-        q(
-            "Has your site staff/equipment ever been certified by Adaptive Sensory Technology (AST) reading center?",
-            type_="radio",
-            options=["Yes", "No"],
-            category="Site Profile",
-        ),
-        q(
-            "How many Certified BCVA Examiners do you plan to have involved in the trial?",
-            type_="number",
-            required=False,
-            category="Site Profile",
-        ),
-        q(
-            "Do you have the capability of performing Spectral Domain OCT (SD-OCT) Imaging?",
-            type_="multiselect",
-            options=["Heidelberg Spectralis", "Zeiss Cirrus", "Both", "Other"],
-            category="Equipment",
-        ),
-        q(
-            "If other SD-OCT, please specify manufacturer/model",
-            type_="text",
-            required=False,
-            category="Equipment",
-        ),
-        q(
-            "Color Fundus Photography (CFP) Imaging available?",
-            type_="radio",
-            options=["Yes", "No"],
-            category="Equipment",
-        ),
-        q(
-            "CFP manufacturer/model",
-            type_="text",
-            required=False,
-            category="Equipment",
-        ),
-        q(
-            "Fundus Autofluorescence (FAF) Imaging available?",
-            type_="radio",
-            options=["Yes", "No"],
-            category="Equipment",
-        ),
-        q(
-            "FAF manufacturer/model",
-            type_="text",
-            required=False,
-            category="Equipment",
-        ),
-        q(
-            "Fluorescein Angiography (FA) Imaging available?",
-            type_="radio",
-            options=["Yes", "No"],
-            category="Equipment",
-        ),
-        q(
-            "FA manufacturer/model",
-            type_="text",
-            required=False,
-            category="Equipment",
-        ),
-        q(
-            "Do you have an ETDRS lightbox?",
-            type_="radio",
-            options=["Yes", "No"],
-            category="Equipment",
-        ),
-        q(
-            "ETDRS lightbox make/model/cat. No",
-            type_="text",
-            required=False,
-            category="Equipment",
-        ),
-        q(
-            "Do you have a dedicated 4 meter lane/room/area to perform BCVA testing?",
-            type_="radio",
-            options=["Yes", "No"],
-            category="Equipment",
-        ),
-        q(
-            "Do you have room for a Quantitative Contrast Sensitivity Function (qCSF) machine?",
-            type_="radio",
-            options=["Yes", "No"],
-            category="Equipment",
-        ),
-        q(
-            "Do you have Corneal Fluorescein staining strips?",
-            type_="radio",
-            options=["Yes", "No"],
-            category="Equipment",
-        ),
-        q(
-            "Do you have the equipment necessary to perform Biomicroscopy (Slit Lamp)?",
-            type_="radio",
-            options=["Yes", "No"],
-            category="Equipment",
-        ),
-        q(
-            "Does your site maintain a regular calibration schedule (SOP, Policy, etc) for all equipment?",
-            type_="radio",
-            options=["Yes", "No"],
-            category="Equipment",
-            alias_key="does your site maintain a regular calibration schedule",
-        ),
-        q(
-            "If YES, can the calibration records be reviewed by the CRA during monitoring visits?",
-            type_="radio",
-            options=["Yes", "No"],
-            required=False,
-            category="Equipment",
-        ),
-        q(
-            "How can records/clinical trial source records best be reviewed by the CRA monitoring at your site?",
-            type_="multiselect",
-            options=[
-                "Paper source at the site",
-                "Electronic Medical Records/Source (i.e., RealTime or CRIO), CRA can log-in",
-                "Electronic Medical Records, CRA can review certified printouts",
-                "Other (please specify)",
-            ],
-            category="Site Profile",
-        ),
-        q(
-            "If Electronic Source, specify system",
-            type_="text",
-            required=False,
-            category="Site Profile",
-        ),
-        q(
-            "Will CRA have remote access to the Electronic Source for remote monitoring?",
-            type_="radio",
-            options=["Yes", "No"],
-            required=False,
-            category="Site Profile",
-        ),
-    ]
-
-    # Access to Patients
-    qs += [
-        q(
-            "How many patients > 55 years old with at least 1 eye with dry AMD with GA do you see on a monthly basis?",
-            type_="number",
-            category="Access to Patients",
-        ),
-        q(
-            "What percentage of these patients have extrafoveal GA lesions (at least > 150 µm from the foveal center) with a cumulative GA lesion size of approximately > 0.5 mm2 and < 10.16 mm2?",
-            type_="radio",
-            options=["≤25%", ">25 to ≤50%", "over 50%"],
-            category="Access to Patients",
-        ),
-        q(
-            "How many newly referred or newly diagnosed with dry AMD with GA patients does your site see each month?",
-            type_="number",
-            category="Access to Patients",
-        ),
-        q(
-            "Based on the numbers above and the protocol synopsis provided, how many patients do you anticipate being able to enroll each month?",
-            type_="number",
-            category="Access to Patients",
-        ),
-        q(
-            "Please indicate below if any ELIGIBILITY criteria would prevent you from recruiting patients into the trial",
-            type_="textarea",
-            required=False,
-            category="Access to Patients",
-        ),
-        q(
-            "Does your site routinely use complement inhibitors to treat patients with GA?",
-            type_="radio",
-            options=["Yes", "No"],
-            category="Access to Patients",
-        ),
-        q(
-            "If YES, do you use complement inhibitors in the study’s proposed patient population?",
-            type_="radio",
-            options=["Yes", "No"],
-            required=False,
-            category="Access to Patients",
-        ),
-        q(
-            "If yes, what percentage of Dry AMD patients?",
-            type_="text",
-            required=False,
-            category="Access to Patients",
-        ),
-        q(
-            "Is your site willing to pre-screen potential, suitable patients prior to the SIV and make a list of possible eligible patients?",
-            type_="radio",
-            options=["Yes", "No"],
-            category="Access to Patients",
-        ),
-        q(
-            "What method(s) are/were you planning to identify patients?",
-            type_="multiselect",
-            options=[
-                "Site Database Review",
-                "Patient Chart Review",
-                "Dear Dr. Letter",
-                "Past Enrollment in Similar Studies",
-                "Other Physician Referrals",
-                "Other (please specify)",
-            ],
-            category="Access to Patients",
-        ),
-    ]
-
-    # IRB/EC
-    qs += [
-        q(
-            "Please indicate the type of IRB/EC your site is able to use",
-            type_="multiselect",
-            options=["Central IRB/EC", "Local IRB/EC"],
-            category="IRB/EC Submission",
-            alias_key="please indicate the type of irb ec your site is able to use",
-        ),
-        q(
-            "If Local IRB/EC, how often does the IRB meet?",
-            type_="radio",
-            options=["Weekly", "Every Other Week", "Monthly", "Other, please specify"],
-            required=False,
-            category="IRB/EC Submission",
-        ),
-        q(
-            "If Local IRB/EC, what is the lead time for preparing the submission package?",
-            type_="text",
-            required=False,
-            category="IRB/EC Submission",
-        ),
-        q(
-            "If Local IRB/EC, how many workdays in advance of your local meeting must the package be submitted?",
-            type_="number",
-            required=False,
-            category="IRB/EC Submission",
-        ),
-        q(
-            "If Local IRB/EC, please describe the submission and approval process",
-            type_="textarea",
-            required=False,
-            category="IRB/EC Submission",
-        ),
-        q(
-            "How long does it take to receive the approval documents from the IRB/EC meeting date?",
-            type_="text",
-            required=False,
-            category="IRB/EC Submission",
-        ),
-        q(
-            "In addition to the local IRB/EC review, are there additional local committees that are a part of your review process and approval required prior to activation?",
-            type_="radio",
-            options=["Yes", "No"],
-            category="IRB/EC Submission",
-            alias_key="in addition to the local irb ec review are there additional local committees",
-        ),
-        q(
-            "If yes, please specify committee name & frequency",
-            type_="text",
-            required=False,
-            category="IRB/EC Submission",
-        ),
-        q(
-            "If Local IRB/EC, does the contract (Clinical Trial Agreement) need to be submitted?",
-            type_="radio",
-            options=["Yes", "No"],
-            required=False,
-            category="IRB/EC Submission",
-        ),
-        q(
-            "If yes, is it acceptable to submit a DRAFT CTA?",
-            type_="radio",
-            options=["Yes", "No, fully executed CTA required"],
-            required=False,
-            category="IRB/EC Submission",
-        ),
-        q(
-            "Are there any requirements after IRB/EC approval that are rate limiting to site activation?",
-            type_="radio",
-            options=["Yes", "No"],
-            category="IRB/EC Submission",
-        ),
-        q(
-            "If yes, please specify rate-limiting requirements after IRB/EC approval",
-            type_="textarea",
-            required=False,
-            category="IRB/EC Submission",
-        ),
-        q(
-            "Can IRB/EC submission and contract/budget negotiations occur in parallel?",
-            type_="radio",
-            options=["Yes", "No"],
-            category="IRB/EC Submission",
-        ),
-        q(
-            "Will your site require translations?",
-            type_="radio",
-            options=["Yes", "No"],
-            category="IRB/EC Submission",
-            alias_key="will your site require translations",
-        ),
-        q(
-            "If yes, please specify translation requirements",
-            type_="text",
-            required=False,
-            category="IRB/EC Submission",
-        ),
-    ]
-
-    # Contract / Budget
-    qs += [
-        q(
-            "Do you have a separate contract and/or budget office?",
-            type_="radio",
-            options=["Yes", "No"],
-            category="Contract / Budget",
-        ),
-        q(
-            "If yes, please provide contract/budget office contact details",
-            type_="textarea",
-            required=False,
-            category="Contract / Budget",
-        ),
-        q(
-            "Who will be contracting parties to the Clinical Trial Agreement? Please check all that apply.",
-            type_="multiselect",
-            options=["Institution", "PI", "Contract Department"],
-            category="Contract / Budget",
-        ),
-        q(
-            "On average, how long will it take to execute the Clinical Trial Agreement (CTA) / Budget between the Sponsor and your study site?",
-            type_="radio",
-            options=["< 30 days", "31 to 60 days", "60 to 90 days", "> 90 days"],
-            category="Contract / Budget",
-        ),
-        q(
-            "Do you accept electronic signatures of the Clinical Trial Agreement?",
-            type_="radio",
-            options=["Yes", "No"],
-            category="Contract / Budget",
-        ),
-    ]
-
-    # Vendors
-    qs += [
-        q(
-            "Do you have experience with Electronic Data Capture (EDC)?",
-            type_="radio",
-            options=["Yes", "No"],
-            category="Site Vendor Experience",
-            alias_key="do you have experience with electronic data capture edc",
-        ),
-        q(
-            "If YES, what EDC systems do you have experience with, please specify?",
-            type_="textarea",
-            required=False,
-            category="Site Vendor Experience",
-        ),
-        q(
-            "Do you have experience with Interactive Response Technology (IRT) for patient randomization and IMP distribution?",
-            type_="radio",
-            options=["Yes", "No"],
-            category="Site Vendor Experience",
-            alias_key="do you have experience with interactive response technology irt",
-        ),
-        q(
-            "Do you have experience with sending ophthalmic images to a central reading center?",
-            type_="radio",
-            options=["Yes", "No"],
-            category="Site Vendor Experience",
-        ),
-        q(
-            "If YES, which central reading center vendors have you worked with, please specify?",
-            type_="textarea",
-            required=False,
-            category="Site Vendor Experience",
-        ),
-        q(
-            "Do you have experience using paper patient diaries in a dry AMD population?",
-            type_="radio",
-            options=["Yes", "No"],
-            category="Site Vendor Experience",
-        ),
-        q(
-            "Do you have experience using eDiaries in a dry AMD population?",
-            type_="radio",
-            options=["Yes", "No"],
-            category="Site Vendor Experience",
-        ),
-        q(
-            "What type of diary collection is your patient’s most comfortable using? Check all that apply.",
-            type_="multiselect",
-            options=["eDiary", "Paper Diary"],
-            category="Site Vendor Experience",
-        ),
-        q(
-            "Do you have any additional comments that you would like to provide?",
-            type_="textarea",
-            required=False,
-            category=cat,
-        ),
-    ]
-    return qs
-
-
-def find_match(label: str, alias_key: str, by_lib_id: dict, by_lib_label: dict):
-    ak = norm(alias_key or label)
+def find_match(label: str, by_lib_id: dict, by_lib_label: dict):
     ln = norm(label)
-
-    if ak in ALIASES and ALIASES[ak] in by_lib_id:
-        return by_lib_id[ALIASES[ak]], f"alias:{ALIASES[ak]}"
     if ln in ALIASES and ALIASES[ln] in by_lib_id:
         return by_lib_id[ALIASES[ln]], f"alias:{ALIASES[ln]}"
-
     for key, lid in ALIASES.items():
         if lid not in by_lib_id:
             continue
-        if ln == key or ak == key:
+        if ln == key:
             return by_lib_id[lid], f"alias:{lid}"
         if SequenceMatcher(None, ln, key).ratio() >= 0.92:
             return by_lib_id[lid], f"alias-fuzzy:{lid}"
-
     if ln in by_lib_label:
         return by_lib_label[ln], "exact-lib"
-
     best = None
     best_s = 0.0
     for k, obj in by_lib_label.items():
@@ -752,10 +308,58 @@ def find_match(label: str, alias_key: str, by_lib_id: dict, by_lib_label: dict):
         if s > best_s:
             best_s = s
             best = obj
-    # High bar — avoid false positives (FA vs FAF manufacturer/model)
     if best and best_s >= 0.94 and len(ln) >= 48:
         return best, f"fuzzy-lib:{best_s:.2f}"
     return None, None
+
+
+def attach_branch_logic(survey_qs: list[dict], raw_questions: list[dict]):
+    """Wire simple Yes/No skip branches onto follow-up rows."""
+    by_label = {q["label"]: q for q in survey_qs}
+    # Interest gate: Q13 Yes → skip not-interested reasons
+    interest = next(
+        (
+            q
+            for q in survey_qs
+            if "reviewed the protocol synopsis" in q["label"].lower()
+            and "interest" in q["label"].lower()
+        ),
+        None,
+    )
+    not_int = next(
+        (q for q in survey_qs if q["label"].lower().startswith("if not interested")),
+        None,
+    )
+    if interest and not_int:
+        not_int["logic"] = {
+            "showIf": {"questionId": interest["id"], "equals": "No"},
+        }
+
+    # Generic: "If No, skip the next question" on parent → next required showIf Yes
+    for i, rq in enumerate(raw_questions):
+        branch = (rq.get("branch") or "").lower()
+        if "skip the next" in branch and 'if "no"' in branch:
+            parent = by_label.get(rq["label"])
+            # next non-followup or next item
+            if i + 1 < len(raw_questions) and parent:
+                child_label = raw_questions[i + 1]["label"]
+                child = by_label.get(child_label)
+                if child:
+                    child["logic"] = {
+                        "showIf": {"questionId": parent["id"], "equals": "Yes"},
+                    }
+        if "skip to q20" in branch.replace(" ", "") or "go to q20" in branch.replace(" ", ""):
+            parent = by_label.get(rq["label"])
+            # satellite block: show Q18/Q19 when Yes
+            if parent:
+                for sq in survey_qs:
+                    if sq["label"] in (
+                        "Satellite Institution Name",
+                        "Will this be an independent satellite site?",
+                    ) or sq["label"].startswith("If no, what procedures"):
+                        sq["logic"] = {
+                            "showIf": {"questionId": parent["id"], "equals": "Yes"},
+                        }
 
 
 def main():
@@ -763,11 +367,27 @@ def main():
     ap.add_argument("docx", nargs="?", default=str(DEFAULT_DOCX))
     ap.add_argument("--apply", action="store_true")
     args = ap.parse_args()
+    docx_path = Path(args.docx)
+    if not docx_path.exists():
+        raise SystemExit(f"DOCX not found: {docx_path}")
 
-    questions = rebuild_questions()
+    questions, meta = parse_docx(docx_path)
+
     db = cosmos()
     lib_c = db.get_container_client("site-survey-question-library")
     def_c = db.get_container_client("site-survey-definitions")
+
+    # Prior survey for delta report
+    prior_labels = set()
+    try:
+        prior = def_c.read_item(SURVEY_ID, SURVEY_ID)
+        prior_labels = {
+            norm(q.get("label"))
+            for q in (prior.get("questions") or [])
+            if q.get("label")
+        }
+    except Exception:
+        prior = None
 
     lib_items = list(lib_c.query_items("SELECT * FROM c", enable_cross_partition_query=True))
     by_lib_id = {x["id"]: x for x in lib_items if x.get("id")}
@@ -776,7 +396,6 @@ def main():
         k = norm(x.get("label"))
         if k and k not in by_lib_label:
             by_lib_label[k] = x
-    # Freeze pre-existing labels so same-run near-duplicates (FA vs FAF) don't collide
     preexisting_labels = dict(by_lib_label)
 
     now = datetime.now(timezone.utc).isoformat()
@@ -784,26 +403,33 @@ def main():
     report = []
     created = 0
     reused = 0
+    label_counts = Counter(norm(q["label"]) for q in questions)
+    dup_labels = [lab for lab, c in label_counts.items() if c > 1]
 
     for i, qq in enumerate(questions, start=1):
-        match, how = find_match(qq["label"], qq.get("aliasKey") or "", by_lib_id, preexisting_labels)
+        match, how = find_match(qq["label"], by_lib_id, preexisting_labels)
         opts = list(qq.get("options") or [])
         qtype = qq["type"]
 
         if match and str(match.get("id") or "").startswith("ql-"):
             lib_id = match["id"]
             reused += 1
-            # Keep existing library label/options; tag with rebuild source
             lib_doc = dict(by_lib_id.get(lib_id) or match)
-            tags = list(dict.fromkeys((lib_doc.get("tags") or []) + ["rebuild", "mytx272am-201", SOURCE]))
+            tags = list(
+                dict.fromkeys((lib_doc.get("tags") or []) + ["rebuild", "mytx272am-201", "mighty", SOURCE])
+            )
             lib_doc["tags"] = tags
             lib_doc["updatedAt"] = now
+            # Refresh options from AF when richer
+            if opts and qtype in ("radio", "select", "multiselect"):
+                if len(opts) >= len(lib_doc.get("options") or []):
+                    lib_doc["options"] = opts
+                    lib_doc["type"] = qtype
             if args.apply:
                 lib_c.upsert_item(lib_doc)
             by_lib_id[lib_id] = lib_doc
         else:
             lib_id = slug(qq["label"], i)
-            # collision-safe
             if lib_id in by_lib_id:
                 lib_id = f"{lib_id}-{i}"
             lib_doc = {
@@ -818,7 +444,7 @@ def main():
                 "createdAt": now,
                 "updatedAt": now,
                 "source": SOURCE,
-                "tags": ["rebuild", "mytx272am-201", "feasibility", SOURCE, "new"],
+                "tags": ["rebuild", "mytx272am-201", "mighty", "feasibility", SOURCE, "new"],
             }
             if args.apply:
                 lib_c.upsert_item(lib_doc)
@@ -837,19 +463,23 @@ def main():
                 "libraryQuestionId": lib_id,
                 "help": qq.get("help") or "",
                 "category": qq.get("category") or "ReBUILD",
+                "docxNum": qq.get("docxNum"),
             }
         )
         report.append(
             {
                 "n": i,
-                "label": qq["label"][:120],
+                "docxNum": qq.get("docxNum"),
+                "label": qq["label"][:140],
                 "libraryQuestionId": lib_id,
                 "how": how or "created",
                 "type": qtype,
+                "followUp": bool(qq.get("isFollowUp")),
             }
         )
 
-    # Pages by category
+    attach_branch_logic(survey_qs, questions)
+
     pages = []
     for sq in survey_qs:
         title = (sq.get("category") or "ReBUILD").strip()
@@ -857,28 +487,50 @@ def main():
             pages.append({"id": f"page-{len(pages) + 1}", "title": title, "questionIds": []})
         pages[-1]["questionIds"].append(sq["id"])
 
-    out = REPO / ".firecrawl" / "rebuild-sync-report.json"
-    out.parent.mkdir(exist_ok=True)
-    out.write_text(
-        json.dumps(
-            {
-                "docx": str(args.docx),
-                "surveyId": SURVEY_ID,
-                "total": len(survey_qs),
-                "reused_lib": reused,
-                "created_lib": created,
-                "questions": report,
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+    new_labels = {norm(q["label"]) for q in questions}
+    added_vs_prior = sorted(new_labels - prior_labels)
+    removed_vs_prior = sorted(prior_labels - new_labels)
 
-    print(f"ReBUILD questions: {len(survey_qs)}")
+    summary = {
+        "docx": str(docx_path),
+        "surveyId": SURVEY_ID,
+        "source": SOURCE,
+        "docxMeta": meta,
+        "surveyQuestionCount": len(survey_qs),
+        "libraryReused": reused,
+        "libraryCreated": created,
+        "duplicateLabelsInParsed": [
+            {"norm": d, "count": label_counts[d]} for d in dup_labels
+        ],
+        "duplicateDocxNumbers": meta["duplicateNumbers"],
+        "missingDocxNumbers": meta["missingNumbers"],
+        "vsPriorSurvey": {
+            "priorCount": len(prior_labels),
+            "added": len(added_vs_prior),
+            "removed": len(removed_vs_prior),
+            "addedSample": added_vs_prior[:25],
+            "removedSample": removed_vs_prior[:25],
+        },
+        "questions": report,
+    }
+
+    out = REPO / ".firecrawl" / "rebuild-af-sync-report.json"
+    out.parent.mkdir(exist_ok=True)
+    out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    print(f"DOCX: {docx_path.name}")
+    print(f"Parsed rows (raw): {meta['rawParsed']}")
+    print(f"After follow-up expansion: {meta['afterFollowUps']}")
+    print(f"Survey questions to write: {len(survey_qs)}")
     print(f"Library reused: {reused}  created: {created}")
+    print(f"DOCX duplicate numbers: {meta['duplicateNumbers'] or 'none'}")
+    print(f"DOCX missing numbers (1..max): {meta['missingNumbers'] or 'none'}")
+    print(f"Duplicate labels in parse: {len(dup_labels)}")
+    print(
+        f"vs prior Artemis survey: +{len(added_vs_prior)} added / -{len(removed_vs_prior)} removed "
+        f"(prior had {len(prior_labels)})"
+    )
     print(f"Report: {out}")
-    for r in report:
-        print(f"{r['how'][:22]:22s} Q{r['n']:03d} -> {r['libraryQuestionId']}")
 
     if not args.apply:
         print("\nDry run only. Re-run with --apply to write Cosmos.")
@@ -895,7 +547,7 @@ def main():
             "title": "ReBUILD Feasibility (MYTX272AM-201)",
             "description": (
                 "Mighty Therapeutics MYTX272AM-201 / ReBUILD Site Feasibility Questionnaire "
-                "(v0.1 10 Sep 2026 Draft). Library questions matched to existing items where possible."
+                "(AF standardized format). Library questions matched to existing items where possible."
             ),
             "status": "active",
             "predefined": True,
@@ -907,8 +559,8 @@ def main():
             "pages": pages,
             "generalFeasibilityVariant": "long",
             "source": SOURCE,
-            "docxPath": Path(args.docx).name,
-            "tags": ["rebuild", "mytx272am-201", "feasibility", "predefined", SOURCE],
+            "docxPath": docx_path.name,
+            "tags": ["rebuild", "mytx272am-201", "mighty", "feasibility", "predefined", SOURCE],
             "updatedAt": now,
         }
     )
