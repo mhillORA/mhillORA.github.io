@@ -686,8 +686,8 @@ const validateSurveyQuestionLibrarySchema = (data) => {
         errors.push('label (question text) is required');
     }
     const type = String(data.type || 'text').toLowerCase();
-    if (!['text', 'textarea', 'number', 'date', 'select'].includes(type)) {
-        errors.push('type must be text, textarea, number, date, or select');
+    if (!['text', 'textarea', 'number', 'date', 'select', 'radio', 'multiselect'].includes(type)) {
+        errors.push('type must be text, textarea, number, date, select, radio, or multiselect');
     }
     data.type = type;
     data.label = String(data.label).trim();
@@ -695,8 +695,16 @@ const validateSurveyQuestionLibrarySchema = (data) => {
     data.options = Array.isArray(data.options)
         ? data.options.map((o) => (typeof o === 'string' ? o.trim() : String(o?.label ?? o?.value ?? '').trim())).filter(Boolean)
         : [];
-    if (type === 'select' && data.options.length < 2) {
-        errors.push('select questions need at least two options');
+    if ((type === 'select' || type === 'radio' || type === 'multiselect') && data.options.length < 2) {
+        errors.push(`${type} questions need at least two options`);
+    }
+    data.aliases = Array.isArray(data.aliases)
+        ? data.aliases.map((a) => String(a || '').trim()).filter(Boolean)
+        : [];
+    if (data.help != null && String(data.help).trim()) {
+        data.help = String(data.help).trim();
+    } else {
+        delete data.help;
     }
     data.category = String(data.category || 'General').trim() || 'General';
     data.scoringWeight = typeof data.scoringWeight === 'number' ? Math.max(0, data.scoringWeight) : 0;
