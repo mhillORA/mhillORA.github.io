@@ -1398,6 +1398,128 @@ function registerSurveySecureRoutes(app, deps) {
             }
         },
     });
+
+    // ---------- Ops: preview survey as a site would see it (no assignment / no write) ----------
+    app.http('siteSurveyPreview', {
+        methods: ['GET', 'OPTIONS'],
+        authLevel: 'anonymous',
+        route: 'site-survey-preview',
+        handler: async (request, context) => {
+            if (request.method === 'OPTIONS') {
+                return { status: 204, headers: corsHeaders() };
+            }
+            try {
+                const surveyId = String(readQueryParam(request, 'surveyId') || '').trim();
+                if (!surveyId) {
+                    return {
+                        status: 400,
+                        jsonBody: { error: 'surveyId is required' },
+                        headers: corsHeaders(),
+                    };
+                }
+                let generalFeasibilityVariant = normalizeGeneralFeasibilityVariant(
+                    readQueryParam(request, 'generalFeasibilityVariant') ??
+                        readQueryParam(request, 'gf') ??
+                        'long'
+                );
+                if (isGeneralFeasibilitySurveyId(surveyId)) {
+                    generalFeasibilityVariant = 'none';
+                }
+                const siteId = String(readQueryParam(request, 'siteId') || '').trim();
+                const targetRole = normalizeRole(readQueryParam(request, 'targetRole') || 'pi') || 'pi';
+
+                let definition = null;
+                try {
+                    const defRead = await getContainer(DEFINITIONS).item(surveyId, surveyId).read();
+                    definition = defRead.resource;
+                } catch (_) {
+                    definition = null;
+                }
+                if (!definition || definition.status === 'archived') {
+                    return {
+                        status: 404,
+                        jsonBody: { error: 'Survey definition was not found.' },
+                        headers: corsHeaders(),
+                    };
+                }
+
+                const questions = await resolvePublicSurveyQuestions(getContainer, definition, {
+                    generalFeasibilityVariant,
+                });
+
+                let siteName = 'Preview site';
+                let siteDoc = null;
+                let coordinatorStaff = null;
+                let piStaff = null;
+                let prior = null;
+                let siteResponses = [];
+                let delta = null;
+
+                if (siteId) {
+                    siteName = await resolveSiteName(getContainer, siteId);
+                    siteDoc = await loadSiteDoc(getContainer, siteId);
+                    coordinatorStaff = await loadStaffForRole(getContainer, siteId, 'coordinator');
+                    piStaff = await loadStaffForRole(getContainer, siteId, 'pi');
+                    prior = await findLatestLiveResponse(getContainer, {
+                        siteId,
+                        surveyId,
+                        targetRole,
+                    });
+                    try {
+                        const relatedSiteIds = await resolveRelatedSiteIds(getContainer, siteId);
+                        siteResponses = await findSiteLiveResponses(getContainer, {
+                            siteIds: relatedSiteIds,
+                        });
+                    } catch (_) {
+                        siteResponses = prior ? [prior] : [];
+                    }
+                    const latestTwo = siteResponses.slice(0, 2);
+                    if (latestTwo.length >= 2) {
+                        try {
+                            delta = compareSurveyResponses(latestTwo[0], latestTwo[1], questions);
+                        } catch (_) {
+                            delta = null;
+                        }
+                    }
+                }
+
+                const fakeAssignment = {
+                    id: 'preview',
+                    surveyId,
+                    siteId: siteId || 'preview',
+                    targetRole,
+                    status: 'preview',
+                    generalFeasibilityVariant,
+                    allowResubmit: true,
+                    expiresAt: null,
+                    draftAnswers: null,
+                };
+
+                const payload = buildPublicPayload({
+                    assignment: fakeAssignment,
+                    definition,
+                    siteName,
+                    prior,
+                    draftAnswers: null,
+                    siteRoleResponses: siteResponses,
+                    questions,
+                    delta,
+                    siteDoc,
+                    coordinatorStaff,
+                    piStaff,
+                    attachments: [],
+                });
+                payload.preview = true;
+                payload.alreadySubmitted = false;
+                payload.requiresPassword = false;
+                payload.locked = false;
+
+                return { jsonBody: payload, headers: corsHeaders() };
+            } catch (error) {
+                return handleError(context, error, 'site-survey-preview');
+            }
+        },
+    });
 }
 
 module.exports = {
