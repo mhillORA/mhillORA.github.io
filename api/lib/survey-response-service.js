@@ -267,12 +267,20 @@ function scoreAnswers(def, answers) {
         const weight = typeof q.scoringWeight === 'number' && q.scoringWeight > 0 ? q.scoringWeight : 0;
         if (weight > 0 && opts.length) configuredScorable += 1;
 
-        const failFromOpts = opts.filter((o) => o && (o.knockout === true || o.fail === true));
+        const failFromOpts = opts.filter((o) => o && (o.knockout === true || o.fail === true)
+            && o.notInterested !== true && String(o.disposition || '').toLowerCase() !== 'not_interested');
+        const notInterestedFromOpts = opts.filter((o) => o && (
+            o.notInterested === true
+            || String(o.disposition || '').toLowerCase() === 'not_interested'
+        ));
         const explicitFails = Array.isArray(q.knockoutFailValues)
             ? q.knockoutFailValues.map(normalizeAnswerValue).filter(Boolean)
             : [];
         const isKnockoutConfigured =
-            q.knockout === true || failFromOpts.length > 0 || explicitFails.length > 0;
+            q.knockout === true
+            || failFromOpts.length > 0
+            || notInterestedFromOpts.length > 0
+            || explicitFails.length > 0;
         if (isKnockoutConfigured) configuredKnockouts += 1;
 
         const ans = findAnswerForQuestionId(answers, q.id);
@@ -280,16 +288,28 @@ function scoreAnswers(def, answers) {
         const match = ansVal ? opts.find((o) => optionMatches(o, ansVal)) : null;
 
         if (isKnockoutConfigured) {
+            const notInterestedSet = new Set(
+                notInterestedFromOpts.map((o) => normalizeAnswerValue(o.value ?? o.label)).filter(Boolean)
+            );
             const failSet = new Set([
                 ...explicitFails,
                 ...failFromOpts.map((o) => normalizeAnswerValue(o.value ?? o.label)),
             ]);
-            if (ansVal && failSet.has(ansVal)) {
+            if (ansVal && notInterestedSet.has(ansVal)) {
+                knockouts.push({
+                    questionId: q.id,
+                    label: q.label || q.id,
+                    answer: ansVal,
+                    reason: 'Site not interested',
+                    disposition: 'not_interested',
+                });
+            } else if (ansVal && failSet.has(ansVal)) {
                 knockouts.push({
                     questionId: q.id,
                     label: q.label || q.id,
                     answer: ansVal,
                     reason: 'Failed knockout criterion',
+                    disposition: 'fail',
                 });
             } else if (q.knockout === true && q.knockoutOnBlank === true && !ansVal) {
                 knockouts.push({
@@ -297,6 +317,7 @@ function scoreAnswers(def, answers) {
                     label: q.label || q.id,
                     answer: '(blank)',
                     reason: 'Required knockout left blank',
+                    disposition: 'fail',
                 });
             }
         }
@@ -324,7 +345,9 @@ function scoreAnswers(def, answers) {
 
     const pct = totalWeight > 0 ? Math.round((earned / totalWeight) * 100) : 0;
     let outcome = 'unscored';
-    if (knockouts.length) {
+    if (knockouts.some((k) => k && k.disposition === 'not_interested')) {
+        outcome = 'not_interested';
+    } else if (knockouts.length) {
         outcome = 'fail';
     } else if (totalWeight > 0) {
         if (pct >= passThreshold) outcome = 'pass';
@@ -349,12 +372,89 @@ function scoreAnswers(def, answers) {
     };
 }
 
+/** True when an answer matches endSurveyIf on that question. */
+function answerTriggersEndSurvey(q, answers) {
+    const endIf = q?.logic?.endSurveyIf;
+    if (!endIf || typeof endIf !== 'object') return false;
+    const ans = findAnswerForQuestionId(answers, q.id);
+    if (!ans || ans.skipped) return false;
+    const ansVal = normalizeAnswerValue(ans.value);
+    if (!ansVal) return false;
+    const selected = String(ans.value || '')
+        .split(',')
+        .map((s) => normalizeAnswerValue(s))
+        .filter(Boolean);
+    const tokens = selected.length ? selected : [ansVal];
+    const hit = (want) => {
+        const w = normalizeAnswerValue(want);
+        return w && tokens.some((t) => t === w);
+    };
+    if (endIf.includes != null && endIf.includes !== '' && hit(endIf.includes)) return true;
+    if (endIf.equals != null && endIf.equals !== '' && hit(endIf.equals)) return true;
+    if (Array.isArray(endIf.includesAny) && endIf.includesAny.some(hit)) return true;
+    return false;
+}
+
+/**
+ * When a site ends early via End survey early / interest gate, prefer Not interested
+ * over Fail for knockouts on that same terminating question. Other Fail knockouts stay fail.
+ */
+function applyEarlyExitDisposition(def, answers, score) {
+    if (!def || !Array.isArray(def.questions)) return score;
+    const earlyQs = def.questions.filter((q) => answerTriggersEndSurvey(q, answers));
+    if (!earlyQs.length) return score;
+
+    const earlyIds = new Set(earlyQs.map((q) => String(q.id)));
+    const knockouts = Array.isArray(score?.knockouts) ? score.knockouts.map((k) => ({ ...k })) : [];
+
+    earlyQs.forEach((earlyQ) => {
+        const ans = findAnswerForQuestionId(answers, earlyQ.id);
+        const ansVal = ans && !ans.skipped ? normalizeAnswerValue(ans.value) : '';
+        const existing = knockouts.find((k) => k && String(k.questionId) === String(earlyQ.id));
+        if (existing) {
+            existing.disposition = 'not_interested';
+            existing.reason = 'Site not interested';
+        } else {
+            knockouts.push({
+                questionId: earlyQ.id,
+                label: earlyQ.label || earlyQ.id,
+                answer: ansVal || '(ended early)',
+                reason: 'Site not interested',
+                disposition: 'not_interested',
+            });
+        }
+    });
+
+    const hasOtherFail = knockouts.some((k) => k
+        && k.disposition !== 'not_interested'
+        && !earlyIds.has(String(k.questionId)));
+    const outcome = hasOtherFail ? 'fail' : 'not_interested';
+
+    return {
+        ...(score && typeof score === 'object' ? score : {
+            earned: 0,
+            totalWeight: 0,
+            pct: 0,
+            passThreshold: 70,
+            borderlineThreshold: 50,
+            byCategory: {},
+            scoredQuestionCount: 0,
+            hasScoring: true,
+        }),
+        outcome,
+        knockouts,
+        scoredAt: new Date().toISOString(),
+        hasScoring: true,
+    };
+}
+
 async function computeScore(getContainer, surveyId, answers) {
     try {
         const defC = getContainer('site-survey-definitions');
         const defRead = await defC.item(surveyId, surveyId).read();
         const def = defRead.resource;
-        return scoreAnswers(def, answers);
+        const scored = scoreAnswers(def, answers);
+        return applyEarlyExitDisposition(def, answers, scored);
     } catch (_) {
         return null;
     }
@@ -654,6 +754,10 @@ async function writeSurveyResponse(deps, { assignment, answers, email, displayNa
     });
     const score = await computeScore(getContainer, body.surveyId, body.answers);
     if (score !== null) body.score = score;
+    const siteDisposition = score?.outcome === 'not_interested' || score?.outcome === 'fail'
+        ? score.outcome
+        : null;
+    if (siteDisposition) body.siteDisposition = siteDisposition;
 
     if (prior) {
         try {
@@ -670,6 +774,10 @@ async function writeSurveyResponse(deps, { assignment, answers, email, displayNa
 
         const mergedAnswers = mergeAnswers(body.answers, prior.answers);
         const reScore = await computeScore(getContainer, body.surveyId, mergedAnswers);
+        const updatedScore = reScore !== null ? reScore : body.score ?? prior.score ?? null;
+        const updatedDisposition = updatedScore?.outcome === 'not_interested' || updatedScore?.outcome === 'fail'
+            ? updatedScore.outcome
+            : null;
         const updated = {
             ...prior,
             ...body,
@@ -678,8 +786,10 @@ async function writeSurveyResponse(deps, { assignment, answers, email, displayNa
             submittedAt: now,
             updatedAt: now,
             _resubmitCount: (prior._resubmitCount || 0) + 1,
-            score: reScore !== null ? reScore : body.score ?? prior.score ?? null,
+            score: updatedScore,
+            siteDisposition: updatedDisposition || undefined,
         };
+        if (!updatedDisposition) delete updated.siteDisposition;
         try {
             if (validateSurveyResponsesSchema) validateSurveyResponsesSchema(updated);
         } catch (schemaErr) {
@@ -696,6 +806,7 @@ async function writeSurveyResponse(deps, { assignment, answers, email, displayNa
             draftAnswers: null,
             draftSavedAt: null,
             lastSubmittedAt: now,
+            siteDisposition: updatedDisposition || null,
         };
         delete asgSubmitted.draftAnswers;
         delete asgSubmitted.draftSavedAt;
@@ -705,6 +816,7 @@ async function writeSurveyResponse(deps, { assignment, answers, email, displayNa
     }
 
     const created = { ...body, id: generateId(), createdAt: now };
+    if (!siteDisposition) delete created.siteDisposition;
     try {
         if (validateSurveyResponsesSchema) validateSurveyResponsesSchema(created);
     } catch (schemaErr) {
@@ -718,6 +830,7 @@ async function writeSurveyResponse(deps, { assignment, answers, email, displayNa
         submittedAt: now,
         updatedAt: now,
         lastSubmittedAt: now,
+        siteDisposition: siteDisposition || null,
     };
     delete asgFirst.draftAnswers;
     delete asgFirst.draftSavedAt;
@@ -736,6 +849,8 @@ module.exports = {
     buildSiteRecordPrefill,
     mergeAnswers,
     scoreAnswers,
+    applyEarlyExitDisposition,
+    answerTriggersEndSurvey,
     computeScore,
     readPassThresholds,
     findLatestLiveResponse,

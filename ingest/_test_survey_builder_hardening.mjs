@@ -95,15 +95,31 @@ assert(selectedHasValue(['Other'], 'Other') === true, 'Other match');
 assert(selectedHasValue(['Anterior', 'Other'], 'Other') === true, 'multiselect includes Other');
 assert(selectedHasValue([], 'No') === false, 'empty selected must not match');
 
-/** Mirror site-survey.html endSurveyIf evaluation */
-function evalEndSurveyIf(selected, endIf) {
-    if (!endIf || typeof endIf !== 'object') return false;
-    if (endIf.includes != null && endIf.includes !== '') {
-        return selectedHasValue(selected, endIf.includes);
+/** Mirror site-survey.html endSurveyIf + knockout evaluation */
+function evalEndSurveyIf(selected, endIf, question) {
+    const anyList = [];
+    const pushAny = (v) => {
+        const s = String(v ?? '').trim();
+        if (!s) return;
+        if (!anyList.some((x) => x.toLowerCase() === s.toLowerCase())) anyList.push(s);
+    };
+    if (endIf && typeof endIf === 'object' && Array.isArray(endIf.includesAny)) {
+        endIf.includesAny.forEach(pushAny);
     }
-    if (endIf.equals != null && endIf.equals !== '') {
-        return selectedHasValue(selected, endIf.equals);
+    (Array.isArray(question?.scoringOptions) ? question.scoringOptions : []).forEach((o) => {
+        if (o && (o.knockout === true || o.fail === true)) pushAny(o.value);
+    });
+    (Array.isArray(question?.knockoutFailValues) ? question.knockoutFailValues : []).forEach(pushAny);
+
+    if (endIf && typeof endIf === 'object') {
+        if (endIf.includes != null && endIf.includes !== '') {
+            if (selectedHasValue(selected, endIf.includes)) return true;
+        }
+        if (endIf.equals != null && endIf.equals !== '') {
+            if (selectedHasValue(selected, endIf.equals)) return true;
+        }
     }
+    if (anyList.length && anyList.some((v) => selectedHasValue(selected, v))) return true;
     return false;
 }
 
@@ -113,7 +129,7 @@ function applyEndSurveySkip(questions, answersById) {
     const visible = questions.map((q, i) => {
         if (endAt >= 0) return { id: q.id, skipped: true, endSkipped: true };
         const selected = answersById[q.id] || [];
-        if (evalEndSurveyIf(selected, q.logic?.endSurveyIf)) endAt = i;
+        if (evalEndSurveyIf(selected, q.logic?.endSurveyIf, q)) endAt = i;
         return { id: q.id, skipped: false, endSkipped: false };
     });
     if (endAt >= 0) {
@@ -138,6 +154,25 @@ function applyEndSurveySkip(questions, answersById) {
     const continued = applyEndSurveySkip(qs, { q1: ['Yes'] });
     assert(continued.endAt === -1, 'Yes must not end');
     assert(continued.visible.every((v) => !v.endSkipped), 'all questions remain');
+}
+
+{
+    const qs = [
+        {
+            id: 'q1',
+            scoringOptions: [
+                { value: 'Yes', points: 10 },
+                { value: 'No', points: 0, knockout: true },
+            ],
+        },
+        { id: 'q2' },
+        { id: 'q3' },
+    ];
+    const ended = applyEndSurveySkip(qs, { q1: ['No'] });
+    assert(ended.endAt === 0, 'knockout alone should end');
+    assert(ended.visible[1].endSkipped && ended.visible[2].endSkipped, 'knockout skips later');
+    const continued = applyEndSurveySkip(qs, { q1: ['Yes'] });
+    assert(continued.endAt === -1, 'knockout Yes continues');
 }
 
 {

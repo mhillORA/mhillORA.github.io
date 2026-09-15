@@ -1219,17 +1219,47 @@
     function evalEndSurveyIf(form, row) {
       const equals = row.getAttribute('data-end-if-equals');
       const includes = row.getAttribute('data-end-if-includes');
-      if ((equals == null || equals === '') && (includes == null || includes === '')) return false;
+      const anyRaw = row.getAttribute('data-end-if-any');
+      const anyList = anyRaw
+        ? String(anyRaw).split('||').map((s) => s.trim()).filter(Boolean)
+        : [];
+      if ((equals == null || equals === '')
+        && (includes == null || includes === '')
+        && !anyList.length) return false;
       const qid = row.getAttribute('data-qid');
       if (!qid) return false;
       const selected = readLogicCurrent(form, qid);
       if (includes != null && includes !== '') {
-        return selectedHasValue(selected, includes);
+        if (selectedHasValue(selected, includes)) return true;
       }
       if (equals != null && equals !== '') {
-        return selectedHasValue(selected, equals);
+        if (selectedHasValue(selected, equals)) return true;
       }
+      if (anyList.length && anyList.some((v) => selectedHasValue(selected, v))) return true;
       return false;
+    }
+
+    /** Auto-fail / not-interested choice values that should also end the survey for the respondent. */
+    function knockoutEndValues(q) {
+      const out = [];
+      const seen = new Set();
+      const push = (v) => {
+        const s = String(v ?? '').trim();
+        if (!s) return;
+        const key = s.toLowerCase();
+        if (seen.has(key)) return;
+        seen.add(key);
+        out.push(s);
+      };
+      (Array.isArray(q?.scoringOptions) ? q.scoringOptions : []).forEach((o) => {
+        if (!o) return;
+        if (o.knockout === true || o.fail === true || o.notInterested === true
+          || String(o.disposition || '').toLowerCase() === 'not_interested') {
+          push(o.value);
+        }
+      });
+      (Array.isArray(q?.knockoutFailValues) ? q.knockoutFailValues : []).forEach(push);
+      return out;
     }
 
     function applyRequiredWhenVisible(row, show) {
@@ -1324,16 +1354,22 @@
       });
     }
 
-    function renderDone({ resubmitted, confirmationCode }) {
+    function renderDone({ resubmitted, confirmationCode, endedEarly }) {
       setChip(resubmitted ? 'Updated' : 'Submitted', 'ok');
       el.desc.textContent = resubmitted ? 'Answers updated' : 'Survey submitted';
-      el.content.innerHTML = banner(
-        resubmitted ? 'Thanks — your answers were updated' : 'Thanks — your survey was submitted',
-        confirmationCode
+      const title = endedEarly
+        ? (resubmitted
+          ? 'Thanks — we updated your response'
+          : 'Thank you anyway — we appreciate you letting us know')
+        : (resubmitted ? 'Thanks — your answers were updated' : 'Thanks — your survey was submitted');
+      const body = endedEarly
+        ? (confirmationCode
+          ? `No further questions were needed. Confirmation: ${confirmationCode}. You can close this tab.`
+          : 'No further questions were needed. You can close this tab.')
+        : (confirmationCode
           ? `You can close this tab. Confirmation: ${confirmationCode}. Ora will review your responses.`
-          : 'You can close this tab. Ora will review your responses.',
-        'ok'
-      );
+          : 'You can close this tab. Ora will review your responses.');
+      el.content.innerHTML = banner(title, body, 'ok');
       el.intro.hidden = true;
       el.bar.hidden = true;
     }
@@ -1496,6 +1532,12 @@
           }
         }
         const endIf = q.logic?.endSurveyIf;
+        const endAny = [];
+        const pushEndAny = (v) => {
+          const s = String(v ?? '').trim();
+          if (!s) return;
+          if (!endAny.some((x) => x.toLowerCase() === s.toLowerCase())) endAny.push(s);
+        };
         if (endIf && typeof endIf === 'object') {
           if (endIf.equals != null && endIf.equals !== '') {
             parts.push(`data-end-if-equals="${escapeHtml(String(endIf.equals))}"`);
@@ -1503,6 +1545,12 @@
           if (endIf.includes != null && endIf.includes !== '') {
             parts.push(`data-end-if-includes="${escapeHtml(String(endIf.includes))}"`);
           }
+          if (Array.isArray(endIf.includesAny)) endIf.includesAny.forEach(pushEndAny);
+        }
+        // Pass/fail auto-fail choices also end the survey — no separate End survey early needed
+        knockoutEndValues(q).forEach(pushEndAny);
+        if (endAny.length) {
+          parts.push(`data-end-if-any="${escapeHtml(endAny.join('||'))}"`);
         }
         return parts.join(' ');
       };
@@ -1696,6 +1744,36 @@
       const pagerMeta = document.getElementById('pager-meta');
       const pagerSteps = document.getElementById('pager-steps');
 
+      const defaultSubmitTitle = previewMode ? 'Preview complete' : 'Submission';
+      const defaultSubmitNote = previewMode
+        ? 'Close this tab when finished testing, then send the survey from Feasibility.'
+        : 'Thank you for completing this survey. Ora will review your responses.';
+      const defaultSubmitBtn = alreadySubmitted ? 'Update answers' : 'Submit answers';
+      let endedEarlyActive = false;
+
+      const applyEarlyEndCopy = (ended) => {
+        endedEarlyActive = !!ended;
+        const titleEl = submitSection?.querySelector('.submit-title');
+        const noteEl = submitSection?.querySelector('.submit-note');
+        if (titleEl) {
+          titleEl.textContent = ended
+            ? (previewMode ? 'Preview — early exit' : 'Thanks for letting us know')
+            : defaultSubmitTitle;
+        }
+        if (noteEl) {
+          noteEl.textContent = ended
+            ? (previewMode
+              ? 'Remaining questions are skipped in this preview. Nothing is saved.'
+              : 'No further questions are needed. Submit below — we appreciate your time.')
+            : defaultSubmitNote;
+        }
+        if (submitBtn && !previewMode) {
+          submitBtn.textContent = ended
+            ? (alreadySubmitted ? 'Update & finish' : 'Submit & finish')
+            : defaultSubmitBtn;
+        }
+      };
+
       const validatePage = (pi) => {
         const missing = [];
         const unconfirmed = [];
@@ -1726,7 +1804,7 @@
         return { missing, unconfirmed };
       };
 
-      const showPage = (pi, { scroll = true } = {}) => {
+      const showPage = (pi, { scroll = true, scrollToSubmit = false } = {}) => {
         pageIndex = Math.max(0, Math.min(pages.length - 1, pi));
         form.querySelectorAll('.page-panel').forEach((panel) => {
           const idx = Number(panel.getAttribute('data-page'));
@@ -1742,21 +1820,29 @@
             panel.hidden = idx !== pageIndex;
           });
         }
+        const ended = endPi != null;
+        applyEarlyEndCopy(ended);
         if (pagerMeta) {
           pagerMeta.innerHTML = `Page <strong>${pageIndex + 1}</strong> of ${pages.length}`
             + (pages[pageIndex] ? ` · <strong>${escapeHtml(pages[pageIndex].title)}</strong>` : '')
-            + (endPi != null ? ' · <strong>Ready to submit</strong>' : '');
+            + (ended ? ' · <strong>Ready to finish</strong>' : '');
         }
         if (pageBack) pageBack.disabled = pageIndex === 0;
         const last = pageIndex >= lastReachable;
         if (pageNext) {
-          pageNext.textContent = last ? 'Review & submit' : 'Next section';
+          pageNext.textContent = last
+            ? (ended ? (previewMode ? 'Finish preview' : 'Finish') : (previewMode ? 'Finish preview' : 'Review & submit'))
+            : 'Next section';
           pageNext.hidden = last && pages.length === 1;
         }
         form.querySelectorAll('.page-next-btn').forEach((btn) => {
           const from = Number(btn.getAttribute('data-from'));
           if (from === pageIndex) {
-            btn.textContent = last ? (previewMode ? 'Finish preview' : 'Review & submit') : 'Next section';
+            btn.textContent = last
+              ? (ended
+                ? (previewMode ? 'Finish preview' : 'Finish')
+                : (previewMode ? 'Finish preview' : 'Review & submit'))
+              : 'Next section';
           }
         });
         if (submitSection) submitSection.hidden = !last;
@@ -1775,7 +1861,9 @@
             }
           });
         }
-        if (scroll) {
+        if (scrollToSubmit && last && submitSection && !submitSection.hidden) {
+          submitSection.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        } else if (scroll) {
           (document.getElementById('survey-pager') || form).scrollIntoView({ behavior: 'smooth', block: 'start' });
         }
       };
@@ -1823,7 +1911,11 @@
           const confirmEl = row?.querySelector('.q-confirm:not([hidden]) input[data-confirm-for]');
           if (confirmEl) confirmEl.checked = false;
         }
+        const wasEnded = endedEarlyActive;
         showPage(pageIndex, { scroll: false });
+        if (!wasEnded && endedEarlyActive) {
+          showPage(pageIndex, { scroll: false, scrollToSubmit: true });
+        }
       });
       form.addEventListener('change', (e) => {
         const t = e.target;
@@ -1832,7 +1924,11 @@
           const confirmEl = row?.querySelector('.q-confirm:not([hidden]) input[data-confirm-for]');
           if (confirmEl) confirmEl.checked = false;
         }
+        const wasEnded = endedEarlyActive;
         showPage(pageIndex, { scroll: false });
+        if (!wasEnded && endedEarlyActive) {
+          showPage(pageIndex, { scroll: false, scrollToSubmit: true });
+        }
       });
 
       const goNextFrom = (pi) => {
@@ -2012,7 +2108,7 @@
             return;
           }
           dirty = false;
-          renderDone(result);
+          renderDone({ ...result, endedEarly: endedEarlyActive });
         } catch (err) {
           const msg = err.status === 410
             ? (err.message || 'This survey link has expired. Ask Ora to resend a new link.')

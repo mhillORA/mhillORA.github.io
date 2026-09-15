@@ -154,22 +154,40 @@ function evalShowIf(showIf, answersById) {
   return selected.length > 0;
 }
 
-function evalEndSurveyIf(endIf, selected) {
-  if (!endIf || typeof endIf !== 'object') return false;
-  if (endIf.includes != null && endIf.includes !== '') {
-    return selectedHasValue(selected, endIf.includes);
+function evalEndSurveyIf(endIf, selected, question) {
+  const anyList = [];
+  const pushAny = (v) => {
+    const s = String(v ?? '').trim();
+    if (!s) return;
+    if (!anyList.some((x) => x.toLowerCase() === s.toLowerCase())) anyList.push(s);
+  };
+  if (endIf && typeof endIf === 'object') {
+    if (Array.isArray(endIf.includesAny)) endIf.includesAny.forEach(pushAny);
   }
-  if (endIf.equals != null && endIf.equals !== '') {
-    return selectedHasValue(selected, endIf.equals);
+  (Array.isArray(question?.scoringOptions) ? question.scoringOptions : []).forEach((o) => {
+    if (o && (o.knockout === true || o.fail === true || o.notInterested === true
+      || String(o.disposition || '').toLowerCase() === 'not_interested')) pushAny(o.value);
+  });
+  (Array.isArray(question?.knockoutFailValues) ? question.knockoutFailValues : []).forEach(pushAny);
+
+  if (endIf && typeof endIf === 'object') {
+    if (endIf.includes != null && endIf.includes !== '') {
+      if (selectedHasValue(selected, endIf.includes)) return true;
+    }
+    if (endIf.equals != null && endIf.equals !== '') {
+      if (selectedHasValue(selected, endIf.equals)) return true;
+    }
   }
+  if (anyList.length && anyList.some((v) => selectedHasValue(selected, v))) return true;
   return false;
 }
 
-/** Public visibility after showIf + endSurveyIf */
+/** Public visibility after showIf + endSurveyIf / knockout */
 function visibleAfterLogic(questions, answersById) {
   const rows = questions.map((q, i) => ({
     id: q.id,
     idx: i,
+    q,
     showIf: q.logic?.showIf,
     endSurveyIf: q.logic?.endSurveyIf,
     visible: true,
@@ -183,7 +201,7 @@ function visibleAfterLogic(questions, answersById) {
     if (endAt >= 0) return;
     if (!row.visible) return;
     const selected = answersById[row.id] || [];
-    if (evalEndSurveyIf(row.endSurveyIf, selected)) endAt = i;
+    if (evalEndSurveyIf(row.endSurveyIf, selected, row.q)) endAt = i;
   });
   if (endAt >= 0) {
     for (let i = endAt + 1; i < rows.length; i++) {
@@ -206,7 +224,7 @@ function seedTemplate() {
     scoringWeight: 10,
     scoringOptions: [
       { value: 'Yes', points: 10 },
-      { value: 'No', points: 0, knockout: true },
+      { value: 'No', points: 0, knockout: true, notInterested: true, disposition: 'not_interested' },
     ],
     knockout: true,
     logic: { endSurveyIf: { equals: 'No' } },
@@ -381,13 +399,39 @@ function main() {
     log('OK: showIf + endSurveyIf visibility matrix');
   }
 
+  // --- 2b) Fail-site alone ends survey (no endSurveyIf needed) ---
+  {
+    const qs = [
+      {
+        id: 'q_interest',
+        type: 'radio',
+        options: ['Yes', 'No'],
+        scoringOptions: [
+          { value: 'Yes', points: 10 },
+          { value: 'No', points: 0, knockout: true },
+        ],
+        knockout: true,
+        // intentionally no logic.endSurveyIf
+      },
+      { id: 'q_more', type: 'text', required: true },
+      { id: 'q_even_more', type: 'text', required: true },
+    ];
+    const ended = visibleAfterLogic(qs, { q_interest: ['No'] });
+    assert(ended.endAt === 0, 'knockout No should end without endSurveyIf');
+    assert(ended.rows[1].endSkipped && ended.rows[2].endSkipped, 'later Qs skipped on fail-site');
+    const cont = visibleAfterLogic(qs, { q_interest: ['Yes'] });
+    assert(cont.endAt === -1, 'Yes should continue');
+    assert(cont.rows.every((row) => row.visible && !row.endSkipped), 'all Qs remain on Yes');
+    log('OK: fail-site skips remaining questions');
+  }
+
   // --- 3) Pass / fail scoring (real API scorer) ---
   {
     const def = seedTemplate();
-    // Knockout on gate No
+    // Knockout on gate No → Not interested
     let score = scoreAnswers(def, answersPayload({ q_gate: 'No', q_multi: 'OCT' }));
-    assert(score && score.outcome === 'fail', `gate No should fail, got ${score?.outcome}`);
-    assert(score.knockouts.some((k) => k.questionId === 'q_gate'), 'gate knockout missing');
+    assert(score && score.outcome === 'not_interested', `gate No should be not_interested, got ${score?.outcome}`);
+    assert(score.knockouts.some((k) => k.questionId === 'q_gate' && k.disposition === 'not_interested'), 'gate not_interested knockout missing');
 
     // Pass path: Yes + Both
     score = scoreAnswers(def, answersPayload({ q_gate: 'Yes', q_multi: 'Both' }));
@@ -642,7 +686,7 @@ function main() {
       { passThreshold: 70, borderlineThreshold: 50, questions: clonedScore },
       answersPayload({ [gateId]: 'No' })
     );
-    assert(failScore.outcome === 'fail', 'cloned template knockout still fails');
+    assert(failScore.outcome === 'not_interested', 'cloned template gate No → not_interested');
 
     log('OK: regression pack (radio, equals, end-early, includesAny, library, import, clone scoring)');
   }

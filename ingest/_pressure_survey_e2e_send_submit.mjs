@@ -115,7 +115,7 @@ function buildTemplate() {
         scoringWeight: 10,
         scoringOptions: [
           { value: 'Yes', points: 10 },
-          { value: 'No', points: 0, knockout: true },
+          { value: 'No', points: 0, knockout: true, notInterested: true, disposition: 'not_interested' },
         ],
         knockout: true,
         logic: { endSurveyIf: { equals: 'No' } },
@@ -353,7 +353,7 @@ async function main() {
     report.created.responses.push(submitted.resource.id);
     assert(submitted.created === true || submitted.resubmitted === true, 'submit.end_early', 'no response written');
     const score = submitted.resource.score || scoreAnswers(defLive, answers);
-    assert(score?.outcome === 'fail', 'submit.end_early', `expected fail knockout, got ${score?.outcome}`);
+    assert(score?.outcome === 'not_interested', 'submit.end_early', `expected not_interested, got ${score?.outcome}`);
     assert(score.knockouts?.some((k) => k.questionId === 'q_gate'), 'submit.end_early', 'gate knockout missing');
     const asgAfter = (await asg.item(m.id, m.id).read()).resource;
     assert(String(asgAfter.status).toLowerCase() === 'submitted', 'submit.end_early', 'assignment not submitted');
