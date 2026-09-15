@@ -479,6 +479,10 @@
     @media (min-width: 720px) {
       .check-grid { grid-template-columns: 1fr 1fr; }
     }
+    .check-grid.check-grid--scroll {
+      max-height: 260px;
+      overflow-y: auto;
+    }
     .check-grid label, .radio-grid label {
       display: flex; gap: 10px; align-items: flex-start;
       font-size: 14px; color: var(--text); line-height: 1.4;
@@ -921,14 +925,33 @@
       return vals.includes('yes') && vals.includes('no');
     }
 
+    function isPromptOption(o) {
+      const s = String(optionLabel(o) || optionValue(o) || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      if (!s) return true;
+      if (/^(manufacturer|make\s*\/\s*model|model|catalog|if other|other,? please specify|please specify|specify:?)/.test(s)) return true;
+      if (/\(if yes\)/.test(s) || /please specify/.test(s)) return true;
+      if (/^(if other|other:)/.test(s)) return true;
+      return false;
+    }
+
+    function realChoiceOptions(opts) {
+      return (Array.isArray(opts) ? opts : [])
+        .filter((o) => !isPromptOption(o) && String(optionValue(o) || '').trim() !== '');
+    }
+
     function fieldControl(q, id, defaultVal, reqNative, reqDeferred) {
       const type = (q.type || 'text').toLowerCase();
       const val = defaultVal ?? '';
-      const opts = Array.isArray(q.options) ? q.options : [];
-      const useRadio = type === 'radio' || type === 'yesno' || (type === 'select' && (isYesNoOptions(opts) || opts.length <= 8));
+      const rawOpts = Array.isArray(q.options) ? q.options : [];
+      const opts = realChoiceOptions(rawOpts);
+      const yesNo = isYesNoOptions(opts);
+      // Yes/No and small choice sets → radio. Long lists → dropdown (never a giant radio wall).
+      const useRadio = yesNo
+        || ((type === 'radio' || type === 'yesno') && opts.length > 0 && opts.length <= 6)
+        || (type === 'select' && (yesNo || (opts.length > 0 && opts.length <= 6)));
 
       if (type === 'rating' || type === 'stars' || type === 'star') {
-        const max = Math.max(1, Math.min(10, Number(q.maxStars || q.max || opts.length || 5) || 5));
+        const max = Math.max(1, Math.min(10, Number(q.maxStars || q.max || rawOpts.length || 5) || 5));
         const current = String(val || '').trim();
         const reqAttr = (reqNative || reqDeferred)
           ? 'data-required-when-visible="true" data-rating="true"'
@@ -956,13 +979,15 @@
         const reqAttr = (reqNative || reqDeferred)
           ? 'data-required-when-visible="true" data-multiselect="true"'
           : 'data-multiselect="true"';
+        const list = opts.length ? opts : rawOpts;
+        const tall = list.length > 12 ? ' check-grid--scroll' : '';
         return `<div class="multi-wrap" data-qid-group="${escapeHtml(id)}">
           <div class="check-toolbar">
             <button type="button" class="multi-select-all" data-for="${escapeHtml(id)}">Select all</button>
             <button type="button" class="multi-clear-all" data-for="${escapeHtml(id)}">Clear all</button>
           </div>
-          <div class="check-grid" role="group" aria-label="${escapeHtml(q.label || id)}" ${reqAttr}>
-          ${opts.map((o, oi) => {
+          <div class="check-grid${tall}" role="group" aria-label="${escapeHtml(q.label || id)}" ${reqAttr}>
+          ${list.map((o, oi) => {
             const v = optionValue(o);
             const lbl = optionLabel(o);
             const cid = `${id}__opt_${oi}`;
@@ -990,10 +1015,11 @@
       if (type === 'textarea') {
         return `<textarea id="${escapeHtml(id)}" name="${escapeHtml(id)}" rows="3" ${reqNative} ${reqDeferred} placeholder="Your answer">${escapeHtml(val)}</textarea>`;
       }
-      if (type === 'select') {
+      if (type === 'select' || type === 'radio' || type === 'yesno') {
+        const list = opts.length ? opts : rawOpts;
         return `<select id="${escapeHtml(id)}" name="${escapeHtml(id)}" ${reqNative} ${reqDeferred}>
           <option value="">Select…</option>
-          ${opts.map((o) => {
+          ${list.map((o) => {
             const v = optionValue(o);
             const lbl = optionLabel(o);
             const sel = String(val) === String(v) ? 'selected' : '';
@@ -1251,11 +1277,12 @@
         seen.add(key);
         out.push(s);
       };
+      (Array.isArray(q?.endEarlyValues) ? q.endEarlyValues : []).forEach(push);
       (Array.isArray(q?.scoringOptions) ? q.scoringOptions : []).forEach((o) => {
         if (!o) return;
         if (o.knockout === true || o.fail === true || o.notInterested === true
           || String(o.disposition || '').toLowerCase() === 'not_interested') {
-          push(o.value);
+          push(o.value ?? o.label);
         }
       });
       (Array.isArray(q?.knockoutFailValues) ? q.knockoutFailValues : []).forEach(push);
@@ -1602,10 +1629,11 @@
 
       const resolveSectionKey = (q) => {
         const section = String(q.section || '').trim();
-        if (section) return section;
+        const weakSection = !section || /^(page\s*\d+|questions)$/i.test(section);
+        if (section && !weakSection) return section;
         // Legacy GF templates stored page titles in category
         const legacy = String(q.category || '').trim();
-        if (legacy && !/^(general|questions)$/i.test(legacy)) return legacy;
+        if (legacy && !/^(general|questions|page\s*\d+)$/i.test(legacy)) return legacy;
         const fromNum = sectionForDocxNum(q.docxNum);
         if (fromNum) return fromNum;
         const m = String(q.id || '').match(/^gsf_(\d{3})_/);
@@ -1613,13 +1641,24 @@
           const fromId = sectionForDocxNum(Number(m[1]));
           if (fromId) return fromId;
         }
-        return 'Questions';
+        return section || 'Questions';
       };
 
       const buildPages = (qs, serverPages) => {
+        // Prefer client section resolution so weak "Page 1" labels don't collapse the survey
+        const pages = [];
+        qs.forEach((q, idx) => {
+          const title = resolveSectionKey(q);
+          if (!pages.length || pages[pages.length - 1].key !== title) {
+            pages.push({ key: title, title: prettySection(title), raw: title, items: [] });
+          }
+          pages[pages.length - 1].items.push({ q, idx });
+        });
+        if (pages.length > 1) return pages;
+        // Fallback: honor server pages only when client could not split
         if (Array.isArray(serverPages) && serverPages.length > 1) {
           const byId = new Map(qs.map((q, idx) => [q.id || `q_${idx}`, { q, idx }]));
-          const pages = [];
+          const fromServer = [];
           serverPages.forEach((p) => {
             const items = (p.questionIds || []).map((id) => byId.get(id)).filter(Boolean);
             if (!items.length && Array.isArray(p.indexes)) {
@@ -1629,23 +1668,15 @@
             }
             if (!items.length) return;
             const key = p.key || p.title || 'Questions';
-            pages.push({
+            fromServer.push({
               key,
               title: prettySection(p.title || key),
               raw: key,
               items,
             });
           });
-          if (pages.length > 1) return pages;
+          if (fromServer.length > 1) return fromServer;
         }
-        const pages = [];
-        qs.forEach((q, idx) => {
-          const title = resolveSectionKey(q);
-          if (!pages.length || pages[pages.length - 1].key !== title) {
-            pages.push({ key: title, title: prettySection(title), raw: title, items: [] });
-          }
-          pages[pages.length - 1].items.push({ q, idx });
-        });
         return pages;
       };
 

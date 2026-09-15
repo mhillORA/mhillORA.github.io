@@ -6437,11 +6437,18 @@
                     const keepOpts = isChoiceQuestionType(keepType)
                         ? (coerceOptionList(q.options).length ? coerceOptionList(q.options) : coerceOptionList(canon.options))
                         : [];
+                    // Never let the mega equipment inventory overwrite a Yes/No / small choice question
+                    const safeOpts = (canon.id === 'ql-site-equipment-inventory' && keepOpts.length > 20
+                        && coerceOptionList(q.options).length && coerceOptionList(q.options).length <= 8)
+                        ? coerceOptionList(q.options)
+                        : keepOpts;
                     out.push({
                         ...q,
                         type: keepType,
-                        options: keepOpts,
-                        libraryQuestionId,
+                        options: safeOpts,
+                        libraryQuestionId: (canon.id === 'ql-site-equipment-inventory' && safeOpts.length <= 8)
+                            ? (q.libraryQuestionId && q.libraryQuestionId !== 'ql-site-equipment-inventory' ? q.libraryQuestionId : null)
+                            : libraryQuestionId,
                     });
                     continue;
                 }
@@ -7814,6 +7821,122 @@
             });
             if (siteId) params.set('siteId', String(siteId));
             window.open(`site-survey.html?${params.toString()}`, '_blank', 'noopener');
+        };
+
+        /** Pick template (and optional site/role) before opening preview — does not auto-open. */
+        const openSiteSurveyPreviewChooser = (prefill = {}) => {
+            const allDefs = (allSiteSurveyDefinitions || [])
+                .filter((d) => d && d.status !== 'archived')
+                .slice()
+                .sort((a, b) => (a.title || '').localeCompare(b.title || ''));
+            const predefined = allDefs.filter(isPredefinedSurveyDef);
+            const custom = allDefs.filter((d) => !isPredefinedSurveyDef(d));
+            const sites = (typeof buildUnifiedSitesCatalog === 'function'
+                ? buildUnifiedSitesCatalog()
+                : (allSites || []))
+                .slice()
+                .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+
+            if (!allDefs.length) {
+                showNotification('Create a survey template first.', 'error');
+                return;
+            }
+
+            const preferredSurveyId = String(prefill.surveyId || '').trim();
+            const optionHtml = (d) => {
+                const ind = d.indication || d.therapeuticArea || '';
+                const scoring = surveyDefinitionScoringSummary(d);
+                const scoreTag = scoring.hasScoring ? ' · scored' : '';
+                const label = `${ind ? `${d.title || d.id} (${ind})` : (d.title || d.id)}${scoreTag}`;
+                return `<option value="${escapeHtml(d.id)}" ${d.id === preferredSurveyId ? 'selected' : ''}>${escapeHtml(label)}</option>`;
+            };
+            const siteOptions = [
+                `<option value="">No site (blank preview)</option>`,
+                ...sites.map((s) => `<option value="${escapeHtml(s.id)}" ${s.id === prefill.siteId ? 'selected' : ''}>${escapeHtml(s.name || s.id)}</option>`),
+            ].join('');
+
+            const modalHTML = `
+                <div class="fixed inset-0 bg-gray-500 bg-opacity-75 flex items-center justify-center z-50 p-4">
+                    <div class="bg-white dark:bg-gray-800 rounded-lg shadow-xl max-w-lg w-full overflow-hidden">
+                        <form id="preview-site-survey-form">
+                            <div class="px-4 py-4 sm:px-6 border-b border-gray-200 dark:border-gray-700">
+                                <h3 class="text-lg font-semibold text-gray-900 dark:text-gray-100">Preview survey</h3>
+                                <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Choose which template to walk through. Nothing is saved.</p>
+                            </div>
+                            <div class="px-4 py-4 sm:px-6 space-y-4">
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Survey template</label>
+                                    <select name="surveyId" required class="block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm">
+                                        <option value="">Select a survey…</option>
+                                        ${predefined.length ? `<optgroup label="Predefined">${predefined.map(optionHtml).join('')}</optgroup>` : ''}
+                                        ${custom.length ? `<optgroup label="Custom">${custom.map(optionHtml).join('')}</optgroup>` : ''}
+                                    </select>
+                                </div>
+                                <div>
+                                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Site (optional)</label>
+                                    <select name="siteId" class="block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm">
+                                        ${siteOptions}
+                                    </select>
+                                    <p class="text-[11px] text-gray-500 dark:text-gray-400 mt-1">Pick a site to preview with prior answers / profile prefill when on file.</p>
+                                </div>
+                                <div>
+                                    <span class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Preview as</span>
+                                    <div class="flex flex-wrap gap-4 text-sm text-gray-800 dark:text-gray-100">
+                                        <label class="inline-flex items-center gap-2">
+                                            <input type="radio" name="targetRole" value="pi" checked class="h-4 w-4" />
+                                            PI
+                                        </label>
+                                        <label class="inline-flex items-center gap-2">
+                                            <input type="radio" name="targetRole" value="coordinator" class="h-4 w-4" />
+                                            Coordinator
+                                        </label>
+                                    </div>
+                                </div>
+                                <div id="preview-gf-wrap">
+                                    <label class="flex items-center gap-2 text-sm text-gray-800 dark:text-gray-100">
+                                        <input type="checkbox" name="includeGeneralFeasibility" value="yes" class="h-4 w-4" />
+                                        Include General Feasibility (long) — off by default; turns on the full multi-section GF above this survey
+                                    </label>
+                                </div>
+                                <div id="preview-site-survey-error" class="text-sm text-red-600 dark:text-red-300 hidden"></div>
+                            </div>
+                            <div class="bg-gray-50 dark:bg-gray-700/50 px-4 py-3 sm:px-6 flex flex-row-reverse flex-wrap gap-2">
+                                <button type="submit" class="inline-flex justify-center rounded-md border border-transparent shadow-sm px-4 py-2 bg-indigo-600 text-sm font-medium text-white hover:bg-indigo-700">Open preview</button>
+                                <button type="button" data-action="cancel" class="inline-flex justify-center rounded-md border border-gray-300 dark:border-gray-500 shadow-sm px-4 py-2 bg-white dark:bg-gray-800 text-sm font-medium text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-600">Cancel</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            `;
+            showModal(modalHTML);
+            const form = document.getElementById('preview-site-survey-form');
+            const errEl = document.getElementById('preview-site-survey-error');
+            const gfWrap = document.getElementById('preview-gf-wrap');
+            const syncGfVisibility = () => {
+                const sid = String(form?.surveyId?.value || '');
+                const isGf = sid === 'survey-general-feasibility' || sid === 'survey-general-feasibility-short';
+                if (gfWrap) gfWrap.classList.toggle('hidden', !sid || isGf);
+            };
+            form?.surveyId?.addEventListener('change', syncGfVisibility);
+            syncGfVisibility();
+            form?.addEventListener('submit', (e) => {
+                e.preventDefault();
+                const surveyId = String(form.surveyId?.value || '').trim();
+                if (!surveyId) {
+                    if (errEl) {
+                        errEl.textContent = 'Choose a survey template to preview.';
+                        errEl.classList.remove('hidden');
+                    }
+                    return;
+                }
+                const isGf = surveyId === 'survey-general-feasibility' || surveyId === 'survey-general-feasibility-short';
+                const includeGf = !!form.includeGeneralFeasibility?.checked;
+                const generalFeasibilityVariant = isGf ? 'none' : (includeGf ? 'long' : 'none');
+                const siteId = String(form.siteId?.value || '').trim();
+                const targetRole = form.querySelector('input[name="targetRole"]:checked')?.value || 'pi';
+                openSiteSurveyPreview({ surveyId, siteId, generalFeasibilityVariant, targetRole });
+                closeModal();
+            });
         };
 
         const createSiteSurveyAssignmentModal = (prefill = {}) => {
@@ -14645,18 +14768,7 @@
                 createSiteSurveyAssignmentModal();
             }
             if (e.target.id === 'preview-site-survey-top-btn') {
-                const preferred =
-                    (allSiteSurveyDefinitions || []).find((d) => d && d.id === 'survey-rebuild-mytx272am-201') ||
-                    (allSiteSurveyDefinitions || []).find((d) => d && d.id === 'survey-general-feasibility') ||
-                    (allSiteSurveyDefinitions || []).find((d) => d && d.status !== 'archived');
-                if (!preferred?.id) {
-                    showNotification('Create a survey template first.', 'error');
-                    return;
-                }
-                openSiteSurveyPreview({
-                    surveyId: preferred.id,
-                    generalFeasibilityVariant: preferred.id.startsWith('survey-general-feasibility') ? 'none' : 'long',
-                });
+                openSiteSurveyPreviewChooser();
                 return;
             }
             if (e.target.id === 'jump-survey-reporting-btn') {

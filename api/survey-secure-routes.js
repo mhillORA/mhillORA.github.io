@@ -178,10 +178,76 @@ function meaningfulQuestionHelp(raw) {
     return t;
 }
 
+function publicEndEarlyValues(q) {
+    const out = [];
+    const seen = new Set();
+    const push = (v) => {
+        const s = String(v ?? '').trim();
+        if (!s) return;
+        const key = s.toLowerCase();
+        if (seen.has(key)) return;
+        seen.add(key);
+        out.push(s);
+    };
+    const endIf = q?.logic?.endSurveyIf;
+    if (endIf && typeof endIf === 'object') {
+        if (endIf.equals != null && endIf.equals !== '') push(endIf.equals);
+        if (endIf.includes != null && endIf.includes !== '') push(endIf.includes);
+        if (Array.isArray(endIf.includesAny)) endIf.includesAny.forEach(push);
+    }
+    (Array.isArray(q?.scoringOptions) ? q.scoringOptions : []).forEach((o) => {
+        if (!o) return;
+        if (o.knockout === true || o.fail === true || o.notInterested === true
+            || String(o.disposition || '').toLowerCase() === 'not_interested') {
+            push(o.value ?? o.label);
+        }
+    });
+    (Array.isArray(q?.knockoutFailValues) ? q.knockoutFailValues : []).forEach(push);
+    return out;
+}
+
+/** Ensure endSurveyIf exists when Fail / Not interested choices are configured (public form needs it). */
+function publicLogicWithEndEarly(q) {
+    const base = q?.logic && typeof q.logic === 'object' ? { ...q.logic } : {};
+    const existing = base.endSurveyIf && typeof base.endSurveyIf === 'object' ? base.endSurveyIf : null;
+    const hasExisting = !!(existing && (
+        String(existing.equals || '').trim()
+        || String(existing.includes || '').trim()
+        || (Array.isArray(existing.includesAny) && existing.includesAny.some((x) => String(x || '').trim()))
+    ));
+    if (hasExisting) return Object.keys(base).length ? base : undefined;
+
+    const vals = publicEndEarlyValues({ ...q, logic: { ...(q?.logic || {}), endSurveyIf: null } });
+    if (!vals.length) return Object.keys(base).length ? base : undefined;
+
+    const type = String(q?.type || 'text').toLowerCase();
+    const multi = type === 'multiselect' || type === 'checkboxes' || type === 'checkbox';
+    if (vals.length === 1) {
+        base.endSurveyIf = multi ? { includes: vals[0] } : { equals: vals[0] };
+    } else {
+        base.endSurveyIf = { includesAny: vals };
+    }
+    return base;
+}
+
 function publicQuestionsFromList(questions) {
     const list = Array.isArray(questions) ? questions : [];
     return list.map((q, idx) => {
         const hasBranch = !!(q.logic && q.logic.showIf && q.logic.showIf.questionId);
+        const scoringOptions = Array.isArray(q.scoringOptions)
+            ? q.scoringOptions
+                .filter((o) => o && (o.value != null || o.label != null))
+                .map((o) => ({
+                    value: o.value ?? o.label,
+                    ...(o.knockout === true ? { knockout: true } : {}),
+                    ...(o.fail === true ? { fail: true } : {}),
+                    ...(o.notInterested === true ? { notInterested: true } : {}),
+                    ...(String(o.disposition || '').toLowerCase() === 'not_interested'
+                        ? { disposition: 'not_interested', notInterested: true }
+                        : {}),
+                }))
+            : undefined;
+        const endEarlyValues = publicEndEarlyValues(q);
         return {
             id: q.id || `q_${idx}`,
             label: q.label || q.title || `Question ${idx + 1}`,
@@ -190,7 +256,13 @@ function publicQuestionsFromList(questions) {
             required: q.required !== false,
             branching: hasBranch,
             options: Array.isArray(q.options) ? q.options : undefined,
-            logic: q.logic || undefined,
+            logic: publicLogicWithEndEarly(q),
+            // Needed so Fail / Not interested choices skip remaining questions on the public form
+            scoringOptions: scoringOptions && scoringOptions.length ? scoringOptions : undefined,
+            knockoutFailValues: Array.isArray(q.knockoutFailValues) && q.knockoutFailValues.length
+                ? q.knockoutFailValues.map((v) => String(v ?? '').trim()).filter(Boolean)
+                : undefined,
+            endEarlyValues: endEarlyValues.length ? endEarlyValues : undefined,
             libraryQuestionId: q.libraryQuestionId || undefined,
             fromGeneralFeasibility: q._fromGeneralFeasibility === true,
             sensitivity: q.sensitivity === 'pii' || q.sensitivity === 'phi' ? q.sensitivity : 'none',
@@ -206,18 +278,56 @@ function publicQuestionsFromList(questions) {
 }
 
 /** Group questions into ordered section pages for the public form. */
+const GF_SECTION_RANGES = [
+    [1, 10, 'SECTION 1: RESPONDENT & SITE CONTACT INFORMATION'],
+    [11, 20, 'SECTION 2: SITE PROFILE & SETTING'],
+    [21, 26, 'SECTION 3: RESEARCH EXPERIENCE & REGULATORY HISTORY'],
+    [27, 27, 'SECTION 4: INVESTIGATORS'],
+    [28, 29, 'SECTION 5: PATIENT POPULATION & INDICATIONS'],
+    [30, 36, 'SECTION 6: PATIENT ACCESS, RETENTION & BARRIERS'],
+    [37, 53, 'SECTION 7: DIVERSITY, EQUITY & INCLUSION IN RESEARCH'],
+    [54, 57, 'SECTION 8: STAFFING & COORDINATION'],
+    [58, 64, 'SECTION 9: FACILITIES & INFRASTRUCTURE'],
+    [65, 66, 'SECTION 10: SYSTEMS EXPERIENCE'],
+    [67, 72, 'SECTION 11: LABORATORY & SPECIMEN HANDLING'],
+    [73, 80, 'SECTION 12: INVESTIGATIONAL PRODUCT (IP) MANAGEMENT'],
+    [81, 85, 'SECTION 13: EQUIPMENT & ASSESSMENTS'],
+    [86, 87, 'SECTION 14: IMAGING & BCVA CERTIFICATIONS'],
+    [88, 89, 'SECTION 15: REGULATORY & ETHICS (IRB / EC)'],
+    [90, 98, 'SECTION 16: CONTRACTING, BUDGETING & PAYMENTS'],
+    [99, 103, 'SECTION 17: SURVEY FEEDBACK'],
+];
+
+function sectionForDocxNum(n) {
+    const num = Number(n);
+    if (!Number.isFinite(num)) return '';
+    for (const [a, b, title] of GF_SECTION_RANGES) {
+        if (num >= a && num <= b) return title;
+    }
+    return '';
+}
+
+function resolvePublicSectionKey(q) {
+    const section = String(q?.section || '').trim();
+    const weakSection = !section || /^(page\s*\d+|questions)$/i.test(section);
+    if (section && !weakSection) return section;
+    const legacy = String(q?.category || '').trim();
+    if (legacy && !/^(general|questions|page\s*\d+)$/i.test(legacy)) return legacy;
+    const fromNum = sectionForDocxNum(q?.docxNum);
+    if (fromNum) return fromNum;
+    const m = String(q?.id || '').match(/^gsf_(\d{3})_/);
+    if (m) {
+        const fromId = sectionForDocxNum(Number(m[1]));
+        if (fromId) return fromId;
+    }
+    return section || 'Questions';
+}
+
 function buildSurveyPages(questions) {
     const list = Array.isArray(questions) ? questions : [];
-    const anyExplicitSection = list.some((q) => String(q?.section || '').trim());
     const pages = [];
     list.forEach((q, idx) => {
-        let key;
-        if (anyExplicitSection) {
-            key = String(q.section || '').trim() || 'Page 1';
-        } else {
-            // Legacy GF templates used category as the page title
-            key = String(q.section || q.category || '').trim() || 'Questions';
-        }
+        const key = resolvePublicSectionKey(q);
         if (!pages.length || pages[pages.length - 1].key !== key) {
             pages.push({
                 key,
