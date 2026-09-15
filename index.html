@@ -6300,7 +6300,7 @@
             return rest;
         };
 
-        const libraryItemToBuilderQuestion = (lib) => {
+        const libraryItemToBuilderQuestion = (lib, { section = 'Page 1' } = {}) => {
             const type = normalizeSurveyQuestionType(lib?.type);
             const options = resolveBuilderOptions({ type, options: lib?.options, scoringOptions: lib?.scoringOptions }, lib);
             return {
@@ -6314,11 +6314,21 @@
                 scoringWeight: typeof lib?.scoringWeight === 'number' ? lib.scoringWeight : 0,
                 scoringOptions: Array.isArray(lib?.scoringOptions) ? lib.scoringOptions : [],
                 category: lib?.category || 'General',
+                section: String(section || 'Page 1').trim() || 'Page 1',
                 knockout: !!lib?.knockout,
                 knockoutOnBlank: !!lib?.knockoutOnBlank,
                 knockoutFailValues: Array.isArray(lib?.knockoutFailValues) ? lib.knockoutFailValues : [],
                 libraryQuestionId: lib?.id || null,
             };
+        };
+
+        const resolveBuilderPageSection = (q) => {
+            const explicit = String(q?.section || '').trim();
+            if (explicit) return explicit;
+            const cat = String(q?.category || '').trim();
+            // Legacy GF page titles look like "SECTION 1: …"
+            if (/^section\s+\d+/i.test(cat)) return cat;
+            return 'Page 1';
         };
 
         /** Ensure each survey question has libraryQuestionId + canonical type for cross-survey normalize/prefill. */
@@ -6582,6 +6592,7 @@
                         scoringWeight: typeof q.scoringWeight === 'number' ? q.scoringWeight : 0,
                         scoringOptions: Array.isArray(q.scoringOptions) ? q.scoringOptions : [],
                         category: q.category || 'General',
+                        section: resolveBuilderPageSection(q),
                         knockout: q.knockout === true,
                         knockoutOnBlank: q.knockoutOnBlank === true,
                         knockoutFailValues: Array.isArray(q.knockoutFailValues) ? q.knockoutFailValues : [],
@@ -6685,6 +6696,8 @@
                                                 <button type="button" id="add-site-survey-question-btn" class="px-3 py-1.5 rounded-md border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700 text-sm">Custom (not in bank)</button>
                                             </div>
                                         </div>
+                                        <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Assign each question a <strong>Survey page</strong> name to split the live form into sections. Same page name = same section; change the name to start a new page.</p>
+                                        <div id="site-survey-pages-overview" class="mt-2"></div>
                                         <div id="site-survey-questions-builder" class="mt-2 space-y-3"></div>
                                         <div class="mt-3 flex flex-wrap gap-2" id="site-survey-add-question-btns-bottom">
                                             <button type="button" id="add-from-library-question-btn-bottom" class="px-3 py-1.5 rounded-md bg-indigo-600 text-white hover:bg-indigo-700 text-sm font-medium">Add from library</button>
@@ -6748,6 +6761,7 @@
 
             const renderBuilder = () => {
                 const root = document.getElementById('site-survey-questions-builder');
+                const pagesOverview = document.getElementById('site-survey-pages-overview');
                 if (!root) return;
                 const questions = window.__siteSurveyBuilderQuestions || [];
                 const typeLabels = {
@@ -6760,6 +6774,40 @@
                     rating: 'Star rating',
                     multiselect: 'Checkboxes',
                 };
+                const pageNames = [];
+                const pageCounts = new Map();
+                questions.forEach((q) => {
+                    const name = resolveBuilderPageSection(q);
+                    q.section = name;
+                    if (!pageCounts.has(name)) {
+                        pageNames.push(name);
+                        pageCounts.set(name, 0);
+                    }
+                    pageCounts.set(name, pageCounts.get(name) + 1);
+                });
+                if (pagesOverview) {
+                    if (!questions.length) {
+                        pagesOverview.innerHTML = '';
+                    } else {
+                        pagesOverview.innerHTML = `<div class="rounded-md border border-indigo-200 dark:border-indigo-800 bg-indigo-50/50 dark:bg-indigo-950/20 px-3 py-2">
+                            <div class="text-[11px] font-semibold uppercase tracking-wide text-indigo-800 dark:text-indigo-200 mb-1">Survey pages (${pageNames.length})</div>
+                            <div class="flex flex-wrap gap-1.5">${pageNames.map((name, i) =>
+                                `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-white dark:bg-gray-800 border border-indigo-200 dark:border-indigo-700 text-indigo-900 dark:text-indigo-100">${i + 1}. ${escapeHtml(name)} <span class="text-indigo-500 dark:text-indigo-300">· ${pageCounts.get(name)}</span></span>`
+                            ).join('')}</div>
+                        </div>`;
+                    }
+                }
+                const sectionDatalistId = 'survey-page-sections';
+                if (!document.getElementById(sectionDatalistId)) {
+                    const dl = document.createElement('datalist');
+                    dl.id = sectionDatalistId;
+                    document.body.appendChild(dl);
+                }
+                const sectionDl = document.getElementById(sectionDatalistId);
+                if (sectionDl) {
+                    const opts = pageNames.length ? pageNames : ['Page 1', 'Page 2', 'Page 3'];
+                    sectionDl.innerHTML = opts.map((n) => `<option value="${escapeHtml(n)}"></option>`).join('');
+                }
                 if (!questions.length) {
                     root.innerHTML = `<div class="rounded-lg border border-dashed border-indigo-300 dark:border-indigo-700 bg-indigo-50/40 dark:bg-indigo-950/20 px-4 py-6 text-center space-y-2">
                         <p class="text-sm font-medium text-gray-800 dark:text-gray-100">No questions yet</p>
@@ -6797,18 +6845,22 @@
                     if (isSelect) q.options = opts;
                     const scored = (q.scoringWeight || 0) > 0 || q.knockout || (q.scoringOptions || []).some(o => o && (o.knockout || o.fail));
                     const fromLib = !!q.libraryQuestionId;
+                    const pageSection = resolveBuilderPageSection(q);
+                    const prevSection = idx > 0 ? resolveBuilderPageSection(questions[idx - 1]) : '';
+                    const pageBreak = idx === 0 || pageSection !== prevSection;
+                    const pageNum = pageNames.indexOf(pageSection) + 1;
                     const libBadge = fromLib
                         ? `<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-indigo-100 text-indigo-800 dark:bg-indigo-900/40 dark:text-indigo-200" title="Linked library question ${escapeHtml(q.libraryQuestionId)}">Library</span>`
                         : `<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-gray-100 text-gray-500 dark:bg-gray-700 dark:text-gray-400">New</span>`;
                     return `
                         <div class="rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 overflow-hidden" data-q-card="${idx}" data-q-idx="${idx}">
+                            ${pageBreak ? `<div class="px-3 py-1.5 bg-indigo-600 text-white text-[11px] font-semibold tracking-wide">Page ${pageNum}: ${escapeHtml(pageSection)}</div>` : ''}
                             <div class="flex items-center justify-between gap-2 px-3 py-2 bg-gray-50 dark:bg-gray-900/40 border-b border-gray-200 dark:border-gray-700">
                                 <div class="flex items-center gap-2 min-w-0">
                                     <div class="text-xs font-semibold uppercase tracking-wide text-gray-500">Question ${idx + 1}</div>
                                     ${libBadge}
                                 </div>
                                 <div class="flex gap-1">
-                                    ${fromLib ? `<button type="button" class="q-unlink-library px-2 py-1 rounded bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 text-xs text-gray-600 dark:text-gray-300" title="Keep text but stop linking to library">Unlink</button>` : ''}
                                     <button type="button" class="q-move-up px-2 py-1 rounded bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 text-sm" ${idx === 0 ? 'disabled' : ''}>↑</button>
                                     <button type="button" class="q-move-down px-2 py-1 rounded bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 text-sm" ${idx === questions.length - 1 ? 'disabled' : ''}>↓</button>
                                     <button type="button" class="q-remove px-2 py-1 rounded bg-red-50 dark:bg-red-900/30 text-red-700 dark:text-red-200 text-sm border border-red-100 dark:border-red-800">Remove</button>
@@ -6816,6 +6868,19 @@
                             </div>
 
                             <div class="p-4 space-y-4">
+                                <div class="rounded-md border border-indigo-100 dark:border-indigo-900/50 bg-indigo-50/40 dark:bg-indigo-950/10 p-3">
+                                    <div class="flex flex-wrap items-end gap-2">
+                                        <div class="flex-1 min-w-[12rem]">
+                                            <label class="block text-xs font-semibold text-indigo-900 dark:text-indigo-100">Survey page</label>
+                                            <input name="q_section_${idx}" value="${escapeHtml(pageSection)}" list="${sectionDatalistId}"
+                                                placeholder="e.g. Page 1 · Site profile · Investigators"
+                                                class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm" />
+                                        </div>
+                                        <button type="button" class="q-new-page px-2.5 py-2 rounded-md border border-indigo-300 dark:border-indigo-600 text-xs font-medium text-indigo-800 dark:text-indigo-200 hover:bg-indigo-100 dark:hover:bg-indigo-900/40" title="Put this question on a new page">New page</button>
+                                        ${idx > 0 ? `<button type="button" class="q-same-page px-2.5 py-2 rounded-md border border-gray-300 dark:border-gray-600 text-xs font-medium text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700" title="Match the page of the question above">Same as above</button>` : ''}
+                                    </div>
+                                    <p class="text-[11px] text-indigo-800/80 dark:text-indigo-200/70 mt-1.5">Questions with the same page name appear together. Changing the name starts a new section in the live survey.</p>
+                                </div>
                                 <div>
                                     <label class="block text-sm font-medium text-gray-800 dark:text-gray-100">Question</label>
                                     <input name="q_label_${idx}" value="${escapeHtml(q.label || '')}" required placeholder="What should the site answer?"
@@ -6889,9 +6954,10 @@
                                         </p>
                                         <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
                                             <div>
-                                                <label class="block text-xs font-medium text-gray-700 dark:text-gray-300">Category</label>
+                                                <label class="block text-xs font-medium text-gray-700 dark:text-gray-300">Scoring category</label>
                                                 <input name="q_category_${idx}" value="${escapeHtml(q.category || 'General')}" list="survey-score-categories"
                                                     class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm" placeholder="Patient access" />
+                                                <p class="text-[10px] text-gray-500 dark:text-gray-400 mt-1">For scoring reports only — does not create survey pages.</p>
                                             </div>
                                             <div>
                                                 <label class="block text-xs font-medium text-gray-700 dark:text-gray-300">Max points for this question</label>
@@ -7187,6 +7253,7 @@
                     q.type = readBuilderTypeFromCard(card, idx, prevType);
                     q.required = card.querySelector(`#q_required_${idx}`)?.checked !== false;
                     q.category = (card.querySelector(`input[name="q_category_${idx}"]`)?.value || 'General').trim() || 'General';
+                    q.section = (card.querySelector(`input[name="q_section_${idx}"]`)?.value || q.section || 'Page 1').trim() || 'Page 1';
                     q.logic = readBuilderLogicFromCard(card, idx);
                     // If logic controls were missing from DOM, keep prior logic rather than wiping
                     if (q.logic == null && prevLogic && !card.querySelector(`select[name="q_logic_qid_${idx}"]`)) {
@@ -7255,6 +7322,8 @@
             const addFromLibBtn = document.getElementById('add-from-library-question-btn');
             const addCustomQuestion = () => {
                 syncBuilderFromDom();
+                const prev = (window.__siteSurveyBuilderQuestions || []).slice(-1)[0];
+                const section = resolveBuilderPageSection(prev || { section: 'Page 1' });
                 const q = {
                     id: `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
                     label: '',
@@ -7269,6 +7338,7 @@
                         { value: 'No', points: 0, knockout: true },
                     ],
                     category: 'General',
+                    section,
                     knockout: true,
                     knockoutOnBlank: false,
                     knockoutFailValues: [],
@@ -7285,13 +7355,16 @@
                 const already = (window.__siteSurveyBuilderQuestions || [])
                     .map((q) => q.libraryQuestionId)
                     .filter(Boolean);
+                const prev = (window.__siteSurveyBuilderQuestions || []).slice(-1)[0];
+                const section = resolveBuilderPageSection(prev || { section: 'Page 1' });
                 showLibraryQuestionPicker({
                     excludeLibraryIds: already,
                     onAdd: (picks) => {
                         if (!picks.length) return;
+                        const stamped = picks.map((p) => ({ ...p, section: p.section || section }));
                         window.__siteSurveyBuilderQuestions = [
                             ...(window.__siteSurveyBuilderQuestions || []),
-                            ...picks,
+                            ...stamped,
                         ];
                         renderBuilder();
                         showNotification(`Added ${picks.length} library question${picks.length === 1 ? '' : 's'}`, 'success');
@@ -7310,16 +7383,32 @@
                     const idx = parseInt(card.getAttribute('data-q-card'), 10);
                     if (Number.isNaN(idx)) return;
 
-                    if (e.target.closest('.q-unlink-library')) {
+                    if (e.target.closest('.q-remove')) {
                         const qs = syncBuilderFromDom();
-                        if (qs[idx]) qs[idx].libraryQuestionId = null;
+                        qs.splice(idx, 1);
                         window.__siteSurveyBuilderQuestions = qs;
                         renderBuilder();
                         return;
                     }
-                    if (e.target.closest('.q-remove')) {
+                    if (e.target.closest('.q-new-page')) {
                         const qs = syncBuilderFromDom();
-                        qs.splice(idx, 1);
+                        if (!qs[idx]) return;
+                        const used = new Set(qs.map((q) => resolveBuilderPageSection(q)));
+                        let n = used.size + 1;
+                        let name = `Page ${n}`;
+                        while (used.has(name)) {
+                            n += 1;
+                            name = `Page ${n}`;
+                        }
+                        qs[idx].section = name;
+                        window.__siteSurveyBuilderQuestions = qs;
+                        renderBuilder();
+                        return;
+                    }
+                    if (e.target.closest('.q-same-page')) {
+                        const qs = syncBuilderFromDom();
+                        if (!qs[idx] || idx < 1) return;
+                        qs[idx].section = resolveBuilderPageSection(qs[idx - 1]);
                         window.__siteSurveyBuilderQuestions = qs;
                         renderBuilder();
                         return;
@@ -7384,6 +7473,7 @@
                                 scoringWeight: 0,
                                 scoringOptions: [],
                                 category: parent.category || 'General',
+                                section: resolveBuilderPageSection(parent),
                                 knockout: false,
                                 knockoutOnBlank: false,
                                 knockoutFailValues: [],
@@ -7442,6 +7532,12 @@
                         return;
                     }
 
+                    if (e.target.matches?.(`input[name="q_section_${idx}"]`)) {
+                        const qs = syncBuilderFromDom();
+                        window.__siteSurveyBuilderQuestions = qs;
+                        renderBuilder();
+                        return;
+                    }
                     // Branching controls: sync + re-render so Value becomes a choice dropdown for radio/multiselect parents
                     if (e.target.matches?.(`select[name="q_logic_qid_${idx}"], select[name="q_logic_op_${idx}"]`)) {
                         const qs = syncBuilderFromDom();
@@ -13563,7 +13659,8 @@
                                 };
                             }).filter(o => o.value);
                         }
-                        const category = (questionsRoot.querySelector(`[name="q_category_${idx}"]`)?.value || 'General').trim() || 'General';
+                        const category = (questionsRoot.querySelector(`[name="q_category_${idx}"]`)?.value || q.category || 'General').trim() || 'General';
+                        const section = (questionsRoot.querySelector(`[name="q_section_${idx}"]`)?.value || q.section || 'Page 1').trim() || 'Page 1';
                         const knockoutOnBlank = scoreOn && !!questionsRoot.querySelector(`[name="q_knockout_blank_${idx}"]`)?.checked;
                         const failRaw = questionsRoot.querySelector(`[name="q_knockout_fails_${idx}"]`)?.value || '';
                         const knockoutFailValues = scoreOn
@@ -13598,6 +13695,7 @@
                             scoringWeight,
                             scoringOptions: scoreOn ? scoringOptions : [],
                             category,
+                            section,
                             knockout,
                             knockoutOnBlank,
                             knockoutFailValues,

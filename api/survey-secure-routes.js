@@ -195,9 +195,9 @@ function publicQuestionsFromList(questions) {
             fromGeneralFeasibility: q._fromGeneralFeasibility === true,
             sensitivity: q.sensitivity === 'pii' || q.sensitivity === 'phi' ? q.sensitivity : 'none',
             defaultValue: q.defaultValue,
-            // Section / paging metadata for the public multi-page form
-            category: q.category || q.section || undefined,
-            section: q.section || q.category || undefined,
+            // Section = survey page (builder). Category = scoring taxonomy only.
+            category: q.category || undefined,
+            section: q.section || undefined,
             help: meaningfulQuestionHelp(q.help || q.context || q.description),
             maxStars: q.maxStars || q.max || undefined,
             docxNum: typeof q.docxNum === 'number' ? q.docxNum : undefined,
@@ -208,9 +208,16 @@ function publicQuestionsFromList(questions) {
 /** Group questions into ordered section pages for the public form. */
 function buildSurveyPages(questions) {
     const list = Array.isArray(questions) ? questions : [];
+    const anyExplicitSection = list.some((q) => String(q?.section || '').trim());
     const pages = [];
     list.forEach((q, idx) => {
-        const key = String(q.category || q.section || '').trim() || 'Questions';
+        let key;
+        if (anyExplicitSection) {
+            key = String(q.section || '').trim() || 'Page 1';
+        } else {
+            // Legacy GF templates used category as the page title
+            key = String(q.section || q.category || '').trim() || 'Questions';
+        }
         if (!pages.length || pages[pages.length - 1].key !== key) {
             pages.push({
                 key,
