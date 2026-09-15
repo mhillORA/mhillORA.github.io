@@ -8019,9 +8019,8 @@
                     const lib = String(q?.libraryQuestionId || '').trim();
                     if (lib) libToQid.set(lib, qid);
                     const lab = normalizeSurveyDeltaLabel(q?.label || q?.title);
-                    if (lab && !labelToQid.has(lab)) labelToQid.set(lab, qid);
-                    const base = lab.includes(' | ') ? lab.split(' | ')[0].trim() : lab;
-                    if (base && !labelToQid.has(base)) labelToQid.set(base, qid);
+                    // Full label only — stem matches ("Name", "Address") inflate coverage to ~100%.
+                    if (lab && lab.length >= 12 && !labelToQid.has(lab)) labelToQid.set(lab, qid);
                 });
                 return { qidSet, libToQid, labelToQid, total: qidSet.size };
             };
@@ -8034,8 +8033,10 @@
                     if (!r || r._archived || !ids.has(r.siteId)) return;
                     asSurveyList(r.answers).forEach((a) => {
                         if (!readSurveyAnswerValue(a)) return;
-                        const bridgedLib = resolveAnswerLibraryId(a);
-                        const lib = bridgedLib || String(a?.libraryQuestionId || '').trim();
+                        // Coverage = exact concept match only (library id or question id).
+                        // Do NOT use GF bible fallbacks / fuzzy label stems — those fake 100%.
+                        const lib = String(a?.libraryQuestionId || '').trim()
+                            || String(resolveSourceLibraryId(a) || '').trim();
                         const qid = String(a?.questionId || a?.id || '').trim();
                         if (lib && index.libToQid.has(lib)) {
                             answered.add(index.libToQid.get(lib));
@@ -8046,13 +8047,8 @@
                             return;
                         }
                         const lab = normalizeSurveyDeltaLabel(a?.label || a?.title);
-                        if (lab && index.labelToQid.has(lab)) {
+                        if (lab && lab.length >= 12 && index.labelToQid.has(lab)) {
                             answered.add(index.labelToQid.get(lab));
-                            return;
-                        }
-                        const base = lab.includes(' | ') ? lab.split(' | ')[0].trim() : '';
-                        if (base && index.labelToQid.has(base)) {
-                            answered.add(index.labelToQid.get(base));
                         }
                     });
                 });
@@ -8073,7 +8069,7 @@
                     ? Math.round((1000 * sendFilled) / sendIndex.total) / 10
                     : 0;
 
-                // Best completion among surveys this site actually answered (qid/label overlap).
+                // Best completion among surveys this site actually answered (for tooltip only).
                 const ids = siteIdsForSurveyLookup(site.id);
                 const answeredSurveyIds = new Set();
                 (allSiteSurveyResponses || []).forEach((r) => {
@@ -8082,8 +8078,6 @@
                         answeredSurveyIds.add(String(r.surveyId));
                     }
                 });
-                // Always consider GF as a coverage target when history exists
-                if (answeredSurveyIds.size) answeredSurveyIds.add('survey-general-feasibility');
 
                 let best = null;
                 answeredSurveyIds.forEach((sid) => {
@@ -8106,16 +8100,17 @@
                 });
 
                 const historyPct = best ? best.pct : 0;
-                const displayPct = Math.max(sendPct, historyPct);
-                if (!displayPct) {
+                // Badge = overlap with THIS send packet only — never max() with an unrelated survey's 100%.
+                const displayPct = sendPct;
+                if (!displayPct && !historyPct) {
                     priorLikelihoodCache.set(cacheKey, null);
                     return null;
                 }
                 const row = {
                     likelihoodPct: displayPct,
                     mappedLikelihoodPct: displayPct,
-                    filled: best && historyPct >= sendPct ? best.filled : sendFilled,
-                    total: best && historyPct >= sendPct ? best.total : sendIndex.total,
+                    filled: sendFilled,
+                    total: sendIndex.total,
                     sendPct,
                     sendFilled,
                     sendTotal: sendIndex.total,
@@ -8130,7 +8125,7 @@
 
             const likelihoodBadge = (row) => {
                 if (!row) {
-                    return `<span class="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 dark:bg-gray-700 dark:text-gray-300" title="No prior feasibility answers on file">0%</span>`;
+                    return `<span class="text-[10px] font-semibold px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 dark:bg-gray-700 dark:text-gray-300" title="No answers that match this send packet">0%</span>`;
                 }
                 const pct = Number(row.mappedLikelihoodPct ?? row.likelihoodPct) || 0;
                 const cls = pct >= 40
@@ -8139,11 +8134,11 @@
                         ? 'bg-amber-100 text-amber-900 dark:bg-amber-900/40 dark:text-amber-100'
                         : 'bg-slate-100 text-slate-700 dark:bg-slate-700 dark:text-slate-200';
                 const tipParts = [];
-                if (row.historyPct) {
-                    tipParts.push(`Prior feasibility ${row.historyPct}% (${row.historyFilled}/${row.historyTotal}${row.historyTitle ? ` · ${row.historyTitle}` : ''})`);
-                }
                 if (row.sendTotal) {
                     tipParts.push(`Prefill on this send ${row.sendPct || 0}% (${row.sendFilled || 0}/${row.sendTotal})`);
+                }
+                if (row.historyPct) {
+                    tipParts.push(`Best prior survey ${row.historyPct}% (${row.historyFilled}/${row.historyTotal}${row.historyTitle ? ` · ${row.historyTitle}` : ''})`);
                 }
                 const tip = tipParts.join(' · ') || `${row.filled || 0}/${row.total || 0} answered`;
                 return `<span class="text-[10px] font-semibold px-1.5 py-0.5 rounded ${cls}" title="${escapeHtml(tip)}">${pct}%</span>`;
