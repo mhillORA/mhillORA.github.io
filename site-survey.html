@@ -1095,19 +1095,86 @@
       });
     }
 
+    function cssEsc(name) {
+      if (typeof CSS !== 'undefined' && CSS.escape) return CSS.escape(String(name || ''));
+      return String(name || '').replace(/["\\]/g, '\\$&');
+    }
+
+    function normLogicToken(s) {
+      return String(s ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
+    }
+
+    /** Yes/No (and common aliases) should match regardless of casing/punctuation. */
+    function logicTokensEquivalent(a, b) {
+      const x = normLogicToken(a);
+      const y = normLogicToken(b);
+      if (!x || !y) return false;
+      if (x === y) return true;
+      const yes = new Set(['yes', 'y', 'true']);
+      const no = new Set(['no', 'n', 'false']);
+      if (yes.has(x) && yes.has(y)) return true;
+      if (no.has(x) && no.has(y)) return true;
+      // "Other (please specify)" vs "Other"
+      if (x.startsWith(y + ' ') || y.startsWith(x + ' ')) return true;
+      if (x.startsWith('other') && y === 'other') return true;
+      if (y.startsWith('other') && x === 'other') return true;
+      return false;
+    }
+
+    function selectedHasValue(selected, want) {
+      const w = String(want ?? '').trim();
+      if (!w) return false;
+      return (selected || []).some((s) => logicTokensEquivalent(s, w));
+    }
+
+    /**
+     * Read current answer(s) for a dependency question id.
+     * Critical: radio grids AND checkbox groups both use data-qid-group — do not
+     * treat every group as multiselect (that bug made Yes/No branching always fail).
+     */
     function readLogicCurrent(form, dep) {
-      const esc = CSS.escape ? CSS.escape(dep) : dep;
-      const multi = form.querySelector(`[data-qid-group="${esc}"]`);
-      if (multi) {
-        return [...form.querySelectorAll(`input[type="checkbox"][name="${esc}"]:checked`)]
+      if (!form || !dep) return [];
+      const esc = cssEsc(dep);
+      const row = form.querySelector(`.q[data-qid="${esc}"]`) || null;
+      const scope = row || form;
+
+      const isConfirm = (el) => !!(
+        el?.hasAttribute?.('data-confirm-for')
+        || String(el?.name || '').endsWith('__confirmed')
+        || el?.closest?.('.q-confirm')
+      );
+
+      // Multiselect / checkboxes (answer options only)
+      const multiBoxes = [...scope.querySelectorAll(`input[type="checkbox"][name="${esc}"]`)]
+        .filter((el) => !isConfirm(el));
+      if (multiBoxes.length) {
+        return multiBoxes.filter((el) => el.checked)
           .map((el) => String(el.value || '').trim())
           .filter(Boolean);
       }
-      const radios = [...form.querySelectorAll(`input[type="radio"][name="${esc}"]:checked`)];
+
+      // Radio (Yes/No and choice grids) — most branching depends on this
+      const radios = [...scope.querySelectorAll(`input[type="radio"][name="${esc}"]`)];
       if (radios.length) {
-        return radios.map((el) => String(el.value || '').trim()).filter(Boolean);
+        return radios.filter((el) => el.checked)
+          .map((el) => String(el.value || '').trim())
+          .filter(Boolean);
       }
-      const ctrl = qsByName(form, dep);
+
+      // Star rating hidden input
+      const rating = scope.querySelector(`input[data-rating-input="true"][name="${esc}"]`);
+      if (rating) {
+        const v = String(rating.value || '').trim();
+        return v ? [v] : [];
+      }
+
+      // Native select / text / number / date / textarea
+      const ctrl = qsByName(scope, dep) || qsByName(form, dep)
+        || scope.querySelector(`#${esc}`)
+        || form.querySelector(`#${esc}`);
+      if (ctrl && ctrl.type === 'checkbox') {
+        return ctrl.checked ? [String(ctrl.value || 'on').trim()].filter(Boolean) : [];
+      }
       const v = String(ctrl?.value || '').trim();
       return v ? [v] : [];
     }
@@ -1116,33 +1183,34 @@
       const dep = row.getAttribute('data-show-if-qid');
       if (!dep) return true;
       const selected = readLogicCurrent(form, dep);
-      const selectedLower = selected.map((s) => s.toLowerCase());
       const equals = row.getAttribute('data-show-if-equals');
       const includes = row.getAttribute('data-show-if-includes');
       const includesAny = row.getAttribute('data-show-if-includes-any');
       const notOnly = row.getAttribute('data-show-if-not-only');
       const notEmpty = row.getAttribute('data-show-if-not-empty') === 'true';
 
-      // Prefer explicit operators; fall back to equals for legacy attrs.
+      // Prefer explicit operators. equals/includes both mean "any selected value matches"
+      // so radio Yes/No and checkbox Other behave the same for authors.
       if (includes != null && includes !== '') {
-        return selectedLower.includes(String(includes).trim().toLowerCase());
+        return selectedHasValue(selected, includes);
       }
       if (includesAny != null && includesAny !== '') {
-        const wants = String(includesAny).split('||').map((s) => s.trim().toLowerCase()).filter(Boolean);
-        return wants.some((w) => selectedLower.includes(w));
+        const wants = String(includesAny).split('||').map((s) => s.trim()).filter(Boolean);
+        return wants.some((w) => selectedHasValue(selected, w));
       }
       if (notOnly != null && notOnly !== '') {
-        const exclude = String(notOnly).trim().toLowerCase();
-        return selectedLower.some((s) => s !== exclude);
+        if (!selected.length) return false;
+        return selected.some((s) => !logicTokensEquivalent(s, notOnly));
       }
       if (notEmpty) {
         return selected.length > 0;
       }
-      if (equals != null) {
-        // Case-insensitive exact match for single-value; for multi, joined string equality kept for back-compat
-        const want = String(equals).trim().toLowerCase();
-        if (selected.length <= 1) return (selected[0] || '').toLowerCase() === want;
-        return selected.join(', ').trim().toLowerCase() === want;
+      if (equals != null && equals !== '') {
+        return selectedHasValue(selected, equals);
+      }
+      // Legacy: showIf with only questionId → treat as "is answered"
+      if (dep && equals == null && includes == null && includesAny == null && notOnly == null && !notEmpty) {
+        return selected.length > 0;
       }
       return true;
     }
