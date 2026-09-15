@@ -25,6 +25,13 @@ SURVEY_ID = "survey-rebuild-mytx272am-201"
 MOST_RECENT = (
     "Most Recent Dry AMD Studies (repeat for each of the 3 most recent studies)"
 )
+# AF has 9 SECTION headers; "Most Recent Dry AMD Studies" is a subsection of SITE PROFILE,
+# not its own survey page.
+SITE_PROFILE = "SECTION 3: SITE PROFILE"
+SECTION_ALIASES = {
+    MOST_RECENT: SITE_PROFILE,
+    "most recent dry amd studies": SITE_PROFILE,
+}
 
 
 def cosmos_defs():
@@ -67,6 +74,18 @@ def build_pages(qs: list) -> list:
     return pages
 
 
+def canonicalize_section(s: str) -> str:
+    t = (s or "").strip()
+    if not t:
+        return t
+    if t in SECTION_ALIASES:
+        return SECTION_ALIASES[t]
+    low = t.lower()
+    if low.startswith("most recent dry amd"):
+        return SITE_PROFILE
+    return t
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true")
@@ -96,14 +115,14 @@ def main():
         src = by_label.get(key)
         target = None
 
-        # Exact AF label → AF section
+        # Exact AF label → AF section (then fold Most Recent into SITE PROFILE)
         if src and src.get("section"):
-            target = str(src["section"])
-        # Study #N enrollment/period rows belong with the Most Recent block
+            target = canonicalize_section(str(src["section"]))
+        # Study #N enrollment/period rows belong in SITE PROFILE (AF §3)
         elif re.match(r"^study\s*#?\s*[123]\s*:", label, re.I) or re.search(
             r"number of subjects enrolled|length of enrollment period", label, re.I
         ):
-            target = MOST_RECENT
+            target = SITE_PROFILE
         # Branch follow-ups → parent section
         elif (nq.get("logic") or {}).get("showIf", {}).get("questionId"):
             pid = str(nq["logic"]["showIf"]["questionId"])
@@ -114,13 +133,22 @@ def main():
             target = last_strong
         # Else keep current if strong
         if not target and not is_weak(str(nq.get("section") or "")):
-            target = str(nq["section"]).strip()
+            target = canonicalize_section(str(nq["section"]).strip())
+
+        if target:
+            target = canonicalize_section(target)
 
         if target and str(nq.get("section") or "") != target:
             nq["section"] = target
             changed += 1
         elif target:
             nq["section"] = target
+
+        # Final fold for any leftover Most Recent heading
+        folded = canonicalize_section(str(nq.get("section") or ""))
+        if folded and folded != str(nq.get("section") or ""):
+            nq["section"] = folded
+            changed += 1
 
         if not is_weak(str(nq.get("section") or "")):
             last_strong = str(nq["section"]).strip()
@@ -130,18 +158,13 @@ def main():
 
         new_qs.append(nq)
 
-    # Second pass: follow-ups whose parent appears later/earlier now resolved
+    # Second pass: follow-ups inherit parent page
     for nq in new_qs:
         show = ((nq.get("logic") or {}).get("showIf") or {}).get("questionId")
         if not show:
             continue
         parent_sec = parent_section.get(str(show))
         if parent_sec and str(nq.get("section") or "") != parent_sec:
-            # Don't yank Most Recent study rows back to SITE PROFILE
-            if str(nq.get("section") or "") == MOST_RECENT:
-                continue
-            if re.match(r"^study\s*#?\s*[123]\s*:", str(nq.get("label") or ""), re.I):
-                continue
             nq["section"] = parent_sec
             changed += 1
 
@@ -154,6 +177,8 @@ def main():
     print(f"pages: {len(pages)}")
     for p in pages:
         print(f"  {len(p['questionIds']):3d}  {p['title'][:70]}")
+    if len(pages) != 9:
+        print(f"WARNING: expected 9 AF SECTION pages, got {len(pages)}")
 
     if not args.apply:
         print("Dry run only. Re-run with --apply to write Cosmos.")

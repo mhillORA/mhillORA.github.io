@@ -677,6 +677,45 @@ const validateSurveyDefinitionsSchema = (data) => {
     if (errors.length > 0) throw new Error(`VALIDATION_ERROR: SurveyDefinitions validation failed: ${errors.join(', ')}`);
     data.audience = normalizeSurveyAudience(data.audience);
     if (data.isPredefined != null) data.isPredefined = Boolean(data.isPredefined);
+    // Keep default "Page 1" follow-ups on the prior real section so AF-style surveys
+    // don't explode from ~10 pages to ~39 on every builder save.
+    if (Array.isArray(data.questions) && data.questions.length) {
+        let lastReal = '';
+        data.questions = data.questions.map((q) => {
+            if (!q || typeof q !== 'object') return q;
+            const raw = String(q.section || '').trim();
+            const isDefaultPage1 = !raw || /^page\s*1$/i.test(raw) || /^questions$/i.test(raw);
+            let section = raw;
+            if (isDefaultPage1 && lastReal) section = lastReal;
+            else if (raw && !isDefaultPage1) lastReal = raw;
+            else if (!lastReal) {
+                section = raw || 'Page 1';
+                lastReal = section;
+            } else if (!section) section = lastReal;
+            const parentId = q.logic?.showIf?.questionId;
+            if (parentId && isDefaultPage1) {
+                const parent = data.questions.find((x) => x && String(x.id || '') === String(parentId));
+                const pSec = String(parent?.section || '').trim();
+                if (pSec && !/^page\s*1$/i.test(pSec) && !/^questions$/i.test(pSec)) section = pSec;
+            }
+            return { ...q, section };
+        });
+        const pages = [];
+        data.questions.forEach((q, idx) => {
+            const key = String(q?.section || 'Questions').trim() || 'Questions';
+            if (!pages.length || pages[pages.length - 1].key !== key) {
+                pages.push({
+                    key,
+                    title: key.replace(/^SECTION\s+\d+\s*:\s*/i, '').trim() || key,
+                    questionIds: [],
+                    indexes: [],
+                });
+            }
+            pages[pages.length - 1].questionIds.push(q.id || `q_${idx}`);
+            pages[pages.length - 1].indexes.push(idx);
+        });
+        data.pages = pages;
+    }
     return true;
 };
 

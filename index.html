@@ -6407,6 +6407,60 @@
             return 'Page 1';
         };
 
+        /**
+         * Keep follow-ups on the prior real page when they still say the default "Page 1".
+         * Intentional Page 2+ / named sections are left alone. Stops AF's 10 sections from
+         * exploding into ~39 pages every time someone saves the builder.
+         */
+        const normalizeSurveyQuestionSections = (questions) => {
+            const list = asSurveyList(questions);
+            let lastReal = '';
+            return list.map((q) => {
+                const raw = String(q?.section || '').trim();
+                const isDefaultPage1 = !raw || /^page\s*1$/i.test(raw) || /^questions$/i.test(raw);
+                let section = raw;
+                if (isDefaultPage1 && lastReal) {
+                    section = lastReal;
+                } else if (raw && !isDefaultPage1) {
+                    lastReal = raw;
+                } else if (!lastReal && (raw || section)) {
+                    lastReal = section || 'Page 1';
+                    section = lastReal;
+                } else if (!section) {
+                    section = lastReal || 'Page 1';
+                    if (!lastReal) lastReal = section;
+                }
+                // Branch follow-ups: prefer parent page when still on default Page 1
+                const parentId = q?.logic?.showIf?.questionId;
+                if (parentId && isDefaultPage1) {
+                    const parent = list.find((x) => String(x?.id || '') === String(parentId));
+                    const pSec = String(parent?.section || '').trim();
+                    if (pSec && !/^page\s*1$/i.test(pSec) && !/^questions$/i.test(pSec)) {
+                        section = pSec;
+                    }
+                }
+                return { ...q, section };
+            });
+        };
+
+        const rebuildDefinitionPages = (questions) => {
+            const pages = [];
+            asSurveyList(questions).forEach((q, idx) => {
+                const key = String(q?.section || 'Questions').trim() || 'Questions';
+                if (!pages.length || pages[pages.length - 1].key !== key) {
+                    pages.push({
+                        key,
+                        title: key.replace(/^SECTION\s+\d+\s*:\s*/i, '').trim() || key,
+                        questionIds: [],
+                        indexes: [],
+                    });
+                }
+                pages[pages.length - 1].questionIds.push(q.id || `q_${idx}`);
+                pages[pages.length - 1].indexes.push(idx);
+            });
+            return pages;
+        };
+
         /** Ensure each survey question has libraryQuestionId + canonical type for cross-survey normalize/prefill. */
         const ensureQuestionsLinkedToLibrary = async (questions) => {
             let lib = asSurveyList(allSiteSurveyQuestionLibrary).filter((q) => q && q.status !== 'archived');
@@ -6715,7 +6769,7 @@
                         if (next) q.logic.showIf.questionId = next;
                     });
                 }
-                return mapped;
+                return normalizeSurveyQuestionSections(mapped);
             };
 
             const fromDef = cloneQuestionsFromDef();
@@ -14219,6 +14273,9 @@
 
                     // Link/create library entries so types + identity normalize across surveys going forward
                     questions = await ensureQuestionsLinkedToLibrary(questions);
+                    // Don't let default "Page 1" follow-ups shatter AF sections on every save
+                    questions = normalizeSurveyQuestionSections(questions);
+                    const pages = rebuildDefinitionPages(questions);
 
                     // Default values are optional; for now keep empty object (future UI can populate)
                     const defaultValues = {};
@@ -14236,6 +14293,7 @@
                             audience: normalizeSurveyAudience(audience),
                             status,
                             questions,
+                            pages,
                             passThreshold,
                             borderlineThreshold,
                             scoring,
@@ -14267,6 +14325,7 @@
                             audience: normalizeSurveyAudience(audience),
                             status,
                             questions,
+                            pages,
                             passThreshold,
                             borderlineThreshold,
                             scoring,

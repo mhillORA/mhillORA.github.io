@@ -166,10 +166,17 @@ def parse_docx(path: Path) -> tuple[list[dict], dict]:
     for style, text in paras:
         if not text:
             continue
-        if SECTION_RE.match(text) or (style.startswith("Heading") and not STUDY_RE.match(text)):
+        # Only true "SECTION N: …" headings start a new survey page.
+        # Other Word headings (e.g. "Most Recent Dry AMD Studies…") stay under the current SECTION.
+        if SECTION_RE.match(text):
             flush()
             section = clean_section(text)
             study_ctx = ""
+            continue
+        if style.startswith("Heading") and not STUDY_RE.match(text) and not SECTION_RE.match(text):
+            # Subsection label — keep for category, do not change page section
+            study_ctx = ""
+            # leave `section` as the current SECTION N
             continue
         sm = STUDY_RE.match(text)
         if sm:

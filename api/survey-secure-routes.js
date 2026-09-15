@@ -309,8 +309,11 @@ function sectionForDocxNum(n) {
 
 function resolvePublicSectionKey(q) {
     const section = String(q?.section || '').trim();
-    const weakSection = !section || /^(page\s*\d+|questions)$/i.test(section);
-    if (section && !weakSection) return section;
+    // Strong builder page title (e.g. SECTION 4: …) wins.
+    if (section && !/^(page\s*\d+|questions)$/i.test(section)) return section;
+    // Explicit "Page 1" is a weak default — do NOT fall back to scoring category.
+    // Category fallback was inventing phantom pages (39 instead of AF's 10).
+    if (/^page\s*\d+$/i.test(section) || /^questions$/i.test(section)) return section;
     const legacy = String(q?.category || '').trim();
     if (legacy && !/^(general|questions|page\s*\d+)$/i.test(legacy)) return legacy;
     const fromNum = sectionForDocxNum(q?.docxNum);
