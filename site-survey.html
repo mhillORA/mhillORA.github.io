@@ -772,6 +772,56 @@
       return data;
     }
 
+    /** Fire-and-forget bug report to Cosmos (via API). Never includes answers. */
+    const __bugLogSeen = new Map();
+    function reportSurveyBug({ code, message, context } = {}) {
+      if (isPreview || !token) return;
+      const msg = String(message || 'Unknown error').slice(0, 500);
+      const c = String(code || 'client_error').slice(0, 80);
+      const key = `${c}|${msg.slice(0, 120)}`;
+      const now = Date.now();
+      const last = __bugLogSeen.get(key) || 0;
+      if (now - last < 15000) return; // dedupe identical errors for 15s
+      __bugLogSeen.set(key, now);
+      const safeContext = {
+        ...(context && typeof context === 'object' ? context : {}),
+        path: String(location.pathname || '').slice(0, 200),
+        ua: String(navigator.userAgent || '').slice(0, 180),
+      };
+      // Strip anything that looks like answer payload
+      delete safeContext.answers;
+      delete safeContext.answer;
+      delete safeContext.value;
+      fetch(`${API}/public/site-survey/log`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          t: token,
+          code: c,
+          message: msg,
+          level: 'client',
+          context: safeContext,
+        }),
+        keepalive: true,
+      }).catch(() => { /* never block UX */ });
+    }
+
+    window.addEventListener('error', (ev) => {
+      reportSurveyBug({
+        code: 'js_error',
+        message: ev?.message || 'window.onerror',
+        context: { source: 'window.onerror', action: 'js' },
+      });
+    });
+    window.addEventListener('unhandledrejection', (ev) => {
+      const reason = ev?.reason;
+      reportSurveyBug({
+        code: 'unhandled_rejection',
+        message: reason?.message || String(reason || 'unhandledrejection'),
+        context: { source: 'unhandledrejection', action: 'js' },
+      });
+    });
+
     const passwordStorageKey = () => `ora-survey-pw:${token || ''}`;
     function getStoredSurveyPassword() {
       if (!token) return '';
@@ -828,6 +878,11 @@
           }
           renderSurvey(unlocked);
         } catch (err) {
+          reportSurveyBug({
+            code: 'unlock_failed',
+            message: err.message || 'Incorrect password',
+            context: { action: 'unlock', status: err.status || 401 },
+          });
           renderPasswordGate(payload, err.message || 'Incorrect password');
         } finally {
           const again = document.getElementById('unlock-btn');
@@ -1681,6 +1736,11 @@
           dirty = true;
           if (saveHint) saveHint.textContent = 'Draft save failed — tap Save draft';
           console.warn('page-change draft save failed', err?.message || err);
+          reportSurveyBug({
+            code: 'draft_save_failed',
+            message: err?.message || String(err),
+            context: { action: 'draft', saveReason: reason, status: err?.status, pageIndex },
+          });
         } finally {
           draftSaving = false;
           if (draftQueued) {
@@ -1801,6 +1861,11 @@
             msg,
             'err'
           );
+          reportSurveyBug({
+            code: action === 'submit' ? 'submit_failed' : 'draft_save_failed',
+            message: msg,
+            context: { action, status: err.status, pageIndex },
+          });
         } finally {
           if (document.getElementById('survey-form')) {
             draftBtn.disabled = false;
@@ -1894,6 +1959,11 @@
             : (err.message || String(err)),
           'err'
         );
+        reportSurveyBug({
+          code: err.status === 410 ? 'link_expired' : 'load_failed',
+          message: err.message || String(err),
+          context: { action: 'load', status: err.status, source: isPreview ? 'preview' : 'invite' },
+        });
       }
     })();
   </script>

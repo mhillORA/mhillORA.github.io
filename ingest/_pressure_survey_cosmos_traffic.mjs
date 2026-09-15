@@ -37,7 +37,7 @@ const args = Object.fromEntries(
     return m ? [m[1], m[2] ?? true] : [a, true];
   })
 );
-const COUNT = Math.max(4, Math.min(80, Number(args.count || 36) || 36));
+const COUNT = Math.max(4, Math.min(500, Number(args.count || 36) || 36));
 const REORDER_ROUNDS = Math.max(2, Math.min(40, Number(args.reorder || 12) || 12));
 const KEEP = args.keep === true || args.keep === 'true';
 const SOURCE_SURVEY = String(args.survey || 'survey-rebuild-mytx272am-201');

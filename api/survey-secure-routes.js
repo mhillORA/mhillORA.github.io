@@ -260,6 +260,79 @@ async function writeNotification(deps, entry) {
     return doc;
 }
 
+const SAFE_LOG_CONTEXT_KEYS = new Set([
+    'action',
+    'pageIndex',
+    'status',
+    'href',
+    'path',
+    'ua',
+    'userAgent',
+    'saveReason',
+    'code',
+    'source',
+    'preview',
+]);
+
+function sanitizeSurveyLogContext(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+    const out = {};
+    for (const [k, v] of Object.entries(raw)) {
+        if (!SAFE_LOG_CONTEXT_KEYS.has(k)) continue;
+        if (v == null) continue;
+        if (typeof v === 'number' && Number.isFinite(v)) {
+            out[k] = v;
+            continue;
+        }
+        if (typeof v === 'boolean') {
+            out[k] = v;
+            continue;
+        }
+        const s = String(v).trim();
+        if (!s) continue;
+        if (k === 'ua' || k === 'userAgent') out.ua = s.slice(0, 180);
+        else if (k === 'href' || k === 'path') out.path = s.slice(0, 200);
+        else out[k] = s.slice(0, 120);
+    }
+    return Object.keys(out).length ? out : undefined;
+}
+
+function trimErrorMessage(msg) {
+    return String(msg || 'Unknown error').replace(/\s+/g, ' ').trim().slice(0, 500);
+}
+
+async function writeSurveyBugNotification(deps, {
+    level = 'client',
+    code,
+    message,
+    context,
+    assignment = null,
+    siteName = null,
+    ip = null,
+}) {
+    const kind = String(level).toLowerCase() === 'server' ? 'survey_server_error' : 'survey_client_error';
+    const errorMessage = trimErrorMessage(message);
+    const errorCode = String(code || 'client_error').trim().slice(0, 80) || 'client_error';
+    const safeContext = sanitizeSurveyLogContext(context);
+    const role = assignment?.targetRole ? roleLabel(assignment.targetRole) : null;
+    const where = siteName || assignment?.siteId || 'unknown site';
+    const summary = `${errorCode.replace(/_/g, ' ')} · ${where}${role ? ` · ${role}` : ''}`.slice(0, 200);
+    return writeNotification(deps, {
+        kind,
+        summary,
+        siteId: assignment?.siteId || null,
+        siteName: siteName || null,
+        surveyId: assignment?.surveyId || null,
+        assignmentId: assignment?.id || null,
+        targetRole: assignment?.targetRole || null,
+        tokenPrefix: assignment?.tokenPrefix || null,
+        errorCode,
+        errorMessage,
+        context: safeContext,
+        clientIp: ip ? String(ip).slice(0, 64) : undefined,
+    });
+}
+
 async function findAssignmentByToken(getContainer, rawToken) {
     const hash = hashSurveyToken(rawToken);
     const c = getContainer(ASSIGNMENTS);
@@ -691,6 +764,15 @@ function registerSurveySecureRoutes(app, deps) {
                 headers: corsHeaders(),
             };
         } catch (error) {
+            try {
+                await writeSurveyBugNotification(deps, {
+                    level: 'server',
+                    code: 'public_get_failed',
+                    message: error?.message || String(error),
+                    context: { action: 'get', source: 'server' },
+                    ip: clientIp(request),
+                });
+            } catch (_) { /* ignore */ }
             return handleError(context, error, 'public/site-survey GET');
         }
     };
@@ -701,10 +783,12 @@ function registerSurveySecureRoutes(app, deps) {
             return { status: 429, jsonBody: { error: 'Too many requests' }, headers: corsHeaders() };
         }
 
+        let assignmentForLog = null;
+        let actionForLog = 'submit';
         try {
             const body = await request.json();
             const raw = body?.t || body?.token;
-            const action = String(body?.action || 'submit').toLowerCase();
+            actionForLog = String(body?.action || 'submit').toLowerCase();
             if (!raw) {
                 return {
                     status: 400,
@@ -714,6 +798,8 @@ function registerSurveySecureRoutes(app, deps) {
             }
 
             const assignment = await findAssignmentByToken(getContainer, raw);
+            assignmentForLog = assignment;
+            const action = actionForLog;
             const bad = assertTokenUsable(assignment);
             if (bad) {
                 return { status: bad.status, jsonBody: { error: bad.error }, headers: corsHeaders() };
@@ -898,6 +984,21 @@ function registerSurveySecureRoutes(app, deps) {
                 headers: corsHeaders(),
             };
         } catch (error) {
+            try {
+                let siteName = null;
+                if (assignmentForLog?.siteId) {
+                    siteName = await resolveSiteName(getContainer, assignmentForLog.siteId).catch(() => null);
+                }
+                await writeSurveyBugNotification(deps, {
+                    level: 'server',
+                    code: 'public_post_failed',
+                    message: error?.message || String(error),
+                    context: { action: actionForLog, source: 'server' },
+                    assignment: assignmentForLog,
+                    siteName,
+                    ip,
+                });
+            } catch (_) { /* ignore */ }
             return handleError(context, error, 'public/site-survey POST');
         }
     };
@@ -918,6 +1019,64 @@ function registerSurveySecureRoutes(app, deps) {
                 return handlePublicSiteSurveyPost(request, context);
             }
             return { status: 405, jsonBody: { error: 'Method not allowed' }, headers: corsHeaders() };
+        },
+    });
+
+    // ---------- Public: client bug / error log (no answers / PHI) ----------
+    app.http('publicSiteSurveyLog', {
+        methods: ['POST', 'OPTIONS'],
+        authLevel: 'anonymous',
+        route: 'public/site-survey/log',
+        handler: async (request, context) => {
+            if (request.method === 'OPTIONS') {
+                return { status: 204, headers: corsHeaders() };
+            }
+            const ip = clientIp(request);
+            if (!rateLimit(`log:${ip}`, 20, 60_000)) {
+                return { status: 429, jsonBody: { error: 'Too many requests' }, headers: corsHeaders() };
+            }
+            try {
+                const body = await request.json().catch(() => ({}));
+                const raw = body?.t || body?.token || '';
+                const message = trimErrorMessage(body?.message || body?.error || 'Client error');
+                const code = String(body?.code || 'client_error').trim().slice(0, 80) || 'client_error';
+                const level = String(body?.level || 'client').toLowerCase() === 'server' ? 'server' : 'client';
+
+                let assignment = null;
+                if (raw) {
+                    try {
+                        assignment = await findAssignmentByToken(getContainer, raw);
+                    } catch (_) {
+                        assignment = null;
+                    }
+                }
+                if (assignment?.id && !rateLimit(`log:asg:${assignment.id}`, 30, 60_000)) {
+                    return { status: 429, jsonBody: { error: 'Too many reports for this invite' }, headers: corsHeaders() };
+                }
+
+                let siteName = null;
+                if (assignment?.siteId) {
+                    siteName = await resolveSiteName(getContainer, assignment.siteId).catch(() => null);
+                }
+
+                const doc = await writeSurveyBugNotification(deps, {
+                    level,
+                    code,
+                    message,
+                    context: body?.context,
+                    assignment,
+                    siteName,
+                    ip,
+                });
+
+                return {
+                    status: 201,
+                    jsonBody: { ok: true, id: doc?.id || null },
+                    headers: corsHeaders(),
+                };
+            } catch (error) {
+                return handleError(context, error, 'public/site-survey/log');
+            }
         },
     });
 
@@ -1546,4 +1705,7 @@ module.exports = {
     redactAssignment,
     buildInviteUrl,
     NOTIFICATIONS,
+    writeSurveyBugNotification,
+    sanitizeSurveyLogContext,
+    trimErrorMessage,
 };
