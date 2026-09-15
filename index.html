@@ -6317,9 +6317,18 @@
                 let libraryQuestionId = q.libraryQuestionId || null;
                 if (libraryQuestionId && byId.has(libraryQuestionId)) {
                     const canon = byId.get(libraryQuestionId);
+                    // Keep the builder's type/options — never let a library mismatch demote radio/checkbox → text
+                    const canonType = normalizeSurveyQuestionType(canon.type || type);
+                    const keepType = SURVEY_QUESTION_TYPES.includes(String(q.type || '').toLowerCase())
+                        ? type
+                        : canonType;
+                    const keepOpts = isChoiceQuestionType(keepType)
+                        ? (coerceOptionList(q.options).length ? coerceOptionList(q.options) : coerceOptionList(canon.options))
+                        : [];
                     out.push({
                         ...q,
-                        type: normalizeSurveyQuestionType(canon.type || type),
+                        type: keepType,
+                        options: keepOpts,
                         libraryQuestionId,
                     });
                     continue;
@@ -6327,7 +6336,19 @@
                 const key = `${normalizeLibraryLabelKey(label)}::${type}`;
                 let hit = byLabelType.get(key) || byLabel.get(normalizeLibraryLabelKey(label));
                 if (hit) {
-                    out.push({ ...q, type: normalizeSurveyQuestionType(hit.type || type), libraryQuestionId: hit.id });
+                    const hitType = normalizeSurveyQuestionType(hit.type || type);
+                    const keepType = SURVEY_QUESTION_TYPES.includes(String(q.type || '').toLowerCase())
+                        ? type
+                        : hitType;
+                    const keepOpts = isChoiceQuestionType(keepType)
+                        ? (coerceOptionList(q.options).length ? coerceOptionList(q.options) : coerceOptionList(hit.options))
+                        : [];
+                    out.push({
+                        ...q,
+                        type: keepType,
+                        options: keepOpts,
+                        libraryQuestionId: hit.id,
+                    });
                     continue;
                 }
                 try {
@@ -6944,21 +6965,65 @@
                 }
             };
 
+            const readSelectValue = (sel) => {
+                if (!sel) return '';
+                const fromValue = String(sel.value || '').trim();
+                if (fromValue) return fromValue;
+                const selected = sel.querySelector('option[selected]');
+                if (selected) return String(selected.value || '').trim();
+                return '';
+            };
+
+            const readBuilderLogicFromCard = (card, idx) => {
+                const logicQId = readSelectValue(card.querySelector(`select[name="q_logic_qid_${idx}"]`));
+                if (!logicQId) return null;
+                const logicOp = readSelectValue(card.querySelector(`select[name="q_logic_op_${idx}"]`)) || 'equals';
+                const logicValue = (card.querySelector(`input[name="q_logic_value_${idx}"]`)?.value
+                    || card.querySelector(`input[name="q_logic_equals_${idx}"]`)?.value
+                    || '').trim();
+                const showIf = { questionId: logicQId };
+                if (logicOp === 'notEmpty') showIf.notEmpty = true;
+                else if (logicOp === 'includes') showIf.includes = logicValue;
+                else if (logicOp === 'includesAny') {
+                    showIf.includesAny = logicValue.split(/\s*\|\|\s*/).map((s) => s.trim()).filter(Boolean);
+                } else if (logicOp === 'notOnly') showIf.notOnly = logicValue;
+                else showIf.equals = logicValue;
+                return { showIf };
+            };
+
+            const readBuilderTypeFromCard = (card, idx, prevType) => {
+                const sel = card.querySelector(`select[name="q_type_${idx}"]`);
+                const prev = normalizeSurveyQuestionType(prevType || 'text');
+                if (!sel) return prev; // never invent 'text' when the control is missing
+                const raw = readSelectValue(sel);
+                if (!raw) return prev;
+                const next = normalizeSurveyQuestionType(raw);
+                // Guard: only accept known builder types from the select; otherwise keep previous
+                if (!SURVEY_QUESTION_TYPES.includes(String(raw).toLowerCase()) && next === 'text' && prev !== 'text') {
+                    return prev;
+                }
+                return next;
+            };
+
             const readChoiceOptionsFromCard = (card, idx, prevQ) => {
                 const list = card.querySelector(`[data-choice-list="${idx}"]`);
+                // Only real choice rows — never vacuum label/help/category text inputs
                 const choiceInputs = list
-                    ? [...list.querySelectorAll('input[data-choice-input="1"], input[name^="q_choice_"], input[type="text"]')]
+                    ? [...list.querySelectorAll('input[data-choice-input="1"], input[name^="q_choice_"]')]
                     : [];
                 const fromDom = choiceInputs.map((inp) => String(inp.value || '').trim()).filter(Boolean);
-                const hiddenRaw = (card.querySelector(`[name="q_options_${idx}"]`)?.value
+                const hiddenRaw = (card.querySelector(`input[name="q_options_${idx}"]`)?.value
                     || card.querySelector(`[data-options-backup="${idx}"]`)?.value
                     || '').trim();
                 const fromHidden = coerceOptionList(hiddenRaw);
                 const fromScore = optionsFromScoring(prevQ?.scoringOptions);
                 const prev = coerceOptionList(prevQ?.options);
-                // If the choice list rendered inputs, trust the DOM (even if user cleared some).
-                // If no inputs exist (empty-state / broken markup), NEVER wipe prior options.
-                if (choiceInputs.length > 0) return fromDom.length ? fromDom : (fromHidden.length ? fromHidden : prev);
+                if (choiceInputs.length > 0) {
+                    // DOM rows present: prefer typed values, but don't wipe to [] if inputs are briefly empty during edit
+                    if (fromDom.length) return fromDom;
+                    if (fromHidden.length) return fromHidden;
+                    return prev;
+                }
                 return fromDom.length ? fromDom
                     : (fromHidden.length ? fromHidden
                         : (prev.length ? prev
@@ -6970,26 +7035,38 @@
                 const qs = [...(window.__siteSurveyBuilderQuestions || [])];
                 if (!root) return qs;
                 qs.forEach((q, idx) => {
-                    const card = root.querySelector(`[data-q-card="${idx}"]`) || root.querySelector(`[data-q-idx="${idx}"]`);
-                    if (!card || card.matches?.('input,select,textarea,button,label')) return;
-                    q.label = (card.querySelector(`[name="q_label_${idx}"]`)?.value || '').trim();
-                    q.help = meaningfulQuestionHelp(card.querySelector(`[name="q_help_${idx}"]`)?.value || '');
-                    q.type = normalizeSurveyQuestionType(card.querySelector(`[name="q_type_${idx}"]`)?.value || q.type || 'text');
+                    const card = root.querySelector(`[data-q-card="${idx}"]`);
+                    if (!card) return;
+                    const prevType = q.type;
+                    const prevOptions = coerceOptionList(q.options);
+                    const prevLogic = q.logic && typeof q.logic === 'object' ? q.logic : null;
+
+                    q.label = (card.querySelector(`input[name="q_label_${idx}"]`)?.value || '').trim();
+                    q.help = meaningfulQuestionHelp(card.querySelector(`input[name="q_help_${idx}"]`)?.value || '');
+                    q.type = readBuilderTypeFromCard(card, idx, prevType);
                     q.required = card.querySelector(`#q_required_${idx}`)?.checked !== false;
-                    q.category = (card.querySelector(`[name="q_category_${idx}"]`)?.value || 'General').trim() || 'General';
-                    const weightRaw = parseInt(card.querySelector(`[name="q_scoring_weight_${idx}"]`)?.value || '0', 10);
-                    const scoreOn = !!card.querySelector(`.q-score-enable[data-score-for="${idx}"], .q-score-enable`)?.checked;
+                    q.category = (card.querySelector(`input[name="q_category_${idx}"]`)?.value || 'General').trim() || 'General';
+                    q.logic = readBuilderLogicFromCard(card, idx);
+                    // If logic controls were missing from DOM, keep prior logic rather than wiping
+                    if (q.logic == null && prevLogic && !card.querySelector(`select[name="q_logic_qid_${idx}"]`)) {
+                        q.logic = prevLogic;
+                    }
+
+                    const weightRaw = parseInt(card.querySelector(`input[name="q_scoring_weight_${idx}"]`)?.value || '0', 10);
+                    const scoreOn = !!card.querySelector(`.q-score-enable[data-score-for="${idx}"]`)?.checked;
                     q.scoringWeight = scoreOn ? (Number.isNaN(weightRaw) ? 10 : Math.max(0, weightRaw)) : 0;
-                    q.knockoutOnBlank = scoreOn && !!card.querySelector(`[name="q_knockout_blank_${idx}"]`)?.checked;
-                    const failRaw = card.querySelector(`[name="q_knockout_fails_${idx}"]`)?.value || '';
+                    q.knockoutOnBlank = scoreOn && !!card.querySelector(`input[name="q_knockout_blank_${idx}"]`)?.checked;
+                    const failEl = card.querySelector(`[name="q_knockout_fails_${idx}"]`);
+                    const failRaw = failEl?.value || '';
                     q.knockoutFailValues = scoreOn
                         ? String(failRaw).split('\n').map((s) => s.trim()).filter(Boolean)
                         : [];
+
                     if (isChoiceQuestionType(q.type)) {
-                        q.options = resolveBuilderOptions({
-                            ...q,
-                            options: readChoiceOptionsFromCard(card, idx, q),
-                        });
+                        let opts = readChoiceOptionsFromCard(card, idx, { ...q, options: prevOptions });
+                        // Absolute guard: never drop a prior choice list to empty on reorder/sync
+                        if (!opts.length && prevOptions.length) opts = prevOptions;
+                        q.options = resolveBuilderOptions({ ...q, options: opts });
                         const grid = card.querySelector(`[data-score-option-grid="${idx}"]`);
                         if (grid && scoreOn && (q.type === 'select' || q.type === 'radio')) {
                             q.scoringOptions = [...grid.querySelectorAll('[data-score-opt-row]')].map((row) => {
@@ -7015,6 +7092,7 @@
                             q.knockout = q.knockoutFailValues.length > 0 || q.knockoutOnBlank;
                         }
                     } else {
+                        // Only clear options when type is intentionally non-choice
                         q.options = [];
                         if (scoreOn) {
                             q.scoringOptions = [];
@@ -7172,6 +7250,16 @@
                         }
                         window.__siteSurveyBuilderQuestions = qs;
                         renderBuilder();
+                        return;
+                    }
+
+                    // Keep logic in memory whenever branching controls change (no full re-render)
+                    if (e.target.matches?.(`select[name="q_logic_qid_${idx}"], select[name="q_logic_op_${idx}"], input[name="q_logic_value_${idx}"]`)) {
+                        const qs = syncBuilderFromDom();
+                        window.__siteSurveyBuilderQuestions = qs;
+                        const op = card.querySelector(`select[name="q_logic_op_${idx}"]`)?.value;
+                        const valInput = card.querySelector(`input[name="q_logic_value_${idx}"]`);
+                        if (valInput) valInput.disabled = op === 'notEmpty';
                     }
                 });
 
@@ -13180,45 +13268,49 @@
                     const questionsRoot = document.getElementById('site-survey-questions-builder');
                     if (!questionsRoot) throw new Error('Survey builder not ready');
                     let questions = builderQs.map((q, idx) => {
-                        const label = (questionsRoot.querySelector(`[name="q_label_${idx}"]`)?.value || '').trim();
-                        const help = (questionsRoot.querySelector(`[name="q_help_${idx}"]`)?.value || '').trim();
-                        const type = normalizeSurveyQuestionType(questionsRoot.querySelector(`[name="q_type_${idx}"]`)?.value || 'text');
-                        const required = questionsRoot.querySelector(`#q_required_${idx}`)?.checked !== false;
-                        const scoreOn = !!questionsRoot.querySelector(`.q-score-enable[data-score-for="${idx}"]`)?.checked
-                            || !!questionsRoot.querySelector(`[data-q-card="${idx}"] .q-score-enable`)?.checked;
+                        const card = questionsRoot.querySelector(`[data-q-card="${idx}"]`);
+                        const label = (card?.querySelector(`input[name="q_label_${idx}"]`)?.value || q.label || '').trim();
+                        const help = (card?.querySelector(`input[name="q_help_${idx}"]`)?.value || q.help || '').trim();
+                        // Prefer post-sync memory (hardened) over a fragile DOM re-read
+                        const type = normalizeSurveyQuestionType(q.type || card?.querySelector(`select[name="q_type_${idx}"]`)?.value || 'text');
+                        const required = card?.querySelector(`#q_required_${idx}`)?.checked !== false;
+                        const scoreOn = !!card?.querySelector(`.q-score-enable[data-score-for="${idx}"]`)?.checked;
                         let options = [];
-                        if (type === 'select' || type === 'radio' || type === 'multiselect') {
-                            const card = questionsRoot.querySelector(`[data-q-card="${idx}"]`);
-                            const choiceInputs = card
-                                ? [...card.querySelectorAll(`[data-choice-list="${idx}"] input[data-choice-input="1"], [data-choice-list="${idx}"] input[type="text"]`)]
-                                : [...questionsRoot.querySelectorAll(`[data-choice-list="${idx}"] input[type="text"]`)];
-                            options = choiceInputs.map(inp => inp.value.trim()).filter(Boolean);
-                            if (!options.length) {
-                                const hidden = (questionsRoot.querySelector(`[name="q_options_${idx}"]`)?.value || '').trim();
-                                options = hidden.split('\n').map(s => s.trim()).filter(Boolean);
+                        if (isChoiceQuestionType(type)) {
+                            options = coerceOptionList(q.options);
+                            if (!options.length && card) {
+                                options = [...card.querySelectorAll(`[data-choice-list="${idx}"] input[data-choice-input="1"], [data-choice-list="${idx}"] input[name^="q_choice_"]`)]
+                                    .map(inp => inp.value.trim())
+                                    .filter(Boolean);
                             }
-                            if (!options.length) options = coerceOptionList(q.options);
+                            if (!options.length) {
+                                const hidden = (card?.querySelector(`input[name="q_options_${idx}"]`)?.value || '').trim();
+                                options = coerceOptionList(hidden);
+                            }
                             if (!options.length) options = optionsFromScoring(q.scoringOptions);
                             if ((type === 'radio' || type === 'select') && options.length < 2) {
                                 options = options.length ? options : ['Yes', 'No'];
                             }
                         }
 
-                        const logicQId = (questionsRoot.querySelector(`[name="q_logic_qid_${idx}"]`)?.value || '').trim();
-                        const logicOp = (questionsRoot.querySelector(`[name="q_logic_op_${idx}"]`)?.value || 'equals').trim();
-                        const logicValue = (questionsRoot.querySelector(`[name="q_logic_value_${idx}"]`)?.value
-                            || questionsRoot.querySelector(`[name="q_logic_equals_${idx}"]`)?.value
-                            || '').trim();
-                        let logic = null;
-                        if (logicQId) {
-                            const showIf = { questionId: logicQId };
-                            if (logicOp === 'notEmpty') showIf.notEmpty = true;
-                            else if (logicOp === 'includes') showIf.includes = logicValue;
-                            else if (logicOp === 'includesAny') {
-                                showIf.includesAny = logicValue.split(/\s*\|\|\s*/).map((s) => s.trim()).filter(Boolean);
-                            } else if (logicOp === 'notOnly') showIf.notOnly = logicValue;
-                            else showIf.equals = logicValue;
-                            logic = { showIf };
+                        // Logic: prefer memory synced from DOM; fall back to DOM
+                        let logic = (q.logic && q.logic.showIf && q.logic.showIf.questionId) ? q.logic : null;
+                        if (!logic && card) {
+                            const logicQId = (card.querySelector(`select[name="q_logic_qid_${idx}"]`)?.value || '').trim();
+                            const logicOp = (card.querySelector(`select[name="q_logic_op_${idx}"]`)?.value || 'equals').trim();
+                            const logicValue = (card.querySelector(`input[name="q_logic_value_${idx}"]`)?.value
+                                || card.querySelector(`input[name="q_logic_equals_${idx}"]`)?.value
+                                || '').trim();
+                            if (logicQId) {
+                                const showIf = { questionId: logicQId };
+                                if (logicOp === 'notEmpty') showIf.notEmpty = true;
+                                else if (logicOp === 'includes') showIf.includes = logicValue;
+                                else if (logicOp === 'includesAny') {
+                                    showIf.includesAny = logicValue.split(/\s*\|\|\s*/).map((s) => s.trim()).filter(Boolean);
+                                } else if (logicOp === 'notOnly') showIf.notOnly = logicValue;
+                                else showIf.equals = logicValue;
+                                logic = { showIf };
+                            }
                         }
 
                         const rawScoringWeight = parseInt(questionsRoot.querySelector(`[name="q_scoring_weight_${idx}"]`)?.value || '0', 10);
