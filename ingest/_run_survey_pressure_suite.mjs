@@ -3,6 +3,8 @@
  *
  *   node ingest/_run_survey_pressure_suite.mjs
  *   node ingest/_run_survey_pressure_suite.mjs --rounds=200
+ *   node ingest/_run_survey_pressure_suite.mjs --e2e   # also Cosmos create→send→fill→submit
+ *   node ingest/_run_survey_pressure_suite.mjs --all
  */
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
@@ -17,6 +19,11 @@ const jobs = [
   ['static audit', 'ingest/_audit_survey_builder_static.mjs'],
   ['pressure + regressions', 'ingest/_pressure_survey_builder_logic.mjs', [roundsArg]],
 ];
+
+const runE2E = process.argv.includes('--e2e') || process.argv.includes('--all');
+if (runE2E) {
+  jobs.push(['e2e cosmos send/submit', 'ingest/_pressure_survey_e2e_send_submit.mjs']);
+}
 
 let failed = 0;
 for (const [name, script, extra = []] of jobs) {
