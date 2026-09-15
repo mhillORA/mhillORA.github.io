@@ -204,6 +204,15 @@ assert(endIfOn({ endSurveyIf: { equals: '' } }) === true, 'end checkbox on with 
 assert(endIfOn({ endSurveyIf: { equals: 'No' } }) === true, 'end checkbox on with No');
 assert(endIfOn({ showIf: { questionId: 'x' } }) === false, 'no endSurveyIf → off');
 
+/** includesAny UI: when choice checkboxes exist, empty selection must not keep stale backup */
+function readIncludesAnyFromUi({ choiceBoxesPresent, checked, hiddenBackup }) {
+    if (choiceBoxesPresent) return checked.join(' || ');
+    return String(hiddenBackup || '');
+}
+assert(readIncludesAnyFromUi({ choiceBoxesPresent: true, checked: [], hiddenBackup: 'A || B' }) === '', 'cleared checkboxes win over backup');
+assert(readIncludesAnyFromUi({ choiceBoxesPresent: true, checked: ['A'], hiddenBackup: 'A || B' }) === 'A', 'checked values used');
+assert(readIncludesAnyFromUi({ choiceBoxesPresent: false, checked: [], hiddenBackup: 'A' }) === 'A', 'no checkbox UI can use backup');
+
 function resolveBuilderPageSection(q) {
     const explicit = String(q?.section || '').trim();
     if (explicit) return explicit;

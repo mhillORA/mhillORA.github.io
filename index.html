@@ -7253,21 +7253,27 @@
                 const logicQId = readSelectValue(card.querySelector(`select[name="q_logic_qid_${idx}"]`));
                 if (logicQId) {
                     let logicOp = readSelectValue(card.querySelector(`select[name="q_logic_op_${idx}"]`)) || 'equals';
-                    const choiceChecks = [...card.querySelectorAll(`input[type="checkbox"][name="q_logic_choice_${idx}"]:checked`)]
+                    const choiceBoxEls = [...card.querySelectorAll(`input[type="checkbox"][name="q_logic_choice_${idx}"]`)];
+                    const choiceChecks = choiceBoxEls
+                        .filter((el) => el.checked)
                         .map((el) => String(el.value || '').trim())
                         .filter(Boolean);
                     const valueSel = card.querySelector(`select[name="q_logic_value_${idx}"]`);
                     const valueInput = card.querySelector(`input[name="q_logic_value_${idx}"]`);
+                    const valueBackup = card.querySelector(`input[data-logic-value-backup="${idx}"]`);
                     let logicValue = '';
-                    if (choiceChecks.length) {
+                    if (choiceBoxEls.length) {
+                        // includesAny checkbox UI is present — never fall back to stale hidden backup
                         logicValue = choiceChecks.join(' || ');
                         if (logicOp !== 'includesAny' && choiceChecks.length > 1) logicOp = 'includesAny';
                     } else if (valueSel && !valueSel.disabled) {
                         logicValue = valueSel.multiple
                             ? [...valueSel.selectedOptions].map((o) => String(o.value || '').trim()).filter(Boolean).join(' || ')
                             : String(valueSel.value || '').trim();
-                    } else if (valueInput && !valueInput.disabled) {
+                    } else if (valueInput && !valueInput.disabled && valueInput !== valueBackup) {
                         logicValue = String(valueInput.value || '').trim();
+                    } else if (valueBackup && logicOp !== 'includesAny') {
+                        logicValue = String(valueBackup.value || '').trim();
                     } else {
                         logicValue = String(card.querySelector(`input[name="q_logic_equals_${idx}"]`)?.value || '').trim();
                     }
@@ -13856,40 +13862,62 @@
                             ));
                             if (hasShow || hasEnd) {
                                 logic = { ...q.logic };
-                                // Drop incomplete end (checkbox on, no choice yet)
                                 if (!hasEnd) delete logic.endSurveyIf;
-                                // Normalize incomplete equals/includes to questionId-only (runtime = is answered)
                                 if (logic.showIf) {
                                     const s = { ...logic.showIf };
-                                    if (s.equals !== undefined && !String(s.equals || '').trim() && !s.notEmpty) {
-                                        delete s.equals;
-                                    }
-                                    if (s.includes !== undefined && !String(s.includes || '').trim() && !s.notEmpty) {
-                                        delete s.includes;
-                                    }
-                                    if (Array.isArray(s.includesAny) && !s.includesAny.length) {
-                                        delete s.includesAny;
+                                    const hasEquals = Object.prototype.hasOwnProperty.call(s, 'equals');
+                                    const hasIncludes = Object.prototype.hasOwnProperty.call(s, 'includes');
+                                    const hasIncludesAny = Object.prototype.hasOwnProperty.call(s, 'includesAny');
+                                    const hasNotOnly = Object.prototype.hasOwnProperty.call(s, 'notOnly');
+                                    if (hasEquals && !String(s.equals || '').trim()) delete s.equals;
+                                    if (hasIncludes && !String(s.includes || '').trim()) delete s.includes;
+                                    if (hasIncludesAny && !(Array.isArray(s.includesAny) && s.includesAny.length)) delete s.includesAny;
+                                    if (hasNotOnly && !String(s.notOnly || '').trim()) delete s.notOnly;
+                                    const stillHasOp = s.notEmpty === true
+                                        || Object.prototype.hasOwnProperty.call(s, 'equals')
+                                        || Object.prototype.hasOwnProperty.call(s, 'includes')
+                                        || Object.prototype.hasOwnProperty.call(s, 'includesAny')
+                                        || Object.prototype.hasOwnProperty.call(s, 'notOnly');
+                                    if (!stillHasOp) {
+                                        throw new Error(
+                                            `Question ${idx + 1}: branching is set to a prior question but no When/value was chosen. Pick equals (or another When) and a choice, or clear Prior question.`
+                                        );
                                     }
                                     logic.showIf = s;
+                                }
+                            }
+                            // Checkbox on but no ending choice yet
+                            if (q.logic.endSurveyIf && !hasEnd) {
+                                const endOn = !!card?.querySelector(`#q_end_enable_${idx}`)?.checked;
+                                if (endOn) {
+                                    throw new Error(
+                                        `Question ${idx + 1}: End survey early is checked but no ending answer was selected.`
+                                    );
                                 }
                             }
                         }
                         if (!logic && card) {
                             const logicQId = (card.querySelector(`select[name="q_logic_qid_${idx}"]`)?.value || '').trim();
                             const logicOp = (card.querySelector(`select[name="q_logic_op_${idx}"]`)?.value || 'equals').trim();
-                            const choiceChecks = [...card.querySelectorAll(`input[type="checkbox"][name="q_logic_choice_${idx}"]:checked`)]
+                            const choiceBoxEls = [...card.querySelectorAll(`input[type="checkbox"][name="q_logic_choice_${idx}"]`)];
+                            const choiceChecks = choiceBoxEls
+                                .filter((el) => el.checked)
                                 .map((el) => String(el.value || '').trim())
                                 .filter(Boolean);
                             const valueSel = card.querySelector(`select[name="q_logic_value_${idx}"]`);
+                            const valueBackup = card.querySelector(`input[data-logic-value-backup="${idx}"]`);
                             let logicValue = '';
-                            if (choiceChecks.length) {
+                            if (choiceBoxEls.length) {
                                 logicValue = choiceChecks.join(' || ');
                             } else if (valueSel && !valueSel.disabled) {
                                 logicValue = String(valueSel.value || '').trim();
                             } else {
-                                logicValue = (card.querySelector(`input[name="q_logic_value_${idx}"]`)?.value
+                                const rawInp = card.querySelector(`input[name="q_logic_value_${idx}"]`);
+                                logicValue = String(
+                                    (rawInp && rawInp !== valueBackup ? rawInp.value : '')
                                     || card.querySelector(`input[name="q_logic_equals_${idx}"]`)?.value
-                                    || '').trim();
+                                    || ''
+                                ).trim();
                             }
                             const showIf = logicQId ? { questionId: logicQId } : null;
                             if (showIf) {
@@ -13900,19 +13928,32 @@
                                     showIf.includesAny = logicValue.split(/\s*\|\|\s*/).map((s) => s.trim()).filter(Boolean);
                                 } else if (op === 'notOnly') showIf.notOnly = logicValue;
                                 else showIf.equals = logicValue;
+                                const stillHasOp = showIf.notEmpty === true
+                                    || String(showIf.equals || '').trim()
+                                    || String(showIf.includes || '').trim()
+                                    || (Array.isArray(showIf.includesAny) && showIf.includesAny.length)
+                                    || String(showIf.notOnly || '').trim();
+                                if (!stillHasOp) {
+                                    throw new Error(
+                                        `Question ${idx + 1}: branching is set to a prior question but no When/value was chosen. Pick equals (or another When) and a choice, or clear Prior question.`
+                                    );
+                                }
                             }
                             let endSurveyIf = null;
                             if (card.querySelector(`#q_end_enable_${idx}`)?.checked) {
                                 const endSel = card.querySelector(`select[name="q_end_value_${idx}"]`);
                                 const endInp = card.querySelector(`input[name="q_end_value_${idx}"]`);
-                                const endValue = endSel && !endSel.disabled
+                                const endValue = endSel
                                     ? String(endSel.value || '').trim()
                                     : String(endInp?.value || '').trim();
-                                if (endValue) {
-                                    endSurveyIf = type === 'multiselect'
-                                        ? { includes: endValue }
-                                        : { equals: endValue };
+                                if (!endValue) {
+                                    throw new Error(
+                                        `Question ${idx + 1}: End survey early is checked but no ending answer was selected.`
+                                    );
                                 }
+                                endSurveyIf = type === 'multiselect'
+                                    ? { includes: endValue }
+                                    : { equals: endValue };
                             }
                             if (showIf || endSurveyIf) {
                                 logic = {
