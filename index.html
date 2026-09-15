@@ -6207,6 +6207,41 @@
             return 'text';
         };
 
+        const isChoiceQuestionType = (type) => {
+            const t = normalizeSurveyQuestionType(type);
+            return t === 'select' || t === 'radio' || t === 'multiselect';
+        };
+
+        /** Coerce options from strings, {label,value} objects, or newline text into a clean string[]. */
+        const coerceOptionList = (raw) => {
+            if (raw == null || raw === '') return [];
+            if (typeof raw === 'string') {
+                return raw.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+            }
+            if (!Array.isArray(raw)) return [];
+            return raw.map((o) => {
+                if (typeof o === 'string' || typeof o === 'number') return String(o).trim();
+                if (o && typeof o === 'object') return String(o.label ?? o.value ?? '').trim();
+                return '';
+            }).filter(Boolean);
+        };
+
+        const optionsFromScoring = (scoringOptions) => coerceOptionList(
+            (Array.isArray(scoringOptions) ? scoringOptions : [])
+                .map((o) => (o && typeof o === 'object' ? (o.value ?? o.label) : o))
+        );
+
+        /** Resolve display/storage options for builder — never invent empties that wipe radio/multiselect. */
+        const resolveBuilderOptions = (q, libItem = null) => {
+            const type = normalizeSurveyQuestionType(q?.type);
+            if (!isChoiceQuestionType(type)) return [];
+            let opts = coerceOptionList(q?.options);
+            if (!opts.length) opts = optionsFromScoring(q?.scoringOptions);
+            if (!opts.length && libItem) opts = coerceOptionList(libItem.options);
+            if (!opts.length && (type === 'radio' || type === 'select')) opts = ['Yes', 'No'];
+            return opts;
+        };
+
         const normalizeLibraryLabelKey = (label) => String(label || '').trim().toLowerCase().replace(/\s+/g, ' ');
 
         const stripCosmosMeta = (doc) => {
@@ -6217,18 +6252,14 @@
 
         const libraryItemToBuilderQuestion = (lib) => {
             const type = normalizeSurveyQuestionType(lib?.type);
-            let options = Array.isArray(lib?.options)
-                ? lib.options.map((o) => (typeof o === 'string' ? o : String(o?.label ?? o?.value ?? ''))).filter(Boolean)
-                : [];
-            if (type === 'select' && options.length < 2) options = ['Yes', 'No'];
-            if (type === 'radio' && options.length < 2) options = ['Yes', 'No'];
+            const options = resolveBuilderOptions({ type, options: lib?.options, scoringOptions: lib?.scoringOptions }, lib);
             return {
                 id: `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
                 label: String(lib?.label || '').trim(),
                 help: meaningfulQuestionHelp(lib?.help || lib?.context || lib?.description) || '',
                 type,
                 required: lib?.required !== false,
-                options: (type === 'select' || type === 'radio' || type === 'multiselect') ? options : [],
+                options: isChoiceQuestionType(type) ? options : [],
                 logic: null,
                 scoringWeight: typeof lib?.scoringWeight === 'number' ? lib.scoringWeight : 0,
                 scoringOptions: Array.isArray(lib?.scoringOptions) ? lib.scoringOptions : [],
@@ -6281,7 +6312,7 @@
                         help: q.help || undefined,
                         type,
                         required: q.required !== false,
-                        options: type === 'select' ? (q.options || []) : [],
+                        options: isChoiceQuestionType(type) ? coerceOptionList(q.options) : [],
                         category: q.category || 'General',
                         scoringWeight: q.scoringWeight || 0,
                         scoringOptions: q.scoringOptions || [],
@@ -6462,23 +6493,30 @@
             const cloneQuestionsFromDef = () => {
                 const raw = existingDefinition?.questions;
                 if (!Array.isArray(raw) || raw.length === 0) return null;
-                return raw.map((q) => ({
-                    id: isClone
-                        ? `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`
-                        : (q.id || `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`),
-                    label: q.label || q.title || '',
-                    type: normalizeSurveyQuestionType(q.type),
-                    required: q.required !== false,
-                    options: Array.isArray(q.options) ? q.options.map(o => (typeof o === 'string' ? o : String(o.label ?? o.value ?? ''))) : [],
-                    logic: q.logic && typeof q.logic === 'object' ? q.logic : null,
-                    scoringWeight: typeof q.scoringWeight === 'number' ? q.scoringWeight : 0,
-                    scoringOptions: Array.isArray(q.scoringOptions) ? q.scoringOptions : [],
-                    category: q.category || 'General',
-                    knockout: q.knockout === true,
-                    knockoutOnBlank: q.knockoutOnBlank === true,
-                    knockoutFailValues: Array.isArray(q.knockoutFailValues) ? q.knockoutFailValues : [],
-                    libraryQuestionId: q.libraryQuestionId || null,
-                }));
+                const libById = new Map(
+                    asSurveyList(allSiteSurveyQuestionLibrary).map((item) => [item.id, item])
+                );
+                return raw.map((q) => {
+                    const type = normalizeSurveyQuestionType(q.type);
+                    const libItem = q.libraryQuestionId ? libById.get(q.libraryQuestionId) : null;
+                    return {
+                        id: isClone
+                            ? `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`
+                            : (q.id || `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`),
+                        label: q.label || q.title || '',
+                        type,
+                        required: q.required !== false,
+                        options: resolveBuilderOptions(q, libItem),
+                        logic: q.logic && typeof q.logic === 'object' ? q.logic : null,
+                        scoringWeight: typeof q.scoringWeight === 'number' ? q.scoringWeight : 0,
+                        scoringOptions: Array.isArray(q.scoringOptions) ? q.scoringOptions : [],
+                        category: q.category || 'General',
+                        knockout: q.knockout === true,
+                        knockoutOnBlank: q.knockoutOnBlank === true,
+                        knockoutFailValues: Array.isArray(q.knockoutFailValues) ? q.knockoutFailValues : [],
+                        libraryQuestionId: q.libraryQuestionId || null,
+                    };
+                });
             };
 
             const fromDef = cloneQuestionsFromDef();
@@ -6678,15 +6716,17 @@
                         : showIfOp === 'notOnly' ? showIfNotOnly
                         : '';
                     const qType = normalizeSurveyQuestionType(q.type);
-                    const isSelect = qType === 'select' || qType === 'radio' || qType === 'multiselect';
-                    const opts = Array.isArray(q.options) ? q.options : [];
+                    const isSelect = isChoiceQuestionType(qType);
+                    const opts = isSelect ? resolveBuilderOptions(q) : [];
+                    // Keep in-memory options aligned so reorder/sync never starts from []
+                    if (isSelect) q.options = opts;
                     const scored = (q.scoringWeight || 0) > 0 || q.knockout || (q.scoringOptions || []).some(o => o && (o.knockout || o.fail));
                     const fromLib = !!q.libraryQuestionId;
                     const libBadge = fromLib
                         ? `<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-indigo-100 text-indigo-800 dark:bg-indigo-900/40 dark:text-indigo-200" title="Linked library question ${escapeHtml(q.libraryQuestionId)}">Library</span>`
                         : `<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-gray-100 text-gray-500 dark:bg-gray-700 dark:text-gray-400">New</span>`;
                     return `
-                        <div class="rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 overflow-hidden" data-q-idx="${idx}">
+                        <div class="rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 overflow-hidden" data-q-card="${idx}" data-q-idx="${idx}">
                             <div class="flex items-center justify-between gap-2 px-3 py-2 bg-gray-50 dark:bg-gray-900/40 border-b border-gray-200 dark:border-gray-700">
                                 <div class="flex items-center gap-2 min-w-0">
                                     <div class="text-xs font-semibold uppercase tracking-wide text-gray-500">Question ${idx + 1}</div>
@@ -6737,18 +6777,16 @@
                                         <button type="button" class="q-add-choice text-xs font-medium text-indigo-600 dark:text-indigo-300 hover:underline">+ Add choice</button>
                                     </div>
                                     <div class="mt-2 space-y-2" data-choice-list="${idx}">
-                                        ${opts.length === 0
-                                            ? `<p class="text-xs text-amber-700 dark:text-amber-300">Add at least two choices (e.g. Yes / No).</p>`
-                                            : opts.map((opt, oi) => `
+                                        ${opts.map((opt, oi) => `
                                                 <div class="flex items-center gap-2" data-choice-row="${oi}">
                                                     <input type="text" name="q_choice_${idx}_${oi}" value="${escapeHtml(String(opt || ''))}"
                                                         placeholder="Choice text"
-                                                        class="flex-1 rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm" />
+                                                        class="flex-1 rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm" data-choice-input="1" />
                                                     <button type="button" class="q-remove-choice px-2 py-1 rounded text-xs text-red-600 dark:text-red-300 border border-red-200 dark:border-red-800" data-choice-oi="${oi}">Remove</button>
                                                 </div>`).join('')
                                         }
                                     </div>
-                                    <input type="hidden" name="q_options_${idx}" value="${escapeHtml(opts.join('\n'))}" />
+                                    <input type="hidden" name="q_options_${idx}" value="${escapeHtml(opts.join('\n'))}" data-options-backup="${idx}" />
                                 </div>
                                 ` : `<input type="hidden" name="q_options_${idx}" value="" />`}
 
@@ -6762,7 +6800,7 @@
                                             <span class="text-[11px] text-amber-800/80 dark:text-amber-200/70 hidden sm:inline">Click to open — set points and which answers fail the site</span>
                                         </div>
                                         <label class="flex items-center gap-2 text-sm text-amber-900 dark:text-amber-100" onclick="event.stopPropagation()">
-                                            <input type="checkbox" class="q-score-enable h-4 w-4" data-q-idx="${idx}" ${scored ? 'checked' : ''} />
+                                            <input type="checkbox" class="q-score-enable h-4 w-4" data-score-for="${idx}" ${scored ? 'checked' : ''} />
                                             Score this question
                                         </label>
                                     </summary>
@@ -6882,30 +6920,52 @@
                 }
             };
 
+            const readChoiceOptionsFromCard = (card, idx, prevQ) => {
+                const list = card.querySelector(`[data-choice-list="${idx}"]`);
+                const choiceInputs = list
+                    ? [...list.querySelectorAll('input[data-choice-input="1"], input[name^="q_choice_"], input[type="text"]')]
+                    : [];
+                const fromDom = choiceInputs.map((inp) => String(inp.value || '').trim()).filter(Boolean);
+                const hiddenRaw = (card.querySelector(`[name="q_options_${idx}"]`)?.value
+                    || card.querySelector(`[data-options-backup="${idx}"]`)?.value
+                    || '').trim();
+                const fromHidden = coerceOptionList(hiddenRaw);
+                const fromScore = optionsFromScoring(prevQ?.scoringOptions);
+                const prev = coerceOptionList(prevQ?.options);
+                // If the choice list rendered inputs, trust the DOM (even if user cleared some).
+                // If no inputs exist (empty-state / broken markup), NEVER wipe prior options.
+                if (choiceInputs.length > 0) return fromDom.length ? fromDom : (fromHidden.length ? fromHidden : prev);
+                return fromDom.length ? fromDom
+                    : (fromHidden.length ? fromHidden
+                        : (prev.length ? prev
+                            : fromScore));
+            };
+
             const syncBuilderFromDom = () => {
                 const root = document.getElementById('site-survey-questions-builder');
                 const qs = [...(window.__siteSurveyBuilderQuestions || [])];
                 if (!root) return qs;
-                const isChoiceType = (t) => t === 'select' || t === 'radio' || t === 'multiselect';
                 qs.forEach((q, idx) => {
-                    const card = root.querySelector(`[data-q-idx="${idx}"]`);
-                    if (!card) return;
+                    const card = root.querySelector(`[data-q-card="${idx}"]`) || root.querySelector(`[data-q-idx="${idx}"]`);
+                    if (!card || card.matches?.('input,select,textarea,button,label')) return;
                     q.label = (card.querySelector(`[name="q_label_${idx}"]`)?.value || '').trim();
                     q.help = meaningfulQuestionHelp(card.querySelector(`[name="q_help_${idx}"]`)?.value || '');
-                    q.type = normalizeSurveyQuestionType(card.querySelector(`[name="q_type_${idx}"]`)?.value || 'text');
+                    q.type = normalizeSurveyQuestionType(card.querySelector(`[name="q_type_${idx}"]`)?.value || q.type || 'text');
                     q.required = card.querySelector(`#q_required_${idx}`)?.checked !== false;
                     q.category = (card.querySelector(`[name="q_category_${idx}"]`)?.value || 'General').trim() || 'General';
                     const weightRaw = parseInt(card.querySelector(`[name="q_scoring_weight_${idx}"]`)?.value || '0', 10);
-                    const scoreOn = !!card.querySelector(`.q-score-enable[data-q-idx="${idx}"]`)?.checked;
+                    const scoreOn = !!card.querySelector(`.q-score-enable[data-score-for="${idx}"], .q-score-enable`)?.checked;
                     q.scoringWeight = scoreOn ? (Number.isNaN(weightRaw) ? 10 : Math.max(0, weightRaw)) : 0;
                     q.knockoutOnBlank = scoreOn && !!card.querySelector(`[name="q_knockout_blank_${idx}"]`)?.checked;
                     const failRaw = card.querySelector(`[name="q_knockout_fails_${idx}"]`)?.value || '';
                     q.knockoutFailValues = scoreOn
                         ? String(failRaw).split('\n').map((s) => s.trim()).filter(Boolean)
                         : [];
-                    if (isChoiceType(q.type)) {
-                        const choiceInputs = [...card.querySelectorAll(`[data-choice-list="${idx}"] input[type="text"]`)];
-                        q.options = choiceInputs.map(inp => inp.value.trim()).filter(Boolean);
+                    if (isChoiceQuestionType(q.type)) {
+                        q.options = resolveBuilderOptions({
+                            ...q,
+                            options: readChoiceOptionsFromCard(card, idx, q),
+                        });
                         const grid = card.querySelector(`[data-score-option-grid="${idx}"]`);
                         if (grid && scoreOn && (q.type === 'select' || q.type === 'radio')) {
                             q.scoringOptions = [...grid.querySelectorAll('[data-score-opt-row]')].map((row) => {
@@ -6913,7 +6973,7 @@
                                 const ptsInput = row.querySelector(`input[name="q_opt_pts_${idx}_${oi}"]`) || row.querySelector('input[type="number"]');
                                 const failRadio = row.querySelector(`input[name="q_opt_pf_${idx}_${oi}"][value="fail"]`)
                                     || row.querySelector('input[data-opt-ko="1"]');
-                                const val = (choiceInputs[oi]?.value || ptsInput?.getAttribute('data-opt-value') || '').trim();
+                                const val = (q.options[oi] || ptsInput?.getAttribute('data-opt-value') || '').trim();
                                 const pts = parseFloat(ptsInput?.value || '0');
                                 const isKo = !!failRadio?.checked;
                                 return {
@@ -6927,7 +6987,6 @@
                             q.scoringOptions = [];
                             q.knockout = false;
                         } else if (q.type === 'multiselect') {
-                            // Multiselect: fail values / blank only (no per-choice points grid yet)
                             q.scoringOptions = [];
                             q.knockout = q.knockoutFailValues.length > 0 || q.knockoutOnBlank;
                         }
@@ -6946,6 +7005,7 @@
                 window.__siteSurveyBuilderQuestions = qs;
                 return qs;
             };
+            window.__syncSiteSurveyBuilderFromDom = syncBuilderFromDom;
 
             const builderRoot = document.getElementById('site-survey-questions-builder');
             const addBtn = document.getElementById('add-site-survey-question-btn');
@@ -7002,9 +7062,9 @@
 
             if (builderRoot) {
                 builderRoot.addEventListener('click', (e) => {
-                    const card = e.target.closest('[data-q-idx]');
+                    const card = e.target.closest('[data-q-card]');
                     if (!card) return;
-                    const idx = parseInt(card.getAttribute('data-q-idx'), 10);
+                    const idx = parseInt(card.getAttribute('data-q-card'), 10);
                     if (Number.isNaN(idx)) return;
 
                     if (e.target.closest('.q-unlink-library')) {
@@ -7050,15 +7110,18 @@
                         const qs = syncBuilderFromDom();
                         if (!qs[idx] || Number.isNaN(oi)) return;
                         qs[idx].options = (qs[idx].options || []).filter((_, i) => i !== oi);
+                        if (isChoiceQuestionType(qs[idx].type)) {
+                            qs[idx].options = resolveBuilderOptions(qs[idx]);
+                        }
                         window.__siteSurveyBuilderQuestions = qs;
                         renderBuilder();
                     }
                 });
 
                 builderRoot.addEventListener('change', (e) => {
-                    const card = e.target.closest('[data-q-idx]');
+                    const card = e.target.closest('[data-q-card]');
                     if (!card) return;
-                    const idx = parseInt(card.getAttribute('data-q-idx'), 10);
+                    const idx = parseInt(card.getAttribute('data-q-card'), 10);
                     if (Number.isNaN(idx)) return;
 
                     if (e.target.classList.contains('q-score-enable')) {
@@ -7077,9 +7140,11 @@
                     const typeSelect = card.querySelector(`select[name="q_type_${idx}"]`);
                     if (typeSelect && e.target === typeSelect) {
                         const qs = syncBuilderFromDom();
-                        qs[idx].type = typeSelect.value;
-                        if ((typeSelect.value === 'select' || typeSelect.value === 'radio') && !(qs[idx].options || []).length) {
-                            qs[idx].options = ['Yes', 'No'];
+                        qs[idx].type = normalizeSurveyQuestionType(typeSelect.value);
+                        if (isChoiceQuestionType(qs[idx].type)) {
+                            qs[idx].options = resolveBuilderOptions(qs[idx]);
+                        } else {
+                            qs[idx].options = [];
                         }
                         window.__siteSurveyBuilderQuestions = qs;
                         renderBuilder();
@@ -7089,11 +7154,11 @@
                 builderRoot.addEventListener('toggle', (e) => {
                     const details = e.target.closest?.('.q-score-details') || (e.target.classList?.contains('q-score-details') ? e.target : null);
                     if (!details || details.tagName !== 'DETAILS') return;
-                    const card = details.closest('[data-q-idx]');
+                    const card = details.closest('[data-q-card]');
                     if (!card) return;
-                    const idx = parseInt(card.getAttribute('data-q-idx'), 10);
+                    const idx = parseInt(card.getAttribute('data-q-card'), 10);
                     if (Number.isNaN(idx)) return;
-                    const enable = card.querySelector(`.q-score-enable[data-q-idx="${idx}"]`);
+                    const enable = card.querySelector(`.q-score-enable[data-score-for="${idx}"]`) || card.querySelector('.q-score-enable');
                     const body = details.querySelector(`[data-score-body="${idx}"]`);
                     if (details.open) {
                         if (enable && !enable.checked) {
@@ -13078,6 +13143,9 @@
                 const errEl = document.getElementById('site-survey-definition-error');
                 if (errEl) errEl.classList.add('hidden');
                 try {
+                    if (typeof window.__syncSiteSurveyBuilderFromDom === 'function') {
+                        window.__syncSiteSurveyBuilderFromDom();
+                    }
                     const editId = form.getAttribute('data-edit-id') || '';
                     const title = form.title.value.trim();
                     const description = form.description.value.trim();
@@ -13092,15 +13160,23 @@
                         const help = (questionsRoot.querySelector(`[name="q_help_${idx}"]`)?.value || '').trim();
                         const type = normalizeSurveyQuestionType(questionsRoot.querySelector(`[name="q_type_${idx}"]`)?.value || 'text');
                         const required = questionsRoot.querySelector(`#q_required_${idx}`)?.checked !== false;
-                        const scoreOn = !!questionsRoot.querySelector(`.q-score-enable[data-q-idx="${idx}"]`)?.checked;
+                        const scoreOn = !!questionsRoot.querySelector(`.q-score-enable[data-score-for="${idx}"]`)?.checked
+                            || !!questionsRoot.querySelector(`[data-q-card="${idx}"] .q-score-enable`)?.checked;
                         let options = [];
                         if (type === 'select' || type === 'radio' || type === 'multiselect') {
-                            options = [...questionsRoot.querySelectorAll(`[data-choice-list="${idx}"] input[type="text"]`)]
-                                .map(inp => inp.value.trim())
-                                .filter(Boolean);
+                            const card = questionsRoot.querySelector(`[data-q-card="${idx}"]`);
+                            const choiceInputs = card
+                                ? [...card.querySelectorAll(`[data-choice-list="${idx}"] input[data-choice-input="1"], [data-choice-list="${idx}"] input[type="text"]`)]
+                                : [...questionsRoot.querySelectorAll(`[data-choice-list="${idx}"] input[type="text"]`)];
+                            options = choiceInputs.map(inp => inp.value.trim()).filter(Boolean);
                             if (!options.length) {
                                 const hidden = (questionsRoot.querySelector(`[name="q_options_${idx}"]`)?.value || '').trim();
                                 options = hidden.split('\n').map(s => s.trim()).filter(Boolean);
+                            }
+                            if (!options.length) options = coerceOptionList(q.options);
+                            if (!options.length) options = optionsFromScoring(q.scoringOptions);
+                            if ((type === 'radio' || type === 'select') && options.length < 2) {
+                                options = options.length ? options : ['Yes', 'No'];
                             }
                         }
 
@@ -13153,7 +13229,7 @@
                             || knockoutOnBlank;
 
                         if (!label) throw new Error(`Question ${idx + 1} label is required`);
-                        if ((type === 'select' || type === 'radio') && options.length < 2) {
+                        if ((type === 'select' || type === 'radio' || type === 'multiselect') && options.length < 2) {
                             throw new Error(`Question ${idx + 1}: add at least two answer choices`);
                         }
                         if (scoreOn && (type === 'select' || type === 'radio') && scoringOptions.length === 0 && options.length >= 2) {
