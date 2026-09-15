@@ -42,8 +42,9 @@ SEED_BY_CANONICAL = {
     "PROF-008": "ql-coord-name",  # Preferred / primary contact
     "PROF-009": "ql-coord-email",
     "PROF-010": "ql-coord-phone",
-    "PROF-011": "ql-contracts-name",
-    "PROF-012": "ql-contracts-email",
+    "PROF-011": "ql-primary-contact-role",  # Primary Contact Role
+    "PROF-012": "ql-contracts-name",  # Contract/Budget Contact (name)
+    "PROF-090": "ql-rebuild-080-on-average-how-long-will-it-take-to-execute-the-clin",  # CTA / budget timeline
     "PROF-013": "ql-gf-05-practice-setting",
     "PROF-029": "ql-gf-29-central-irb",  # may refine after label check
     "PROF-024": None,  # photographers count — match by label
