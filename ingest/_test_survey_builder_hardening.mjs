@@ -40,8 +40,8 @@ function assert(cond, msg) {
 
 {
     const onePage = buildSurveyPagesLocal([
-        { id: 'a', section: 'Page 1', category: 'Patient access' },
-        { id: 'b', section: 'Page 1', category: 'Staffing' },
+        { id: 'a', section: 'Page 1' },
+        { id: 'b', section: 'Page 1' },
     ]);
     assert(onePage.length === 1, `expected 1 page when same section, got ${onePage.length}`);
     assert(onePage[0].questionIds.join(',') === 'a,b', 'page should keep question order');
@@ -60,9 +60,9 @@ function assert(cond, msg) {
 
 {
     const pages = buildSurveyPagesLocal([
-        { id: 'a', section: 'Page 1', category: 'Experience' },
-        { id: 'b', section: 'Page 1', category: 'Logistics' },
-        { id: 'c', section: 'Page 1', category: 'Regulatory' },
+        { id: 'a', section: 'Equipment' },
+        { id: 'b', section: 'Equipment', category: 'Logistics' },
+        { id: 'c', section: 'Equipment', category: 'Regulatory' },
     ]);
     assert(pages.length === 1, 'scoring categories must not create pages when section is set');
 }
