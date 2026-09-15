@@ -1215,18 +1215,68 @@
       return true;
     }
 
+    /** True when this question's own answer should end the survey early. */
+    function evalEndSurveyIf(form, row) {
+      const equals = row.getAttribute('data-end-if-equals');
+      const includes = row.getAttribute('data-end-if-includes');
+      if ((equals == null || equals === '') && (includes == null || includes === '')) return false;
+      const qid = row.getAttribute('data-qid');
+      if (!qid) return false;
+      const selected = readLogicCurrent(form, qid);
+      if (includes != null && includes !== '') {
+        return selectedHasValue(selected, includes);
+      }
+      if (equals != null && equals !== '') {
+        return selectedHasValue(selected, equals);
+      }
+      return false;
+    }
+
+    function applyRequiredWhenVisible(row, show) {
+      row.querySelectorAll('[data-required-when-visible="true"]').forEach((input) => {
+        if (input.type === 'checkbox' || input.getAttribute('data-multiselect') === 'true') return;
+        if (input.getAttribute('data-radio-group') === 'true') return;
+        input.required = show;
+      });
+    }
+
     function syncLogic(form) {
-      form.querySelectorAll('.q').forEach((row) => {
+      const rows = [...form.querySelectorAll('.q')];
+      rows.forEach((row) => {
+        row.classList.remove('end-skipped');
         const show = evalShowIf(form, row);
         row.classList.toggle('hidden', !show);
-        row.querySelectorAll('[data-required-when-visible="true"]').forEach((input) => {
-          if (input.type === 'checkbox' || input.getAttribute('data-multiselect') === 'true') return;
-          if (input.getAttribute('data-radio-group') === 'true') return;
-          input.required = show;
-        });
+        applyRequiredWhenVisible(row, show);
       });
+      // Earliest visible question whose answer triggers end → hide everything after it
+      let endAt = -1;
+      rows.forEach((row, i) => {
+        if (endAt >= 0) return;
+        if (row.classList.contains('hidden')) return;
+        if (evalEndSurveyIf(form, row)) endAt = i;
+      });
+      if (endAt >= 0) {
+        for (let i = endAt + 1; i < rows.length; i++) {
+          rows[i].classList.add('hidden', 'end-skipped');
+          applyRequiredWhenVisible(rows[i], false);
+        }
+      }
       syncFillAndConfirm(form);
       updateProgress(form);
+    }
+
+    /** Page index of the terminating question, or null if survey has not ended early. */
+    function earlyEndPageIndex(form) {
+      const rows = [...form.querySelectorAll('.q')];
+      for (const row of rows) {
+        if (row.classList.contains('end-skipped')) continue;
+        if (row.classList.contains('hidden')) continue;
+        if (evalEndSurveyIf(form, row)) {
+          const pi = Number(row.getAttribute('data-page-idx'));
+          return Number.isFinite(pi) ? pi : 0;
+        }
+      }
+      return null;
     }
 
     function readQuestionValue(form, q, id) {
@@ -1424,24 +1474,35 @@
       el.privacy.hidden = false;
 
       const logicAttrs = (q) => {
+        const parts = [];
         const showIf = q.logic?.showIf;
         const logicQ = showIf?.questionId ? String(showIf.questionId) : '';
-        if (!logicQ) return '';
-        const parts = [`data-show-if-qid="${escapeHtml(logicQ)}"`];
-        if (showIf.equals != null && showIf.equals !== '') {
-          parts.push(`data-show-if-equals="${escapeHtml(String(showIf.equals))}"`);
+        if (logicQ) {
+          parts.push(`data-show-if-qid="${escapeHtml(logicQ)}"`);
+          if (showIf.equals != null && showIf.equals !== '') {
+            parts.push(`data-show-if-equals="${escapeHtml(String(showIf.equals))}"`);
+          }
+          if (showIf.includes != null && showIf.includes !== '') {
+            parts.push(`data-show-if-includes="${escapeHtml(String(showIf.includes))}"`);
+          }
+          if (Array.isArray(showIf.includesAny) && showIf.includesAny.length) {
+            parts.push(`data-show-if-includes-any="${escapeHtml(showIf.includesAny.map(String).join('||'))}"`);
+          }
+          if (showIf.notOnly != null && showIf.notOnly !== '') {
+            parts.push(`data-show-if-not-only="${escapeHtml(String(showIf.notOnly))}"`);
+          }
+          if (showIf.notEmpty === true) {
+            parts.push('data-show-if-not-empty="true"');
+          }
         }
-        if (showIf.includes != null && showIf.includes !== '') {
-          parts.push(`data-show-if-includes="${escapeHtml(String(showIf.includes))}"`);
-        }
-        if (Array.isArray(showIf.includesAny) && showIf.includesAny.length) {
-          parts.push(`data-show-if-includes-any="${escapeHtml(showIf.includesAny.map(String).join('||'))}"`);
-        }
-        if (showIf.notOnly != null && showIf.notOnly !== '') {
-          parts.push(`data-show-if-not-only="${escapeHtml(String(showIf.notOnly))}"`);
-        }
-        if (showIf.notEmpty === true) {
-          parts.push('data-show-if-not-empty="true"');
+        const endIf = q.logic?.endSurveyIf;
+        if (endIf && typeof endIf === 'object') {
+          if (endIf.equals != null && endIf.equals !== '') {
+            parts.push(`data-end-if-equals="${escapeHtml(String(endIf.equals))}"`);
+          }
+          if (endIf.includes != null && endIf.includes !== '') {
+            parts.push(`data-end-if-includes="${escapeHtml(String(endIf.includes))}"`);
+          }
         }
         return parts.join(' ');
       };
@@ -1671,42 +1732,66 @@
           const idx = Number(panel.getAttribute('data-page'));
           panel.hidden = idx !== pageIndex;
         });
+        syncLogic(form);
+        const endPi = earlyEndPageIndex(form);
+        const lastReachable = endPi == null ? pages.length - 1 : endPi;
+        if (pageIndex > lastReachable) {
+          pageIndex = lastReachable;
+          form.querySelectorAll('.page-panel').forEach((panel) => {
+            const idx = Number(panel.getAttribute('data-page'));
+            panel.hidden = idx !== pageIndex;
+          });
+        }
         if (pagerMeta) {
           pagerMeta.innerHTML = `Page <strong>${pageIndex + 1}</strong> of ${pages.length}`
-            + (pages[pageIndex] ? ` · <strong>${escapeHtml(pages[pageIndex].title)}</strong>` : '');
+            + (pages[pageIndex] ? ` · <strong>${escapeHtml(pages[pageIndex].title)}</strong>` : '')
+            + (endPi != null ? ' · <strong>Ready to submit</strong>' : '');
         }
         if (pageBack) pageBack.disabled = pageIndex === 0;
-        const last = pageIndex >= pages.length - 1;
+        const last = pageIndex >= lastReachable;
         if (pageNext) {
           pageNext.textContent = last ? 'Review & submit' : 'Next section';
           pageNext.hidden = last && pages.length === 1;
         }
+        form.querySelectorAll('.page-next-btn').forEach((btn) => {
+          const from = Number(btn.getAttribute('data-from'));
+          if (from === pageIndex) {
+            btn.textContent = last ? (previewMode ? 'Finish preview' : 'Review & submit') : 'Next section';
+          }
+        });
         if (submitSection) submitSection.hidden = !last;
         if (pagerSteps) {
           pagerSteps.querySelectorAll('.pager-dot').forEach((dot) => {
             const i = Number(dot.getAttribute('data-goto'));
             dot.classList.toggle('active', i === pageIndex);
             dot.classList.toggle('done', i < pageIndex);
+            // Soft-disable dots past the early-end page
+            if (endPi != null && i > endPi) {
+              dot.disabled = true;
+              dot.setAttribute('aria-disabled', 'true');
+            } else {
+              dot.disabled = false;
+              dot.removeAttribute('aria-disabled');
+            }
           });
         }
         if (scroll) {
           (document.getElementById('survey-pager') || form).scrollIntoView({ behavior: 'smooth', block: 'start' });
         }
-        syncLogic(form);
       };
 
       form.querySelectorAll('.multi-select-all').forEach((btn) => {
         btn.addEventListener('click', () => {
           const id = btn.getAttribute('data-for');
           form.querySelectorAll(`input[type="checkbox"][name="${CSS.escape ? CSS.escape(id) : id}"]`).forEach((el) => { el.checked = true; });
-          syncLogic(form);
+          showPage(pageIndex, { scroll: false });
         });
       });
       form.querySelectorAll('.multi-clear-all').forEach((btn) => {
         btn.addEventListener('click', () => {
           const id = btn.getAttribute('data-for');
           form.querySelectorAll(`input[type="checkbox"][name="${CSS.escape ? CSS.escape(id) : id}"]`).forEach((el) => { el.checked = false; });
-          syncLogic(form);
+          showPage(pageIndex, { scroll: false });
         });
       });
       form.querySelectorAll('.star-btn').forEach((btn) => {
@@ -1728,7 +1813,7 @@
           const row = btn.closest('.q');
           const confirmEl = row?.querySelector('.q-confirm:not([hidden]) input[data-confirm-for]');
           if (confirmEl) confirmEl.checked = false;
-          syncLogic(form);
+          showPage(pageIndex, { scroll: false });
         });
       });
       form.addEventListener('input', (e) => {
@@ -1738,7 +1823,7 @@
           const confirmEl = row?.querySelector('.q-confirm:not([hidden]) input[data-confirm-for]');
           if (confirmEl) confirmEl.checked = false;
         }
-        syncLogic(form);
+        showPage(pageIndex, { scroll: false });
       });
       form.addEventListener('change', (e) => {
         const t = e.target;
@@ -1747,7 +1832,7 @@
           const confirmEl = row?.querySelector('.q-confirm:not([hidden]) input[data-confirm-for]');
           if (confirmEl) confirmEl.checked = false;
         }
-        syncLogic(form);
+        showPage(pageIndex, { scroll: false });
       });
 
       const goNextFrom = (pi) => {
@@ -1764,7 +1849,9 @@
           formError.scrollIntoView({ behavior: 'smooth', block: 'center' });
           return;
         }
-        if (pi >= pages.length - 1) {
+        const endPi = earlyEndPageIndex(form);
+        const lastReachable = endPi == null ? pages.length - 1 : endPi;
+        if (pi >= lastReachable) {
           showPage(pi);
           // Persist before review/submit so nothing is lost if they bounce
           saveDraftOnPageChange('review');
@@ -1843,6 +1930,9 @@
         dot.addEventListener('click', () => {
           const target = Number(dot.getAttribute('data-goto'));
           if (!Number.isFinite(target) || target === pageIndex) return;
+          syncLogic(form);
+          const endPi = earlyEndPageIndex(form);
+          if (endPi != null && target > endPi) return;
           if (target > pageIndex) {
             // validate current before jumping forward
             const { missing, unconfirmed } = validatePage(pageIndex);

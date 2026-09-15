@@ -6838,6 +6838,11 @@
                         : showIfOp === 'includesAny' ? showIfIncludesAny
                         : showIfOp === 'notOnly' ? showIfNotOnly
                         : '';
+                    const endIf = q.logic?.endSurveyIf && typeof q.logic.endSurveyIf === 'object' ? q.logic.endSurveyIf : null;
+                    const endIfValue = endIf
+                        ? (endIf.equals ?? endIf.includes ?? (Array.isArray(endIf.includesAny) ? endIf.includesAny[0] : '') ?? '')
+                        : '';
+                    const endIfOn = !!(endIf && String(endIfValue || '').trim());
                     const qType = normalizeSurveyQuestionType(q.type);
                     const isSelect = isChoiceQuestionType(qType);
                     const opts = isSelect ? resolveBuilderOptions(q) : [];
@@ -7111,6 +7116,27 @@
                                     </div>
                                     <p class="text-[11px] text-gray-500 dark:text-gray-400 mt-2">For radio / multiple choice / checkboxes, pick from the prior question’s choices. Hidden questions are skipped on submit.</p>
                                 </details>
+
+                                <details class="rounded-md border border-rose-200 dark:border-rose-900/50 p-3 ${endIfOn ? 'bg-rose-50/40 dark:bg-rose-950/10' : ''}" ${endIfOn ? 'open' : ''}>
+                                    <summary class="cursor-pointer text-sm font-medium text-gray-700 dark:text-gray-200">End survey early…</summary>
+                                    <div class="mt-3 space-y-3">
+                                        <label class="flex items-center gap-2 text-sm text-gray-800 dark:text-gray-100">
+                                            <input type="checkbox" id="q_end_enable_${idx}" class="h-4 w-4" ${endIfOn ? 'checked' : ''} />
+                                            End the survey when this question’s answer is
+                                        </label>
+                                        ${(() => {
+                                            const endNorm = String(endIfValue || '').trim().toLowerCase();
+                                            if (isSelect && opts.length) {
+                                                return `<select name="q_end_value_${idx}" class="block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm" ${endIfOn ? '' : 'disabled'}>
+                                                    <option value="">Select a choice…</option>
+                                                    ${opts.map((opt) => `<option value="${escapeHtml(String(opt))}" ${String(opt).trim().toLowerCase() === endNorm ? 'selected' : ''}>${escapeHtml(String(opt))}</option>`).join('')}
+                                                </select>`;
+                                            }
+                                            return `<input name="q_end_value_${idx}" value="${escapeHtml(String(endIfValue || ''))}" placeholder="Exact answer that ends the survey" class="block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm" ${endIfOn ? '' : 'disabled'} />`;
+                                        })()}
+                                        <p class="text-[11px] text-gray-500 dark:text-gray-400">When that answer is selected, all later questions are skipped and the site can submit immediately.</p>
+                                    </div>
+                                </details>
                             </div>
                         </div>
                     `;
@@ -7134,68 +7160,91 @@
             };
 
             const readBuilderLogicFromCard = (card, idx) => {
-                const logicQId = readSelectValue(card.querySelector(`select[name="q_logic_qid_${idx}"]`));
-                if (!logicQId) return null;
-                let logicOp = readSelectValue(card.querySelector(`select[name="q_logic_op_${idx}"]`)) || 'equals';
-                const choiceChecks = [...card.querySelectorAll(`input[type="checkbox"][name="q_logic_choice_${idx}"]:checked`)]
-                    .map((el) => String(el.value || '').trim())
-                    .filter(Boolean);
-                const valueSel = card.querySelector(`select[name="q_logic_value_${idx}"]`);
-                const valueInput = card.querySelector(`input[name="q_logic_value_${idx}"]`);
-                let logicValue = '';
-                if (choiceChecks.length) {
-                    logicValue = choiceChecks.join(' || ');
-                    if (logicOp !== 'includesAny' && choiceChecks.length > 1) logicOp = 'includesAny';
-                    else if (logicOp === 'equals' && choiceChecks.length === 1) {
-                        /* keep equals */
-                    }
-                } else if (valueSel && !valueSel.disabled) {
-                    if (valueSel.multiple) {
-                        logicValue = [...valueSel.selectedOptions].map((o) => String(o.value || '').trim()).filter(Boolean).join(' || ');
-                    } else {
-                        logicValue = String(valueSel.value || '').trim();
-                    }
-                } else if (valueInput && !valueInput.disabled) {
-                    logicValue = String(valueInput.value || '').trim();
-                } else {
-                    logicValue = String(card.querySelector(`input[name="q_logic_equals_${idx}"]`)?.value || '').trim();
-                }
-
-                // If parent is a choice question, never keep a free-typed value that isn't one of the options
                 const qs = window.__siteSurveyBuilderQuestions || [];
-                const parent = qs.find((q) => q && q.id === logicQId);
-                const parentType = parent ? normalizeSurveyQuestionType(parent.type) : '';
-                if (parent && isChoiceQuestionType(parentType) && logicOp !== 'notEmpty') {
-                    const opts = resolveBuilderOptions(parent).map((o) => String(o || '').trim()).filter(Boolean);
-                    const optLower = new Map(opts.map((o) => [o.toLowerCase(), o]));
-                    if (logicOp === 'includesAny') {
-                        const parts = logicValue.split(/\s*\|\|\s*/).map((s) => s.trim()).filter(Boolean)
-                            .map((s) => optLower.get(s.toLowerCase()) || null)
-                            .filter(Boolean);
-                        logicValue = parts.join(' || ');
-                        if (!parts.length) return { showIf: { questionId: logicQId, notEmpty: true } };
+                const selfQ = qs[idx];
+
+                // --- showIf (depends on a prior question) ---
+                let showIf = null;
+                const logicQId = readSelectValue(card.querySelector(`select[name="q_logic_qid_${idx}"]`));
+                if (logicQId) {
+                    let logicOp = readSelectValue(card.querySelector(`select[name="q_logic_op_${idx}"]`)) || 'equals';
+                    const choiceChecks = [...card.querySelectorAll(`input[type="checkbox"][name="q_logic_choice_${idx}"]:checked`)]
+                        .map((el) => String(el.value || '').trim())
+                        .filter(Boolean);
+                    const valueSel = card.querySelector(`select[name="q_logic_value_${idx}"]`);
+                    const valueInput = card.querySelector(`input[name="q_logic_value_${idx}"]`);
+                    let logicValue = '';
+                    if (choiceChecks.length) {
+                        logicValue = choiceChecks.join(' || ');
+                        if (logicOp !== 'includesAny' && choiceChecks.length > 1) logicOp = 'includesAny';
+                    } else if (valueSel && !valueSel.disabled) {
+                        logicValue = valueSel.multiple
+                            ? [...valueSel.selectedOptions].map((o) => String(o.value || '').trim()).filter(Boolean).join(' || ')
+                            : String(valueSel.value || '').trim();
+                    } else if (valueInput && !valueInput.disabled) {
+                        logicValue = String(valueInput.value || '').trim();
                     } else {
-                        const canon = optLower.get(logicValue.toLowerCase());
-                        if (!canon) {
-                            // Invalid / blank choice — require an explicit pick (keep qid so UI stays open)
-                            if (!logicValue) return { showIf: { questionId: logicQId, notEmpty: true } };
-                            return { showIf: { questionId: logicQId, notEmpty: true } };
+                        logicValue = String(card.querySelector(`input[name="q_logic_equals_${idx}"]`)?.value || '').trim();
+                    }
+
+                    const parent = qs.find((q) => q && q.id === logicQId);
+                    const parentType = parent ? normalizeSurveyQuestionType(parent.type) : '';
+                    if (parent && isChoiceQuestionType(parentType) && logicOp !== 'notEmpty') {
+                        const parentOpts = resolveBuilderOptions(parent).map((o) => String(o || '').trim()).filter(Boolean);
+                        const optLower = new Map(parentOpts.map((o) => [o.toLowerCase(), o]));
+                        if (logicOp === 'includesAny') {
+                            const parts = logicValue.split(/\s*\|\|\s*/).map((s) => s.trim()).filter(Boolean)
+                                .map((s) => optLower.get(s.toLowerCase()) || null)
+                                .filter(Boolean);
+                            logicValue = parts.join(' || ');
+                            if (!parts.length) logicOp = 'notEmpty';
+                        } else {
+                            const canon = optLower.get(logicValue.toLowerCase());
+                            if (!canon) logicOp = 'notEmpty';
+                            else {
+                                logicValue = canon;
+                                if (parentType === 'multiselect' && logicOp === 'equals') logicOp = 'includes';
+                                if (parentType !== 'multiselect' && logicOp === 'includes') logicOp = 'equals';
+                            }
                         }
-                        logicValue = canon;
-                        // Radio/select → equals; multiselect → includes
-                        if (parentType === 'multiselect' && logicOp === 'equals') logicOp = 'includes';
-                        if (parentType !== 'multiselect' && logicOp === 'includes') logicOp = 'equals';
+                    }
+
+                    showIf = { questionId: logicQId };
+                    if (logicOp === 'notEmpty') showIf.notEmpty = true;
+                    else if (logicOp === 'includes') showIf.includes = logicValue;
+                    else if (logicOp === 'includesAny') {
+                        showIf.includesAny = logicValue.split(/\s*\|\|\s*/).map((s) => s.trim()).filter(Boolean);
+                    } else if (logicOp === 'notOnly') showIf.notOnly = logicValue;
+                    else showIf.equals = logicValue;
+                }
+
+                // --- endSurveyIf (based on THIS question's answer) ---
+                let endSurveyIf = null;
+                const endOn = !!card.querySelector(`#q_end_enable_${idx}`)?.checked;
+                if (endOn) {
+                    const endSel = card.querySelector(`select[name="q_end_value_${idx}"]`);
+                    const endInp = card.querySelector(`input[name="q_end_value_${idx}"]`);
+                    let endValue = endSel && !endSel.disabled
+                        ? String(endSel.value || '').trim()
+                        : String(endInp?.value || '').trim();
+                    const selfType = normalizeSurveyQuestionType(selfQ?.type || 'text');
+                    if (selfQ && isChoiceQuestionType(selfType)) {
+                        const selfOpts = resolveBuilderOptions(selfQ).map((o) => String(o || '').trim()).filter(Boolean);
+                        const hit = selfOpts.find((o) => o.toLowerCase() === endValue.toLowerCase());
+                        endValue = hit || '';
+                    }
+                    if (endValue) {
+                        endSurveyIf = selfType === 'multiselect'
+                            ? { includes: endValue }
+                            : { equals: endValue };
                     }
                 }
 
-                const showIf = { questionId: logicQId };
-                if (logicOp === 'notEmpty') showIf.notEmpty = true;
-                else if (logicOp === 'includes') showIf.includes = logicValue;
-                else if (logicOp === 'includesAny') {
-                    showIf.includesAny = logicValue.split(/\s*\|\|\s*/).map((s) => s.trim()).filter(Boolean);
-                } else if (logicOp === 'notOnly') showIf.notOnly = logicValue;
-                else showIf.equals = logicValue;
-                return { showIf };
+                if (!showIf && !endSurveyIf) return null;
+                return {
+                    ...(showIf ? { showIf } : {}),
+                    ...(endSurveyIf ? { endSurveyIf } : {}),
+                };
             };
 
             const readBuilderTypeFromCard = (card, idx, prevType) => {
@@ -7256,7 +7305,9 @@
                     q.section = (card.querySelector(`input[name="q_section_${idx}"]`)?.value || q.section || 'Page 1').trim() || 'Page 1';
                     q.logic = readBuilderLogicFromCard(card, idx);
                     // If logic controls were missing from DOM, keep prior logic rather than wiping
-                    if (q.logic == null && prevLogic && !card.querySelector(`select[name="q_logic_qid_${idx}"]`)) {
+                    if (q.logic == null && prevLogic
+                        && !card.querySelector(`select[name="q_logic_qid_${idx}"]`)
+                        && !card.querySelector(`#q_end_enable_${idx}`)) {
                         q.logic = prevLogic;
                     }
 
@@ -7563,6 +7614,16 @@
                         return;
                     }
                     if (e.target.matches?.(`select[name="q_logic_value_${idx}"], input[name="q_logic_value_${idx}"], input[name="q_logic_choice_${idx}"]`)) {
+                        const qs = syncBuilderFromDom();
+                        window.__siteSurveyBuilderQuestions = qs;
+                    }
+                    if (e.target.matches?.(`#q_end_enable_${idx}`)) {
+                        const qs = syncBuilderFromDom();
+                        window.__siteSurveyBuilderQuestions = qs;
+                        renderBuilder();
+                        return;
+                    }
+                    if (e.target.matches?.(`select[name="q_end_value_${idx}"], input[name="q_end_value_${idx}"]`)) {
                         const qs = syncBuilderFromDom();
                         window.__siteSurveyBuilderQuestions = qs;
                     }
@@ -13606,8 +13667,15 @@
                             }
                         }
 
-                        // Logic: prefer memory synced from DOM; fall back to DOM (select OR input)
-                        let logic = (q.logic && q.logic.showIf && q.logic.showIf.questionId) ? q.logic : null;
+                        // Logic: prefer memory synced from DOM (showIf and/or endSurveyIf); fall back to DOM
+                        let logic = null;
+                        if (q.logic && typeof q.logic === 'object') {
+                            const hasShow = !!(q.logic.showIf && q.logic.showIf.questionId);
+                            const hasEnd = !!(q.logic.endSurveyIf && typeof q.logic.endSurveyIf === 'object'
+                                && (q.logic.endSurveyIf.equals || q.logic.endSurveyIf.includes
+                                    || (Array.isArray(q.logic.endSurveyIf.includesAny) && q.logic.endSurveyIf.includesAny.length)));
+                            if (hasShow || hasEnd) logic = q.logic;
+                        }
                         if (!logic && card) {
                             const logicQId = (card.querySelector(`select[name="q_logic_qid_${idx}"]`)?.value || '').trim();
                             const logicOp = (card.querySelector(`select[name="q_logic_op_${idx}"]`)?.value || 'equals').trim();
@@ -13625,8 +13693,8 @@
                                     || card.querySelector(`input[name="q_logic_equals_${idx}"]`)?.value
                                     || '').trim();
                             }
-                            if (logicQId) {
-                                const showIf = { questionId: logicQId };
+                            const showIf = logicQId ? { questionId: logicQId } : null;
+                            if (showIf) {
                                 const op = (logicOp === 'equals' && choiceChecks.length > 1) ? 'includesAny' : logicOp;
                                 if (op === 'notEmpty') showIf.notEmpty = true;
                                 else if (op === 'includes') showIf.includes = logicValue;
@@ -13634,7 +13702,25 @@
                                     showIf.includesAny = logicValue.split(/\s*\|\|\s*/).map((s) => s.trim()).filter(Boolean);
                                 } else if (op === 'notOnly') showIf.notOnly = logicValue;
                                 else showIf.equals = logicValue;
-                                logic = { showIf };
+                            }
+                            let endSurveyIf = null;
+                            if (card.querySelector(`#q_end_enable_${idx}`)?.checked) {
+                                const endSel = card.querySelector(`select[name="q_end_value_${idx}"]`);
+                                const endInp = card.querySelector(`input[name="q_end_value_${idx}"]`);
+                                const endValue = endSel && !endSel.disabled
+                                    ? String(endSel.value || '').trim()
+                                    : String(endInp?.value || '').trim();
+                                if (endValue) {
+                                    endSurveyIf = type === 'multiselect'
+                                        ? { includes: endValue }
+                                        : { equals: endValue };
+                                }
+                            }
+                            if (showIf || endSurveyIf) {
+                                logic = {
+                                    ...(showIf ? { showIf } : {}),
+                                    ...(endSurveyIf ? { endSurveyIf } : {}),
+                                };
                             }
                         }
 

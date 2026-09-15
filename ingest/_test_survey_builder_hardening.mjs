@@ -95,6 +95,62 @@ assert(selectedHasValue(['Other'], 'Other') === true, 'Other match');
 assert(selectedHasValue(['Anterior', 'Other'], 'Other') === true, 'multiselect includes Other');
 assert(selectedHasValue([], 'No') === false, 'empty selected must not match');
 
+/** Mirror site-survey.html endSurveyIf evaluation */
+function evalEndSurveyIf(selected, endIf) {
+    if (!endIf || typeof endIf !== 'object') return false;
+    if (endIf.includes != null && endIf.includes !== '') {
+        return selectedHasValue(selected, endIf.includes);
+    }
+    if (endIf.equals != null && endIf.equals !== '') {
+        return selectedHasValue(selected, endIf.equals);
+    }
+    return false;
+}
+
+function applyEndSurveySkip(questions, answersById) {
+    // answersById: { qid: string[] }
+    let endAt = -1;
+    const visible = questions.map((q, i) => {
+        if (endAt >= 0) return { id: q.id, skipped: true, endSkipped: true };
+        const selected = answersById[q.id] || [];
+        if (evalEndSurveyIf(selected, q.logic?.endSurveyIf)) endAt = i;
+        return { id: q.id, skipped: false, endSkipped: false };
+    });
+    if (endAt >= 0) {
+        for (let i = endAt + 1; i < visible.length; i++) {
+            visible[i].skipped = true;
+            visible[i].endSkipped = true;
+        }
+    }
+    return { endAt, visible };
+}
+
+{
+    const qs = [
+        { id: 'q1', logic: { endSurveyIf: { equals: 'No' } } },
+        { id: 'q2' },
+        { id: 'q3' },
+    ];
+    const ended = applyEndSurveySkip(qs, { q1: ['No'] });
+    assert(ended.endAt === 0, 'end should fire on q1');
+    assert(ended.visible[0].skipped === false, 'terminating question stays');
+    assert(ended.visible[1].endSkipped && ended.visible[2].endSkipped, 'later questions end-skipped');
+    const continued = applyEndSurveySkip(qs, { q1: ['Yes'] });
+    assert(continued.endAt === -1, 'Yes must not end');
+    assert(continued.visible.every((v) => !v.endSkipped), 'all questions remain');
+}
+
+{
+    const qs = [
+        { id: 'a' },
+        { id: 'b', logic: { endSurveyIf: { includes: 'Decline' } } },
+        { id: 'c' },
+    ];
+    const r = applyEndSurveySkip(qs, { a: ['x'], b: ['Keep going', 'Decline'] });
+    assert(r.endAt === 1, 'multiselect includes ends at b');
+    assert(r.visible[2].endSkipped === true, 'c skipped after decline');
+}
+
 function resolveBuilderPageSection(q) {
     const explicit = String(q?.section || '').trim();
     if (explicit) return explicit;

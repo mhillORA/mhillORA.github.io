@@ -92,6 +92,7 @@ Captured 2026-09-09. Status: `done` | `partial` | `todo` | `later` | `needs-spec
 | F9 | Rename surveys in Responses UI | todo | |
 | F10 | Move Links + Responses elsewhere (IA) | needs-spec | |
 | F11 | Settled questions → library → assign to prior studies/surveys | in-progress | `ingest/feasibility_question_library_seed.json` |
+| F12 | End survey early when a question answer matches | done | Builder `End survey early…` → `logic.endSurveyIf`; public survey hides later Qs + jumps to submit |
 
 ---
 
