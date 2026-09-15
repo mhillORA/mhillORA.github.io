@@ -151,6 +151,35 @@ function applyEndSurveySkip(questions, answersById) {
     assert(r.visible[2].endSkipped === true, 'c skipped after decline');
 }
 
+/** Clone must remap showIf.questionId onto new question ids */
+function remapCloneLogic(oldQuestions) {
+    const idMap = new Map();
+    const mapped = oldQuestions.map((q, qi) => {
+        const oldId = q.id || `q_legacy_${qi}`;
+        const newId = `clone_${qi}`;
+        idMap.set(String(oldId), newId);
+        const logic = q.logic ? JSON.parse(JSON.stringify(q.logic)) : null;
+        return { ...q, id: newId, logic };
+    });
+    mapped.forEach((q) => {
+        const dep = q.logic?.showIf?.questionId;
+        if (dep && idMap.has(String(dep))) q.logic.showIf.questionId = idMap.get(String(dep));
+    });
+    return mapped;
+}
+
+{
+    const cloned = remapCloneLogic([
+        { id: 'gsf_021', type: 'radio', options: ['Yes', 'No'] },
+        { id: 'gsf_022', type: 'text', logic: { showIf: { questionId: 'gsf_021', equals: 'Yes' } } },
+        { id: 'gsf_023', type: 'text', logic: { showIf: { questionId: 'gsf_021', equals: 'No' } } },
+    ]);
+    assert(cloned[0].id === 'clone_0', 'parent id remapped');
+    assert(cloned[1].logic.showIf.questionId === 'clone_0', 'child showIf remapped to new parent');
+    assert(cloned[2].logic.showIf.questionId === 'clone_0', 'second child remapped');
+    assert(cloned[1].logic.showIf.equals === 'Yes', 'equals preserved');
+}
+
 function resolveBuilderPageSection(q) {
     const explicit = String(q?.section || '').trim();
     if (explicit) return explicit;

@@ -6219,7 +6219,7 @@
                                 </div>
                                 <label class="flex items-center gap-2 text-sm"><input name="required" type="checkbox" class="h-4 w-4" ${existing?.required !== false ? 'checked' : ''} /> Required (default)</label>
                                 <div>
-                                    <label class="block text-sm font-medium">Choices (one per line, multiple choice only)</label>
+                                    <label class="block text-sm font-medium">Choices (one per line — radio, checkboxes, or multiple choice)</label>
                                     <textarea name="options" rows="4" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm">${escapeHtml(opts.join('\n'))}</textarea>
                                 </div>
                                 <div id="library-question-error" class="text-sm text-red-600 hidden"></div>
@@ -6462,10 +6462,27 @@
                     const label = String(q.label || q.title || '').trim();
                     const hit = byLabel.get(normalizeLibraryLabelKey(label));
                     if (!hit) return q;
-                    const nextType = normalizeSurveyQuestionType(hit.type || q.type);
-                    if (q.libraryQuestionId === hit.id && normalizeSurveyQuestionType(q.type) === nextType) return q;
+                    const tmplType = normalizeSurveyQuestionType(q.type);
+                    const libType = normalizeSurveyQuestionType(hit.type || q.type);
+                    // Never demote a known builder/template type (radio/checkbox → text) from a stale library row
+                    const keepType = SURVEY_QUESTION_TYPES.includes(String(q.type || '').toLowerCase())
+                        ? tmplType
+                        : libType;
+                    const keepOpts = isChoiceQuestionType(keepType)
+                        ? (coerceOptionList(q.options).length ? coerceOptionList(q.options) : coerceOptionList(hit.options))
+                        : [];
+                    if (q.libraryQuestionId === hit.id
+                        && normalizeSurveyQuestionType(q.type) === keepType
+                        && (!isChoiceQuestionType(keepType) || coerceOptionList(q.options).length || !keepOpts.length)) {
+                        return q;
+                    }
                     changed = true;
-                    return { ...q, libraryQuestionId: hit.id, type: nextType };
+                    return {
+                        ...q,
+                        libraryQuestionId: hit.id,
+                        type: keepType,
+                        ...(isChoiceQuestionType(keepType) && keepOpts.length ? { options: keepOpts } : {}),
+                    };
                 });
                 if (!changed) continue;
                 try {
@@ -6577,18 +6594,25 @@
                 const libById = new Map(
                     asSurveyList(allSiteSurveyQuestionLibrary).map((item) => [item.id, item])
                 );
-                return raw.map((q) => {
+                const idMap = new Map(); // oldId → newId (clone only)
+                const mapped = raw.map((q, qi) => {
                     const type = normalizeSurveyQuestionType(q.type);
                     const libItem = q.libraryQuestionId ? libById.get(q.libraryQuestionId) : null;
+                    const oldId = q.id || `q_legacy_${qi}`;
+                    const newId = isClone
+                        ? `q_${Date.now().toString(36)}_${qi}_${Math.random().toString(36).slice(2, 6)}`
+                        : (q.id || `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`);
+                    if (isClone) idMap.set(String(oldId), newId);
+                    const logicSrc = q.logic && typeof q.logic === 'object' ? q.logic : null;
+                    // Deep-ish clone so we never mutate the source template's logic object
+                    const logic = logicSrc ? JSON.parse(JSON.stringify(logicSrc)) : null;
                     return {
-                        id: isClone
-                            ? `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`
-                            : (q.id || `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`),
+                        id: newId,
                         label: q.label || q.title || '',
                         type,
                         required: q.required !== false,
                         options: resolveBuilderOptions(q, libItem),
-                        logic: q.logic && typeof q.logic === 'object' ? q.logic : null,
+                        logic,
                         scoringWeight: typeof q.scoringWeight === 'number' ? q.scoringWeight : 0,
                         scoringOptions: Array.isArray(q.scoringOptions) ? q.scoringOptions : [],
                         category: q.category || 'General',
@@ -6599,6 +6623,16 @@
                         libraryQuestionId: q.libraryQuestionId || null,
                     };
                 });
+                // Remap showIf.questionId onto the new question ids so cloned branching still works
+                if (isClone && idMap.size) {
+                    mapped.forEach((q) => {
+                        const dep = q.logic?.showIf?.questionId;
+                        if (!dep) return;
+                        const next = idMap.get(String(dep));
+                        if (next) q.logic.showIf.questionId = next;
+                    });
+                }
+                return mapped;
             };
 
             const fromDef = cloneQuestionsFromDef();
@@ -13583,8 +13617,13 @@
                     const required = form.required?.checked !== false;
                     let options = String(form.options.value || '').split('\n').map(s => s.trim()).filter(Boolean);
                     if (!label) throw new Error('Question text is required');
-                    if (type === 'select' && options.length < 2) {
-                        options = options.length ? [...options, 'No'] : ['Yes', 'No'];
+                    if (isChoiceQuestionType(type)) {
+                        if ((type === 'select' || type === 'radio') && options.length < 2) {
+                            options = options.length ? [...options, 'No'] : ['Yes', 'No'];
+                        }
+                        if (type === 'multiselect' && options.length < 2) {
+                            throw new Error('Checkboxes need at least two choices (one per line)');
+                        }
                     }
                     const prev = editId ? (allSiteSurveyQuestionLibrary || []).find(q => q.id === editId) : null;
                     const payload = {
@@ -13594,7 +13633,7 @@
                         type,
                         category,
                         required,
-                        options: type === 'select' ? options : [],
+                        options: isChoiceQuestionType(type) ? options : [],
                         status: prev?.status || 'active',
                         scoringWeight: prev?.scoringWeight || 0,
                         scoringOptions: prev?.scoringOptions || [],
