@@ -1,8 +1,6 @@
 """
-Wire rebuild not-interested flow:
-  1) Select reason checkbox(es)
-  2) Show short-text "why not"
-  3) End survey only when reason selected AND why text is filled
+Keep existing additional-comments visible when end-early reason is selected.
+No new field — restore original comments label/type and wire show-through.
 
 Usage:
   python ingest/fix_rebuild_end_early_why.py --apply
@@ -21,8 +19,8 @@ REPO = Path(__file__).resolve().parents[1]
 SURVEY_ID = "survey-rebuild-mytx272am-201"
 INTEREST_ID = "rebuild_013_has-the-investigator-reviewed-the-protoc"
 REASON_ID = "rebuild_014_if-not-interested-what-is-the-reason"
-WHY_ID = "rebuild_016_do-you-have-any-additional-comments-you-"
-WHY_LABEL = "Please briefly explain why you are not interested"
+COMMENTS_ID = "rebuild_016_do-you-have-any-additional-comments-you-"
+COMMENTS_LABEL = "Do you have any additional comments you would like to provide?"
 
 
 def cosmos():
@@ -50,56 +48,37 @@ def main():
     by_id = {str(q.get("id") or ""): q for q in qs}
 
     reason = by_id.get(REASON_ID)
-    why = by_id.get(WHY_ID)
-    if not reason:
-        raise SystemExit(f"missing reason question {REASON_ID}")
-    if not why:
-        # Insert why text right after reason
-        why = {
-            "id": WHY_ID,
-            "label": WHY_LABEL,
-            "type": "text",
-            "required": True,
-            "options": [],
-            "section": reason.get("section") or "SECTION 1: CONTACT INFORMATION",
-            "category": reason.get("category") or "CONTACT INFORMATION",
-            "libraryQuestionId": None,
-        }
-        idx = next(i for i, q in enumerate(qs) if str(q.get("id")) == REASON_ID)
-        qs.insert(idx + 1, why)
-        by_id[WHY_ID] = why
-        print(f"INSERT why question after reason at {idx+1}")
-    else:
-        why["label"] = WHY_LABEL
-        why["type"] = "text"  # short text, not long textarea
-        why["required"] = True
-        why["section"] = reason.get("section") or why.get("section")
-        print(f"UPDATE why question {WHY_ID}")
+    comments = by_id.get(COMMENTS_ID)
+    if not reason or not comments:
+        raise SystemExit("missing reason or comments question")
 
     opts = [str(o).strip() for o in (reason.get("options") or []) if str(o).strip()]
     reason["logic"] = {
         "showIf": {"questionId": INTEREST_ID, "equals": "No"},
         "endSurveyIf": {
             "includesAny": opts,
-            "requireFilledQuestionId": WHY_ID,
+            # Keep the existing comments box visible; hide only what follows it.
+            "showThroughQuestionId": COMMENTS_ID,
         },
     }
-    why["logic"] = {
+    comments["label"] = COMMENTS_LABEL
+    comments["type"] = "textarea"
+    comments["required"] = False
+    comments["section"] = reason.get("section") or comments.get("section")
+    comments["logic"] = {
         "showIf": {"questionId": INTEREST_ID, "equals": "No"},
     }
-    # Keep why visible while ending reasons are being filled — public form won't hide it
-    # until requireFilledQuestionId has data.
 
-    print("reason endSurveyIf:", json.dumps(reason["logic"]["endSurveyIf"], indent=2)[:500])
-    print("why label:", why["label"], "type:", why["type"], "required:", why["required"])
+    print("reason endSurveyIf:", json.dumps(reason["logic"]["endSurveyIf"], indent=2))
+    print("comments:", comments["label"], comments["type"])
 
     if not args.apply:
-        print("Dry run only. Re-run with --apply.")
+        print("Dry run only.")
         return
 
     doc["questions"] = qs
     doc["updatedAt"] = datetime.now(timezone.utc).isoformat()
-    doc["endEarlyWhyWiredAt"] = doc["updatedAt"]
+    doc["endEarlyCommentsWiredAt"] = doc["updatedAt"]
     c.upsert_item(doc)
     print("APPLIED")
 
