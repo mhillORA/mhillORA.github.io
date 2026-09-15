@@ -4,17 +4,27 @@
  */
 
 // Mirror api/survey-secure-routes.js buildSurveyPages (keep in sync)
+function resolvePublicSectionKeyLocal(q) {
+    const section = String(q?.section || '').trim();
+    const weakSection = !section || /^(page\s*\d+|questions)$/i.test(section);
+    if (section && !weakSection) return section;
+    const legacy = String(q?.category || '').trim();
+    if (legacy && !/^(general|questions|page\s*\d+)$/i.test(legacy)) return legacy;
+    return section || 'Questions';
+}
+
+function isWeakPublicSectionKey(key) {
+    return !key || /^(page\s*\d+|questions)$/i.test(String(key).trim());
+}
+
 function buildSurveyPagesLocal(questions) {
     const list = Array.isArray(questions) ? questions : [];
-    const anyExplicitSection = list.some((q) => String(q?.section || '').trim());
     const pages = [];
+    let lastStrongKey = '';
     list.forEach((q, idx) => {
-        let key;
-        if (anyExplicitSection) {
-            key = String(q.section || '').trim() || 'Page 1';
-        } else {
-            key = String(q.section || q.category || '').trim() || 'Questions';
-        }
+        let key = resolvePublicSectionKeyLocal(q);
+        if (isWeakPublicSectionKey(key) && lastStrongKey) key = lastStrongKey;
+        else if (!isWeakPublicSectionKey(key)) lastStrongKey = key;
         if (!pages.length || pages[pages.length - 1].key !== key) {
             pages.push({ key, title: key, questionIds: [], indexes: [] });
         }
@@ -55,6 +65,20 @@ function assert(cond, msg) {
         { id: 'c', section: 'Page 1', category: 'Regulatory' },
     ]);
     assert(pages.length === 1, 'scoring categories must not create pages when section is set');
+}
+
+{
+    // Mighty rebuild bug: follow-ups stamped "Page 1" must stay on prior SECTION
+    const rebuildish = buildSurveyPagesLocal([
+        { id: 's2a', section: 'SECTION 2: SITE INFORMATION' },
+        { id: 's2b', section: 'Page 1' },
+        { id: 's2c', section: 'SECTION 2: SITE INFORMATION' },
+        { id: 's3a', section: 'SECTION 3: SITE PROFILE' },
+        { id: 's3b', section: 'Page 1' },
+    ]);
+    assert(rebuildish.length === 2, `follow-up Page 1 must not shatter pages, got ${rebuildish.length}`);
+    assert(rebuildish[0].questionIds.join(',') === 's2a,s2b,s2c', 'section 2 membership');
+    assert(rebuildish[1].questionIds.join(',') === 's3a,s3b', 'section 3 membership');
 }
 
 {

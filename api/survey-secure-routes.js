@@ -323,11 +323,19 @@ function resolvePublicSectionKey(q) {
     return section || 'Questions';
 }
 
+function isWeakPublicSectionKey(key) {
+    return !key || /^(page\s*\d+|questions)$/i.test(String(key).trim());
+}
+
 function buildSurveyPages(questions) {
     const list = Array.isArray(questions) ? questions : [];
     const pages = [];
+    let lastStrongKey = '';
     list.forEach((q, idx) => {
-        const key = resolvePublicSectionKey(q);
+        let key = resolvePublicSectionKey(q);
+        // Follow-ups often inherit a default "Page 1" — keep them on the prior section page.
+        if (isWeakPublicSectionKey(key) && lastStrongKey) key = lastStrongKey;
+        else if (!isWeakPublicSectionKey(key)) lastStrongKey = key;
         if (!pages.length || pages[pages.length - 1].key !== key) {
             pages.push({
                 key,

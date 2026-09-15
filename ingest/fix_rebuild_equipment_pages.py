@@ -117,7 +117,12 @@ def main():
     equip_fixed = 0
     unmatched = []
 
+    def is_weak_section(s: str) -> bool:
+        t = (s or "").strip()
+        return (not t) or bool(re.match(r"^(page\s*\d+|questions)$", t, re.I))
+
     new_qs = []
+    last_strong = ""
     for q in qs:
         nq = dict(q)
         label = str(q.get("label") or "")
@@ -128,9 +133,16 @@ def main():
             if str(nq.get("section") or "") != str(src["section"]):
                 nq["section"] = src["section"]
                 section_fixed += 1
-        elif str(nq.get("section") or "").strip() in ("", "Page 1", "Questions"):
-            # keep Page 1 only if we truly have no source — still count for report
-            unmatched.append(label[:70])
+        elif is_weak_section(str(nq.get("section") or "")):
+            # Follow-ups / extras defaulted to "Page 1" — keep them on the prior AF section.
+            if last_strong:
+                nq["section"] = last_strong
+                section_fixed += 1
+            else:
+                unmatched.append(label[:70])
+
+        if not is_weak_section(str(nq.get("section") or "")):
+            last_strong = str(nq["section"]).strip()
 
         lib = str(nq.get("libraryQuestionId") or "")
         opts = list(nq.get("options") or [])
@@ -158,6 +170,23 @@ def main():
 
         new_qs.append(nq)
 
+    # Rebuild ordered pages list for API consumers that read definition.pages
+    pages = []
+    for i, q in enumerate(new_qs):
+        key = str(q.get("section") or "Questions").strip() or "Questions"
+        if not pages or pages[-1]["key"] != key:
+            pages.append(
+                {
+                    "key": key,
+                    "title": re.sub(r"^SECTION\s+\d+\s*:\s*", "", key, flags=re.I).strip()
+                    or key,
+                    "questionIds": [],
+                    "indexes": [],
+                }
+            )
+        pages[-1]["questionIds"].append(q.get("id") or f"q_{i}")
+        pages[-1]["indexes"].append(i)
+
     # Section summary
     from collections import Counter
 
@@ -181,11 +210,12 @@ def main():
         return
 
     doc["questions"] = new_qs
+    doc["pages"] = pages
     doc["updatedAt"] = now
     doc["pagesRestoredAt"] = now
     doc["equipmentOptionsFixedAt"] = now
     c.upsert_item(doc)
-    print("APPLIED")
+    print(f"APPLIED ({len(pages)} pages)")
 
 
 if __name__ == "__main__":
