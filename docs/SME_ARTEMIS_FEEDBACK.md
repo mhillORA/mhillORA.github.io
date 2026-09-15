@@ -9,8 +9,8 @@ Captured 2026-09-09. Status: `done` | `partial` | `todo` | `later` | `needs-spec
 | ID | Ask | Status | Notes |
 |----|-----|--------|-------|
 | X1 | Unique identifier for each site (immutable) | partial | Site Code exists; make required, immutable, used as UID everywhere |
-| X2 | Rename Past Studies → Completed Studies everywhere | todo | UI copy sweep |
-| X3 | Past Sites → Master Site List | todo | Incl. back-button copy |
+| X2 | Rename Past Studies → Completed Studies everywhere | done | UI copy sweep |
+| X3 | Past Sites → Master Site List | done | Incl. back-button copy |
 | X4 | Whole numbers only (screened/scheduled/enrolled) | todo | No decimals |
 | X5 | Lookup tables (10 lists) | needs-spec | SME to provide list values |
 | X6 | New nav: I/E Criteria Repository | todo | Header/placeholder first |
@@ -21,9 +21,9 @@ Captured 2026-09-09. Status: `done` | `partial` | `todo` | `later` | `needs-spec
 
 | ID | Ask | Status |
 |----|-----|--------|
-| D1 | Clickable tiles → filtered target tab (e.g. 48 live sites → Sites filtered) | todo |
-| D2 | Role-specific dashboard (Ops / Monitoring / Exec Leadership) | todo |
-| D3 | 30-day trend sparklines on key tiles (e.g. patients enrolled) | todo |
+| D1 | Clickable tiles → filtered target tab (e.g. 48 live sites → Sites filtered) | done |
+| D2 | Role-specific dashboard (Ops / Monitoring / Exec Leadership) | partial |
+| D3 | 30-day trend sparklines on key tiles (e.g. patients enrolled) | partial |
 
 ---
 
@@ -31,9 +31,9 @@ Captured 2026-09-09. Status: `done` | `partial` | `todo` | `later` | `needs-spec
 
 | ID | Ask | Status |
 |----|-----|--------|
-| ST1 | Add Study: remove Groups | todo |
-| ST2 | Add Sponsor Name, Indication, Phase | todo |
-| ST3 | Title block shows Sponsor + Indication + Phase | todo |
+| ST1 | Add Study: remove Groups | done |
+| ST2 | Add Sponsor Name, Indication, Phase | done |
+| ST3 | Title block shows Sponsor + Indication + Phase | done |
 | ST4 | Timeline milestones: Start-up, Conduct (%), DB Lock | later |
 | ST5 | FPFV/LPLV vs budget + ahead/behind | later |
 | ST6 | Flag assumed enrollment progress vs actual | later |
@@ -47,8 +47,8 @@ Captured 2026-09-09. Status: `done` | `partial` | `todo` | `later` | `needs-spec
 | ID | Ask | Status |
 |----|-----|--------|
 | SI1 | Add Site: PI/Coordinators from feasibility responses | todo |
-| SI2 | Add Unique Identifier; remove site name abbreviation | todo |
-| SI3 | Mailing address = same as site address checkbox | todo |
+| SI2 | Add Unique Identifier; remove site name abbreviation | done |
+| SI3 | Mailing address = same as site address checkbox | done |
 | SI4 | Indication Experience block (indication, # studies, pts enrolled, pts/site/month, SF%) | todo |
 | SI5 | Flag stale feasibility + prompt to send recurring | todo |
 
@@ -57,18 +57,18 @@ Captured 2026-09-09. Status: `done` | `partial` | `todo` | `later` | `needs-spec
 | ID | Ask | Status |
 |----|-----|--------|
 | SP1 | Remove Past Studies block; Completed Studies only | todo |
-| SP2 | Total Studies → Completed Studies | todo |
-| SP3 | Enrolled (Live) → Patients Currently Enrolled In Trials | todo |
-| SP4 | Legacy Enrolled → Total Patients Enrolled All Time | todo |
-| SP5 | Surveys → Study Specific Feasibility Questionnaires (click-through) | todo |
-| SP6 | Swap Site Information / Historical Performance order | todo |
-| SP7 | Historical Performance → Historic Performance Metrics (click-through; close parent modal) | todo |
-| SP8 | Drop summed historical performance; keep count + link | todo |
+| SP2 | Total Studies → Completed Studies | done |
+| SP3 | Enrolled (Live) → Patients Currently Enrolled In Trials | done |
+| SP4 | Legacy Enrolled → Total Patients Enrolled All Time | done |
+| SP5 | Surveys → Study Specific Feasibility Questionnaires (click-through) | done |
+| SP6 | Swap Site Information / Historical Performance order | partial |
+| SP7 | Historical Performance → Historic Performance Metrics (click-through; close parent modal) | done |
+| SP8 | Drop summed historical performance; keep count + link | done |
 | SP9 | Site Preferences → Site Status | todo |
 | SP10 | Relationship → Site Status (tie to report cards) | todo |
 | SP11 | Header: Screened, Enrolled, Target Enrolled, Enrolled vs Target % | todo |
-| SP12 | Back button: Master Site List (not All Legacy Sites) | todo |
-| SP13 | Site Code required + immutable UID | todo |
+| SP12 | Back button: Master Site List (not All Legacy Sites) | done |
+| SP13 | Site Code required + immutable UID | done |
 | SP14 | Remove Target schedule; Screen/Sched → Scheduled to Screened Rate %; Enroll/Screen → Enrollment %; remove Enroll/Sched | todo |
 | SP15 | Studies at this site → Completed Studies table columns: Study, Indication, PI, Groups, Scheduled, Screened, Enrolled, SF%, Enrollment Ranking | todo |
 | SP16 | Clarify “every study × group row” meaning | needs-spec |
@@ -80,14 +80,14 @@ Captured 2026-09-09. Status: `done` | `partial` | `todo` | `later` | `needs-spec
 
 | ID | Ask | Status | Notes |
 |----|-----|--------|-------|
-| F0 | Comms → Feasibility; remove subtitle under “Send secure…” | partial | Tab rename done; scrub remaining Comms + subtitle |
+| F0 | Comms → Feasibility; remove subtitle under “Send secure…” | done | Tab rename done; scrub remaining Comms + subtitle |
 | F1 | Question bank with scoring notes + ranking guidance | partial | Seed JSON ready; push + scoring notes TBD |
 | F2 | Question types + dropdown responses | partial | text/select/number/date; multiselect/matrix designed |
 | F3 | Default all questions required (except branching when hidden) | done | |
 | F4 | Templates pull **only** from question bank | todo | |
-| F5 | Templates: remove words under Survey name | todo | |
+| F5 | Templates: remove words under Survey name | done | |
 | F6 | Backfill legacy responses into surveys | partial | Ingest exists; library link + assign next |
-| F7 | Per-study questionnaire status dashboard (sent / recommended / need review / DNR / unanswered) | todo | |
+| F7 | Per-study questionnaire status dashboard (sent / recommended / need review / DNR / unanswered) | partial | Status strip on Feasibility tab |
 | F8 | Sponsor rollup: scores + ranks + full answers | todo | |
 | F9 | Rename surveys in Responses UI | todo | |
 | F10 | Move Links + Responses elsewhere (IA) | needs-spec | |
@@ -117,8 +117,8 @@ Captured 2026-09-09. Status: `done` | `partial` | `todo` | `later` | `needs-spec
 
 | ID | Ask | Status |
 |----|-----|--------|
-| H1 | Past Studies → Completed Studies | todo |
-| H2 | Past Sites → Master Site List | todo |
+| H1 | Past Studies → Completed Studies | done |
+| H2 | Past Sites → Master Site List | done |
 
 ---
 
@@ -126,7 +126,7 @@ Captured 2026-09-09. Status: `done` | `partial` | `todo` | `later` | `needs-spec
 
 | ID | Ask | Status |
 |----|-----|--------|
-| IE1 | Add nav header/page shell | todo |
+| IE1 | Add nav header/page shell | done |
 | IE2 | Content model | needs-spec |
 
 ---
