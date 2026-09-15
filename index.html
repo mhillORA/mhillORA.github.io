@@ -6902,18 +6902,21 @@
                 }
                 root.innerHTML = questions.map((q, idx) => {
                     const showIfQId = q.logic?.showIf?.questionId || '';
-                    const showIfEquals = q.logic?.showIf?.equals ?? '';
-                    const showIfIncludes = q.logic?.showIf?.includes ?? '';
-                    const showIfIncludesAny = Array.isArray(q.logic?.showIf?.includesAny)
-                        ? q.logic.showIf.includesAny.join(' || ')
-                        : (q.logic?.showIf?.includesAny || '');
-                    const showIfNotOnly = q.logic?.showIf?.notOnly ?? '';
-                    const showIfNotEmpty = q.logic?.showIf?.notEmpty === true;
+                    const showIfObj = q.logic?.showIf && typeof q.logic.showIf === 'object' ? q.logic.showIf : null;
+                    const showIfEquals = showIfObj?.equals ?? '';
+                    const showIfIncludes = showIfObj?.includes ?? '';
+                    const showIfIncludesAny = Array.isArray(showIfObj?.includesAny)
+                        ? showIfObj.includesAny.join(' || ')
+                        : (showIfObj?.includesAny || '');
+                    const showIfNotOnly = showIfObj?.notOnly ?? '';
+                    const showIfNotEmpty = showIfObj?.notEmpty === true;
                     let showIfOp = 'equals';
                     if (showIfNotEmpty) showIfOp = 'notEmpty';
-                    else if (showIfNotOnly) showIfOp = 'notOnly';
-                    else if (showIfIncludesAny) showIfOp = 'includesAny';
-                    else if (showIfIncludes) showIfOp = 'includes';
+                    else if (showIfObj && Object.prototype.hasOwnProperty.call(showIfObj, 'notOnly')) showIfOp = 'notOnly';
+                    else if (showIfObj && Object.prototype.hasOwnProperty.call(showIfObj, 'includesAny')) showIfOp = 'includesAny';
+                    else if (showIfObj && Object.prototype.hasOwnProperty.call(showIfObj, 'includes')) showIfOp = 'includes';
+                    else if (showIfObj && Object.prototype.hasOwnProperty.call(showIfObj, 'equals')) showIfOp = 'equals';
+                    else if (showIfQId) showIfOp = 'equals';
                     const showIfValue = showIfOp === 'equals' ? showIfEquals
                         : showIfOp === 'includes' ? showIfIncludes
                         : showIfOp === 'includesAny' ? showIfIncludesAny
@@ -6923,7 +6926,8 @@
                     const endIfValue = endIf
                         ? (endIf.equals ?? endIf.includes ?? (Array.isArray(endIf.includesAny) ? endIf.includesAny[0] : '') ?? '')
                         : '';
-                    const endIfOn = !!(endIf && String(endIfValue || '').trim());
+                    // Keep checkbox on whenever endSurveyIf is present (even before a choice is picked)
+                    const endIfOn = !!endIf;
                     const qType = normalizeSurveyQuestionType(q.type);
                     const isSelect = isChoiceQuestionType(qType);
                     const opts = isSelect ? resolveBuilderOptions(q) : [];
@@ -7278,14 +7282,17 @@
                                 .map((s) => optLower.get(s.toLowerCase()) || null)
                                 .filter(Boolean);
                             logicValue = parts.join(' || ');
-                            if (!parts.length) logicOp = 'notEmpty';
+                            // Keep includesAny even when no choices picked yet — do not coerce to notEmpty
                         } else {
-                            const canon = optLower.get(logicValue.toLowerCase());
-                            if (!canon) logicOp = 'notEmpty';
-                            else {
+                            const canon = logicValue ? optLower.get(logicValue.toLowerCase()) : null;
+                            if (canon) {
                                 logicValue = canon;
+                                // Align operator family to parent type without wiping the user's pick
                                 if (parentType === 'multiselect' && logicOp === 'equals') logicOp = 'includes';
                                 if (parentType !== 'multiselect' && logicOp === 'includes') logicOp = 'equals';
+                            } else {
+                                // Blank / not-yet-picked value: keep the operator the author selected
+                                logicValue = '';
                             }
                         }
                     }
@@ -7294,7 +7301,9 @@
                     if (logicOp === 'notEmpty') showIf.notEmpty = true;
                     else if (logicOp === 'includes') showIf.includes = logicValue;
                     else if (logicOp === 'includesAny') {
-                        showIf.includesAny = logicValue.split(/\s*\|\|\s*/).map((s) => s.trim()).filter(Boolean);
+                        showIf.includesAny = logicValue
+                            ? logicValue.split(/\s*\|\|\s*/).map((s) => s.trim()).filter(Boolean)
+                            : [];
                     } else if (logicOp === 'notOnly') showIf.notOnly = logicValue;
                     else showIf.equals = logicValue;
                 }
@@ -7305,20 +7314,20 @@
                 if (endOn) {
                     const endSel = card.querySelector(`select[name="q_end_value_${idx}"]`);
                     const endInp = card.querySelector(`input[name="q_end_value_${idx}"]`);
-                    let endValue = endSel && !endSel.disabled
+                    // Read value even if the control was still disabled when the checkbox flipped on
+                    let endValue = endSel
                         ? String(endSel.value || '').trim()
                         : String(endInp?.value || '').trim();
                     const selfType = normalizeSurveyQuestionType(selfQ?.type || 'text');
-                    if (selfQ && isChoiceQuestionType(selfType)) {
+                    if (selfQ && isChoiceQuestionType(selfType) && endValue) {
                         const selfOpts = resolveBuilderOptions(selfQ).map((o) => String(o || '').trim()).filter(Boolean);
                         const hit = selfOpts.find((o) => o.toLowerCase() === endValue.toLowerCase());
                         endValue = hit || '';
                     }
-                    if (endValue) {
-                        endSurveyIf = selfType === 'multiselect'
-                            ? { includes: endValue }
-                            : { equals: endValue };
-                    }
+                    // Always keep endSurveyIf while checkbox is on so the UI stays enabled
+                    endSurveyIf = selfType === 'multiselect'
+                        ? { includes: endValue }
+                        : { equals: endValue };
                 }
 
                 if (!showIf && !endSurveyIf) return null;
@@ -7674,21 +7683,23 @@
                     if (e.target.matches?.(`select[name="q_logic_qid_${idx}"], select[name="q_logic_op_${idx}"]`)) {
                         const qs = syncBuilderFromDom();
                         const q = qs[idx];
-                        if (q?.logic?.showIf?.questionId) {
-                            const parent = qs.find((qq) => qq && qq.id === q.logic.showIf.questionId);
-                            const pType = parent ? normalizeSurveyQuestionType(parent.type) : '';
-                            if (parent && isChoiceQuestionType(pType)) {
-                                // Normalize operator to the right family for the parent type
-                                if (pType === 'multiselect') {
-                                    if (q.logic.showIf.equals != null && q.logic.showIf.includes == null) {
-                                        q.logic.showIf.includes = q.logic.showIf.equals;
-                                        delete q.logic.showIf.equals;
-                                    }
-                                } else if (q.logic.showIf.includes != null && q.logic.showIf.equals == null) {
-                                    q.logic.showIf.equals = q.logic.showIf.includes;
-                                    delete q.logic.showIf.includes;
-                                }
-                            }
+                        // Honor the operator the user just picked — do not remap away from equals/includes
+                        if (e.target.matches?.(`select[name="q_logic_op_${idx}"]`) && q?.logic?.showIf?.questionId) {
+                            const op = String(e.target.value || '').trim() || 'equals';
+                            const sid = q.logic.showIf.questionId;
+                            const prevVal = q.logic.showIf.equals
+                                ?? q.logic.showIf.includes
+                                ?? (Array.isArray(q.logic.showIf.includesAny) ? q.logic.showIf.includesAny.join(' || ') : '')
+                                ?? q.logic.showIf.notOnly
+                                ?? '';
+                            const next = { questionId: sid };
+                            if (op === 'notEmpty') next.notEmpty = true;
+                            else if (op === 'includes') next.includes = String(prevVal || '');
+                            else if (op === 'includesAny') {
+                                next.includesAny = String(prevVal || '').split(/\s*\|\|\s*/).map((s) => s.trim()).filter(Boolean);
+                            } else if (op === 'notOnly') next.notOnly = String(prevVal || '');
+                            else next.equals = String(prevVal || '');
+                            q.logic = { ...(q.logic || {}), showIf: next };
                         }
                         window.__siteSurveyBuilderQuestions = qs;
                         renderBuilder();
@@ -7699,6 +7710,11 @@
                         window.__siteSurveyBuilderQuestions = qs;
                     }
                     if (e.target.matches?.(`#q_end_enable_${idx}`)) {
+                        const on = !!e.target.checked;
+                        const endSel = card.querySelector(`select[name="q_end_value_${idx}"]`);
+                        const endInp = card.querySelector(`input[name="q_end_value_${idx}"]`);
+                        if (endSel) endSel.disabled = !on;
+                        if (endInp) endInp.disabled = !on;
                         const qs = syncBuilderFromDom();
                         window.__siteSurveyBuilderQuestions = qs;
                         renderBuilder();
@@ -13832,10 +13848,31 @@
                         let logic = null;
                         if (q.logic && typeof q.logic === 'object') {
                             const hasShow = !!(q.logic.showIf && q.logic.showIf.questionId);
-                            const hasEnd = !!(q.logic.endSurveyIf && typeof q.logic.endSurveyIf === 'object'
-                                && (q.logic.endSurveyIf.equals || q.logic.endSurveyIf.includes
-                                    || (Array.isArray(q.logic.endSurveyIf.includesAny) && q.logic.endSurveyIf.includesAny.length)));
-                            if (hasShow || hasEnd) logic = q.logic;
+                            const end = q.logic.endSurveyIf;
+                            const hasEnd = !!(end && typeof end === 'object' && (
+                                String(end.equals || '').trim()
+                                || String(end.includes || '').trim()
+                                || (Array.isArray(end.includesAny) && end.includesAny.some((x) => String(x || '').trim()))
+                            ));
+                            if (hasShow || hasEnd) {
+                                logic = { ...q.logic };
+                                // Drop incomplete end (checkbox on, no choice yet)
+                                if (!hasEnd) delete logic.endSurveyIf;
+                                // Normalize incomplete equals/includes to questionId-only (runtime = is answered)
+                                if (logic.showIf) {
+                                    const s = { ...logic.showIf };
+                                    if (s.equals !== undefined && !String(s.equals || '').trim() && !s.notEmpty) {
+                                        delete s.equals;
+                                    }
+                                    if (s.includes !== undefined && !String(s.includes || '').trim() && !s.notEmpty) {
+                                        delete s.includes;
+                                    }
+                                    if (Array.isArray(s.includesAny) && !s.includesAny.length) {
+                                        delete s.includesAny;
+                                    }
+                                    logic.showIf = s;
+                                }
+                            }
                         }
                         if (!logic && card) {
                             const logicQId = (card.querySelector(`select[name="q_logic_qid_${idx}"]`)?.value || '').trim();

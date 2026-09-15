@@ -180,6 +180,30 @@ function remapCloneLogic(oldQuestions) {
     assert(cloned[1].logic.showIf.equals === 'Yes', 'equals preserved');
 }
 
+/** Builder must keep equals even when value not picked yet (do not coerce to notEmpty) */
+function resolveShowIfOp(showIf) {
+    if (!showIf || typeof showIf !== 'object') return 'equals';
+    if (showIf.notEmpty === true) return 'notEmpty';
+    if (Object.prototype.hasOwnProperty.call(showIf, 'notOnly')) return 'notOnly';
+    if (Object.prototype.hasOwnProperty.call(showIf, 'includesAny')) return 'includesAny';
+    if (Object.prototype.hasOwnProperty.call(showIf, 'includes')) return 'includes';
+    if (Object.prototype.hasOwnProperty.call(showIf, 'equals')) return 'equals';
+    if (showIf.questionId) return 'equals';
+    return 'equals';
+}
+assert(resolveShowIfOp({ questionId: 'a', equals: '' }) === 'equals', 'empty equals stays equals');
+assert(resolveShowIfOp({ questionId: 'a', equals: 'No' }) === 'equals', 'equals No');
+assert(resolveShowIfOp({ questionId: 'a', notEmpty: true }) === 'notEmpty', 'notEmpty');
+assert(resolveShowIfOp({ questionId: 'a', includes: '' }) === 'includes', 'empty includes stays includes');
+
+/** End-early checkbox stays on with empty value in memory */
+function endIfOn(logic) {
+    return !!(logic && logic.endSurveyIf && typeof logic.endSurveyIf === 'object');
+}
+assert(endIfOn({ endSurveyIf: { equals: '' } }) === true, 'end checkbox on with empty equals');
+assert(endIfOn({ endSurveyIf: { equals: 'No' } }) === true, 'end checkbox on with No');
+assert(endIfOn({ showIf: { questionId: 'x' } }) === false, 'no endSurveyIf → off');
+
 function resolveBuilderPageSection(q) {
     const explicit = String(q?.section || '').trim();
     if (explicit) return explicit;
