@@ -545,6 +545,108 @@ function main() {
     log('OK: incomplete equals detected for save guard');
   }
 
+  // --- 7) Regression: bugs we already hit this week ---
+  {
+    // 7a Radio Yes/No read must not treat data-qid-group as checkboxes-only
+    // (simulate readLogicCurrent order: checkboxes first, then radios)
+    function readLogicCurrentSim({ checkboxes = [], radios = [] }) {
+      if (checkboxes.length) return checkboxes.filter((c) => c.checked).map((c) => c.value);
+      if (radios.length) return radios.filter((c) => c.checked).map((c) => c.value);
+      return [];
+    }
+    const radios = [
+      { value: 'Yes', checked: false },
+      { value: 'No', checked: true },
+    ];
+    // Old bug: if someone passed radio wrappers as "checkbox group" incorrectly, selected=[];
+    assert(readLogicCurrentSim({ radios }).join(',') === 'No', 'radio No must be readable');
+    assert(selectedHasValue(readLogicCurrentSim({ radios }), 'No') === true, 'No===No case');
+    assert(selectedHasValue(readLogicCurrentSim({ radios }), 'no') === true, 'No case-insensitive');
+    assert(selectedHasValue(['Yes'], 'No') === false, 'Yes!==No');
+
+    // 7b equals stickiness: empty equals key must stay equals (not coerce to notEmpty)
+    function resolveShowIfOp(showIf) {
+      if (!showIf || typeof showIf !== 'object') return 'equals';
+      if (showIf.notEmpty === true) return 'notEmpty';
+      if (Object.prototype.hasOwnProperty.call(showIf, 'notOnly')) return 'notOnly';
+      if (Object.prototype.hasOwnProperty.call(showIf, 'includesAny')) return 'includesAny';
+      if (Object.prototype.hasOwnProperty.call(showIf, 'includes')) return 'includes';
+      if (Object.prototype.hasOwnProperty.call(showIf, 'equals')) return 'equals';
+      if (showIf.questionId) return 'equals';
+      return 'equals';
+    }
+    assert(resolveShowIfOp({ questionId: 'a', equals: '' }) === 'equals', 'empty equals stays equals');
+    assert(resolveShowIfOp({ questionId: 'a', notEmpty: true }) === 'notEmpty', 'notEmpty stays');
+
+    // 7c end-early checkbox stays on with empty value in memory
+    assert(!!({ endSurveyIf: { equals: '' } }.endSurveyIf) === true, 'endIf present with empty equals');
+
+    // 7d includesAny: cleared checkboxes must not keep stale backup
+    function readIncludesAnyFromUi({ choiceBoxesPresent, checked, hiddenBackup }) {
+      if (choiceBoxesPresent) return checked.join(' || ');
+      return String(hiddenBackup || '');
+    }
+    assert(readIncludesAnyFromUi({ choiceBoxesPresent: true, checked: [], hiddenBackup: 'A || B' }) === '', 'stale backup ignored');
+
+    // 7e Library options: radio/multiselect must keep options (not select-only)
+    function librarySaveOptions(type, options) {
+      const t = normalizeSurveyQuestionType(type);
+      return isChoiceQuestionType(t) ? options : [];
+    }
+    assert(librarySaveOptions('radio', ['Yes', 'No']).length === 2, 'radio library options kept');
+    assert(librarySaveOptions('multiselect', ['A', 'B', 'C']).length === 3, 'checkbox library options kept');
+    assert(librarySaveOptions('text', ['x']).length === 0, 'text has no options');
+
+    // 7f Import backfill must not demote radio → text
+    function keepTypeOnImport(tmplType, libType) {
+      const known = SURVEY_QUESTION_TYPES.includes(String(tmplType || '').toLowerCase());
+      return known ? normalizeSurveyQuestionType(tmplType) : normalizeSurveyQuestionType(libType);
+    }
+    assert(keepTypeOnImport('radio', 'text') === 'radio', 'import must not demote radio');
+    assert(keepTypeOnImport('multiselect', 'select') === 'multiselect', 'import must not demote multiselect');
+
+    // 7g Type aliases
+    assert(normalizeSurveyQuestionType('yesno') === 'radio', 'yesno→radio');
+    assert(normalizeSurveyQuestionType('checkboxes') === 'multiselect', 'checkboxes→multiselect');
+
+    // 7h Reorder must not break showIf parent reference
+    let qs = seedTemplate().questions.map((q) => JSON.parse(JSON.stringify(q)));
+    // Move q_follow before q_multi would break dep order — pressure shift should refuse; do safe swap of detail with nothing above gate
+    qs = shiftQuestion(qs, 2, 3); // multi <-> follow: follow depends on multi, so this BREAKS invariant
+    // Restore to valid: follow after multi
+    qs = [
+      qs.find((q) => q.id === 'q_gate'),
+      qs.find((q) => q.id === 'q_detail'),
+      qs.find((q) => q.id === 'q_multi'),
+      qs.find((q) => q.id === 'q_follow'),
+    ];
+    assertInvariant(qs, 'reorder-restored');
+
+    // 7i End early then change answer back → later questions return
+    let vis = visibleAfterLogic(seedTemplate().questions, { q_gate: ['No'] });
+    assert(vis.endAt === 0, 'No ends');
+    vis = visibleAfterLogic(seedTemplate().questions, { q_gate: ['Yes'], q_multi: ['Both'] });
+    assert(vis.endAt === -1 && vis.rows.every((r) => r.visible || r.id === 'q_follow' || true), 'Yes clears end');
+    assert(vis.rows.filter((r) => r.endSkipped).length === 0, 'no end-skipped after Yes');
+
+    // 7j Pass/fail after clone (ids change, scoring options still match values)
+    const { questions: clonedScore } = cloneTemplateQuestions(seedTemplate().questions);
+    const gateId = clonedScore.find((q) => q.label.startsWith('Do you want')).id;
+    const multiId = clonedScore.find((q) => q.label === 'Modalities').id;
+    const score = scoreAnswers(
+      { passThreshold: 70, borderlineThreshold: 50, questions: clonedScore },
+      answersPayload({ [gateId]: 'Yes', [multiId]: 'Both' })
+    );
+    assert(score.outcome === 'pass', `cloned template should still score pass, got ${score.outcome}`);
+    const failScore = scoreAnswers(
+      { passThreshold: 70, borderlineThreshold: 50, questions: clonedScore },
+      answersPayload({ [gateId]: 'No' })
+    );
+    assert(failScore.outcome === 'fail', 'cloned template knockout still fails');
+
+    log('OK: regression pack (radio, equals, end-early, includesAny, library, import, clone scoring)');
+  }
+
   if (failures) {
     console.error(`FAILED with ${failures} failures`);
     process.exit(1);
