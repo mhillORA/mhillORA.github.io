@@ -1,0 +1,256 @@
+/**
+ * Canonical site field mapping for Artemis.
+ *
+ * Source data is inconsistently shaped per site (legacy promote, survey blobs,
+ * city-only "streets", zip stolen from house number, PI baked into name, etc.).
+ * Always run records through these helpers before display / prefill / promote.
+ *
+ * Contract:
+ *   name / institution_name  → site label (never an address)
+ *   address1                 → street line only
+ *   city / state / zip       → locality parts
+ *   address                  → legacy composite; fill gaps only, never over address1
+ */
+
+function trimStr(v) {
+    return String(v == null ? '' : v).trim();
+}
+
+function normKey(v) {
+    return trimStr(v).toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+function looksLikeStreet(v) {
+    const s = trimStr(v);
+    if (!s) return false;
+    if (/\d/.test(s)) return true;
+    return /\b(st|street|ave|avenue|rd|road|blvd|drive|dr|ln|lane|way|ct|court|suite|ste|hwy|highway|pkwy|parkway)\b/i.test(
+        s
+    );
+}
+
+/** City-only or non-street placeholder wrongly stored in address1. */
+function looksLikeCityOnly(v) {
+    const s = trimStr(v);
+    if (!s || looksLikeStreet(s)) return false;
+    if (s.includes('@')) return false;
+    // single/multi-word place name, no digits
+    if (/\d/.test(s)) return false;
+    if (/^(n\/?a|none|unknown|tbd|test)$/i.test(s)) return false;
+    // emails / PI initials mistakenly in address (e.g. "bwatkins")
+    if (/^[a-z]+\.[a-z]+$/i.test(s) || (/^[a-z]{2,20}$/i.test(s) && !/^[A-Z][a-z]+(?:\s[A-Z][a-z]+)+$/.test(s))) {
+        // bare token like "bwatkins" — not a city
+        if (!/^[A-Z][a-z]+(?:[\s-][A-Z][a-z]+)*$/.test(s) && s === s.toLowerCase()) return false;
+    }
+    return s.length >= 3 && s.length <= 40 && !/,/.test(s);
+}
+
+function parseCompositeAddress(blob) {
+    const raw = trimStr(blob);
+    if (!raw) return { street: '', city: '', state: '', zip: '' };
+    const zipM = raw.match(/\b(\d{5}(?:-\d{4})?)\b/);
+    const stateM = raw.match(/\b([A-Z]{2})\b(?:\s+\d{5})?\s*$/i) || raw.match(/,\s*([A-Z]{2})\s*(?:,|\d|$)/i);
+    let street = raw;
+    let city = '';
+    let state = stateM ? stateM[1].toUpperCase() : '';
+    let zip = zipM ? zipM[1] : '';
+    if (stateM) {
+        const before = raw.slice(0, stateM.index).replace(/[,\s]+$/, '');
+        const parts = before.split(',').map((p) => p.trim()).filter(Boolean);
+        if (parts.length >= 2) {
+            city = parts[parts.length - 1];
+            street = parts.slice(0, -1).join(', ');
+        } else {
+            street = before;
+        }
+    } else if (raw.includes(',')) {
+        const parts = raw.split(',').map((p) => p.trim()).filter(Boolean);
+        if (parts.length >= 2 && !looksLikeStreet(parts[parts.length - 1])) {
+            city = parts[parts.length - 1];
+            street = parts.slice(0, -1).join(', ');
+        }
+    }
+    return { street: trimStr(street), city: trimStr(city), state, zip };
+}
+
+/**
+ * Normalize any site-shaped record into consistent live fields.
+ * Safe to call repeatedly; does not mutate input.
+ */
+function normalizeSiteFields(site) {
+    if (!site || typeof site !== 'object') {
+        return {
+            name: '',
+            address1: '',
+            address: '',
+            city: '',
+            state: '',
+            zip: '',
+            zipCode: '',
+            pi: '',
+            piEmail: '',
+            pi2Name: '',
+            pi2Email: '',
+            pi3Name: '',
+            pi3Email: '',
+            siteCoordinator: '',
+            siteCoordinatorEmail: '',
+        };
+    }
+
+    let name = trimStr(site.name || site.institution_name || site.siteName || site.practice_name || '');
+    let address1 = trimStr(site.address1 || site.streetAddress || site.street || site.address_street || '');
+    let address = trimStr(site.address || site.address_raw || site.mailingAddress || '');
+    let city = trimStr(site.city || site.address_city || '');
+    let state = trimStr(site.state || site.address_state || '');
+    let zip = trimStr(site.zipCode || site.zip || site.postal || site.address_zip || '');
+    const pi = trimStr(site.pi || site.piName || '');
+    const piEmail = trimStr(site.piEmail || '');
+    const pi2Name = trimStr(site.pi2Name || '');
+    const pi2Email = trimStr(site.pi2Email || '');
+    const pi3Name = trimStr(site.pi3Name || '');
+    const pi3Email = trimStr(site.pi3Email || '');
+
+    // City wrongly stored as address1 (e.g. "San Antonio")
+    if (address1 && looksLikeCityOnly(address1) && !city) {
+        city = address1;
+        address1 = '';
+    } else if (address1 && looksLikeCityOnly(address1) && city && normKey(address1) === normKey(city)) {
+        address1 = '';
+    }
+
+    // Prefer real street; fall back to composite `address` only when address1 empty/useless
+    if (!address1 || !looksLikeStreet(address1)) {
+        if (address && looksLikeStreet(address) && normKey(address) !== normKey(name)) {
+            const parsed = parseCompositeAddress(address);
+            if (parsed.street) address1 = parsed.street;
+            if (!city && parsed.city) city = parsed.city;
+            if (!state && parsed.state) state = parsed.state;
+            if (!zip && parsed.zip) zip = parsed.zip;
+        }
+    }
+
+    // Institution name mistakenly in address fields
+    if (name && address1 && normKey(address1) === normKey(name) && !looksLikeStreet(address1)) {
+        address1 = '';
+    }
+    if (name && address1.toLowerCase().startsWith(name.toLowerCase())) {
+        const rest = address1.slice(name.length).replace(/^[\s,–—-]+/, '');
+        if (rest && looksLikeStreet(rest)) address1 = rest;
+    }
+
+    // City embedded at end of street ("10701 W Bell Rd  Sun City")
+    if (address1 && city && address1.toLowerCase().endsWith(city.toLowerCase())) {
+        const cut = address1.slice(0, -city.length).replace(/[,\s]+$/, '');
+        if (cut && looksLikeStreet(cut)) address1 = cut;
+    } else if (address1 && !city) {
+        const parsed = parseCompositeAddress(address1);
+        if (parsed.city && parsed.street && parsed.street !== address1) {
+            address1 = parsed.street;
+            city = parsed.city;
+            if (!state && parsed.state) state = parsed.state;
+            if (!zip && parsed.zip) zip = parsed.zip;
+        } else {
+            // "800 SW 39th Street Sun City" — last capitalized multi-word without digits as city
+            const m = address1.match(/^(.*\d.*)\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)$/);
+            if (m && looksLikeStreet(m[1]) && !looksLikeStreet(m[2])) {
+                address1 = trimStr(m[1]);
+                city = trimStr(m[2]);
+            }
+        }
+    }
+
+    // Zip stolen from house number (zip === leading street digits, often no real city)
+    const leading = (address1.match(/^(\d{3,6})\b/) || [])[1];
+    if (zip && leading && zip === leading) {
+        zip = '';
+    }
+    // Zip that is clearly a street number (5 digits matching start) when state present but city empty
+    if (zip && leading && zip === leading && state && !city) {
+        zip = '';
+    }
+
+    // Name that is only an address blob — keep but don't treat as street source again
+    if (name && looksLikeStreet(name) && !pi) {
+        // leave name; display layer may still show it
+    }
+
+    // Sync composite for older readers: street-only, not full blob
+    address = address1 || address;
+
+    return {
+        name: name || trimStr(site.id || ''),
+        address1,
+        address,
+        city,
+        state,
+        zip,
+        zipCode: zip,
+        pi,
+        piEmail,
+        pi2Name,
+        pi2Email,
+        pi3Name,
+        pi3Email,
+        siteCoordinator: trimStr(site.siteCoordinator || site.coordinator || ''),
+        siteCoordinatorEmail: trimStr(site.siteCoordinatorEmail || site.coordinatorEmail || ''),
+    };
+}
+
+function resolveStreetAddress(site) {
+    return normalizeSiteFields(site).address1;
+}
+
+function resolveCityStateZip(site) {
+    const n = normalizeSiteFields(site);
+    return { city: n.city, state: n.state, zip: n.zip };
+}
+
+function resolveSiteName(site) {
+    return normalizeSiteFields(site).name;
+}
+
+function mapToLiveSiteFields(src) {
+    return normalizeSiteFields(src);
+}
+
+function uniqueInvestigatorNames(site) {
+    const n = normalizeSiteFields(site);
+    const pairs = [
+        [n.pi, n.piEmail],
+        [n.pi2Name, n.pi2Email],
+        [n.pi3Name, n.pi3Email],
+    ];
+    const seen = new Set();
+    const out = [];
+    for (const [name] of pairs) {
+        const key = normKey(name);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        out.push(name);
+    }
+    return out;
+}
+
+/** Prefill for ql-site-address: street only (not city/state blob, not institution). */
+function siteAddressPrefill(site) {
+    return resolveStreetAddress(site);
+}
+
+function siteNamePrefill(site) {
+    return resolveSiteName(site);
+}
+
+module.exports = {
+    looksLikeStreet,
+    looksLikeCityOnly,
+    parseCompositeAddress,
+    normalizeSiteFields,
+    resolveStreetAddress,
+    resolveCityStateZip,
+    resolveSiteName,
+    mapToLiveSiteFields,
+    uniqueInvestigatorNames,
+    siteAddressPrefill,
+    siteNamePrefill,
+};

@@ -124,18 +124,20 @@ function buildSiteRecordPrefill(questions, site, { coordinatorStaff = null, piSt
     if (!site || typeof site !== 'object') return map;
     const coord = coordinatorStaff && typeof coordinatorStaff === 'object' ? coordinatorStaff : {};
     const pi = piStaff && typeof piStaff === 'object' ? piStaff : {};
+    const { siteAddressPrefill, siteNamePrefill, normalizeSiteFields } = require('./site-field-map');
+    const normalized = normalizeSiteFields(site);
 
     const byLib = {
-        'ql-coord-name': site.siteCoordinator || coord.name || '',
-        'ql-coord-email': site.siteCoordinatorEmail || coord.email || '',
+        'ql-coord-name': normalized.siteCoordinator || coord.name || '',
+        'ql-coord-email': normalized.siteCoordinatorEmail || coord.email || '',
         'ql-coord-phone': site.siteCoordinatorPhone || coord.phone || coord.phoneNumber || '',
         'ql-coord-title': coord.title || 'Study Coordinator',
         'ql-primary-contact-role': coord.title || 'Study Coordinator',
-        'ql-site-name': site.name || site.siteName || '',
-        'ql-site-address': site.address || site.streetAddress || site.mailingAddress || '',
+        'ql-site-name': siteNamePrefill(site) || '',
+        'ql-site-address': siteAddressPrefill(site) || '',
         'ql-site-phone': site.phone || site.sitePhone || site.mainPhone || '',
-        'ql-pi-name': site.pi || pi.name || '',
-        'ql-pi-email': site.piEmail || pi.email || '',
+        'ql-pi-name': normalized.pi || pi.name || '',
+        'ql-pi-email': normalized.piEmail || pi.email || '',
         'ql-pi-phone': site.piPhone || pi.phone || pi.phoneNumber || '',
         'ql-gf-00-name': '', // respondent — leave blank
     };

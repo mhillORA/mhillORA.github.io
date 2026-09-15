@@ -8,6 +8,8 @@
  * - Unmatched: create a minimal sites row (inert until ops schedules against it).
  * - Never delete legacy docs; never retarget survey/outcome partition keys here.
  */
+const { mapToLiveSiteFields } = require('./lib/site-field-map');
+
 const LEGACY_SITES = 'legacy-sites';
 const LIVE_SITES = 'sites';
 
@@ -52,19 +54,21 @@ function readHeader(request, name) {
 
 function buildLiveSiteFromLegacy(legacy, generateId) {
     const now = new Date().toISOString();
-    const name = String(legacy.name || '').trim() || 'Promoted site';
+    const mapped = mapToLiveSiteFields(legacy);
     return {
         id: generateId(),
-        name,
+        name: mapped.name || 'Promoted site',
         status: 'Active',
-        address: legacy.address || legacy.street || '',
-        city: legacy.city || '',
-        state: legacy.state || '',
-        zip: legacy.zip || legacy.postalCode || '',
-        pi: legacy.pi || legacy.piName || '',
-        piEmail: legacy.piEmail || '',
-        siteCoordinator: legacy.siteCoordinator || legacy.coordinator || '',
-        siteCoordinatorEmail: legacy.siteCoordinatorEmail || legacy.coordinatorEmail || '',
+        address1: mapped.address1,
+        address: mapped.address1,
+        city: mapped.city,
+        state: mapped.state,
+        zip: mapped.zip,
+        zipCode: mapped.zip,
+        pi: mapped.pi,
+        piEmail: mapped.piEmail,
+        siteCoordinator: mapped.siteCoordinator,
+        siteCoordinatorEmail: mapped.siteCoordinatorEmail,
         notes: legacy.notes || '',
         source: 'promoted-from-legacy',
         promotedFromLegacySiteId: legacy.id,
