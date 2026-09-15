@@ -21,7 +21,7 @@ Captured 2026-09-09. Status: `done` | `partial` | `todo` | `later` | `needs-spec
 
 | ID | Ask | Status |
 |----|-----|--------|
-| D1 | Clickable tiles → filtered target tab (e.g. 48 live sites → Sites filtered) | done |
+| D1 | Clickable tiles → filtered target tab (e.g. 48 live sites → Sites filtered) | done | Tiles + chart segment/bar drill-through (indication, status, site, study) |
 | D2 | Role-specific dashboard (Ops / Monitoring / Exec Leadership) | partial |
 | D3 | 30-day trend sparklines on key tiles (e.g. patients enrolled) | partial |
 
