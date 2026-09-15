@@ -391,10 +391,17 @@ function answerTriggersEndSurvey(q, answers) {
         const w = normalizeAnswerValue(want);
         return w && tokens.some((t) => t === w);
     };
-    if (endIf.includes != null && endIf.includes !== '' && hit(endIf.includes)) return true;
-    if (endIf.equals != null && endIf.equals !== '' && hit(endIf.equals)) return true;
-    if (Array.isArray(endIf.includesAny) && endIf.includesAny.some(hit)) return true;
-    return false;
+    let matched = false;
+    if (endIf.includes != null && endIf.includes !== '' && hit(endIf.includes)) matched = true;
+    if (endIf.equals != null && endIf.equals !== '' && hit(endIf.equals)) matched = true;
+    if (Array.isArray(endIf.includesAny) && endIf.includesAny.some(hit)) matched = true;
+    if (!matched) return false;
+    const requireId = String(endIf.requireFilledQuestionId || '').trim();
+    if (requireId) {
+        const why = findAnswerForQuestionId(answers, requireId);
+        if (!why || why.skipped || !normalizeAnswerValue(why.value)) return false;
+    }
+    return true;
 }
 
 /**
