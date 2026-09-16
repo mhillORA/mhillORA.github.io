@@ -37,12 +37,14 @@ MAP_OUT = REPO / ".firecrawl" / "stealth-ga-column-to-rebuild.json"
 # Curated Stealth column -> rebuild libraryQuestionId (Response cols + specials)
 # Verified against Stealth GA Feasibility.xlsx Q inference + live rebuild survey.
 COL_LIB: dict[str, str] = {
-    "AS": "ql-rebuild-013-has-the-investigator-reviewed-the-protocol-synop",  # may fuzzy-fix below
+    "AS": "ql-rebuild-013-has-the-investigator-reviewed-the-protocol-synop",  # resolved live
     "BB": "ql-gf-05-practice-setting",
+    "BD": "ql-rebuild-018-does-your-site-have-satellite-offices-or-other-locat",
     "BO": "ql-rebuild-023-how-many-dry-amd-clinical-trials-has-your-site-condu",
-    "BS": "ql-rebuild-027-how-many-ongoing-trials-does-your-site-have-in-patie",
-    "BU": "ql-rebuild-028-if-you-have-ongoing-dry-amd-ga-trials-would-they-int",
+    # BS is Yes/No in Stealth; rebuild asks how-many → handled via BT in build_answers
+    "BU": "ql-rebuild-026-if-you-have-ongoing-dry-amd-ga-trials-would-they-int",
     "CC": "ql-rebuild-072-is-your-staff-gcp-certified",
+    "GH": "ql-rebuild-077-do-you-have-a-separate-contract-and-or-budget-office",
     "CD": "ql-rebuild-025-do-you-have-dedicated-staff-to-conduct-this-study",
     "CS": "ql-rebuild-030-has-your-site-staff-equipment-ever-been-certified-by",
     "DE": "mu3330hmyp18qfkmzy",  # FAF Yes/No
@@ -50,6 +52,7 @@ COL_LIB: dict[str, str] = {
     "DL": "mu3330woingrwq22ky",  # ETDRS lightbox
     "DN": "ql-rebuild-043-do-you-have-a-dedicated-4-meter-lane-room-area-to-pe",
     "DO": "ql-rebuild-055-does-your-site-maintain-a-regular-calibration-schedu",
+    "DP": "ql-gsf_075_are-calibration-records-available-for-monitoring",
     "DV": "ql-rebuild-051-will-cra-have-remote-access-to-the-electronic-source",
     "DW": "ql-rebuild-064-on-site-pharmacy",
     "DX": "ql-rebuild-061-would-your-study-staff-have-unrestricted-access-to-a",
@@ -65,6 +68,7 @@ COL_LIB: dict[str, str] = {
     "EY": "ql-rebuild-075-secure-space-to-store-clinical-study-files-and-subje",
     "FA": "ql-gsf_073_does-your-site-have-a-backup-plan-for-power-outa",
     "FC": "ql-rebuild-078-what-percentage-of-these-patients-have-extrafoveal-g",
+    "FM": "ql-rebuild-079-do-you-use-complement-inhibitors-in-the-studys-propo",  # resolve live
     "FP": "ql-rebuild-060-is-your-site-willing-to-pre-screen-potential-suitabl",
     "FS": "ql-gf-29-central-irb",
     "FT": "ql-rebuild-063-if-local-irb-ec-how-often-does-the-irb-meet",
@@ -72,6 +76,79 @@ COL_LIB: dict[str, str] = {
     "GM": "ql-rebuild-080-on-average-how-long-will-it-take-to-execute-the-clin",
     "GN": "ql-rebuild-081-do-you-accept-electronic-signatures-of-the-clinical-",
 }
+
+# CFP capability checkboxes
+CFP_COLS = {
+    "CZ": "Standard 3-field",
+    "DA": "Ultra Wide-Field",
+}
+CFP_LIB = "mu332z1gb2ehc1rf3n"
+CFP_MODEL_COL = "DB"
+CFP_MODEL_LIB = "ql-rebuild-044-manufacturer-model-if-yes"
+
+# Source review checkboxes → rebuild radio options
+SOURCE_COLS = {
+    "DQ": "Paper source or certified copies",
+    "DR": "EMR, CRA can log in remotely",
+    "DS": "EMR, CRA can review certified printouts",
+}
+SOURCE_LIB = "ql-gsf_060_how-will-the-monitor-review-source-data-at-your-"
+SOURCE_OTHER_COL = "DT"
+SOURCE_OTHER_LIB = "ql-rebuild-058-if-other-please-specify"
+ESOURCE_SYSTEM_COL = "DU"
+ESOURCE_SYSTEM_LIB = "ql-rebuild-059-if-electronic-source-which-system"
+
+# Patient identify methods
+PATIENT_ID_COLS = {
+    "FF": "Site database review",
+    "FG": "Patient chart review",
+    "FH": "Dear Dr. letter",
+    "FI": "Past enrollment in similar studies",
+    "FJ": "Physician referrals",
+}
+PATIENT_ID_LIB = "ql-rebuild-085-what-method-s-are-you-planning-to-use-to-identify-pa"
+PATIENT_ID_OTHER_COL = "FK"
+PATIENT_ID_OTHER_LIB = "ql-rebuild-086-if-other-please-specify"
+
+VOLUME_COLS = {
+    "FB": "ql-rebuild-077-how-many-patients-over-55-years-old-with-at-least-on",
+    "FD": "ql-rebuild-054-how-many-newly-referred-or-newly-diagnosed-with-dry-",
+    "FE": "ql-rebuild-080-based-on-the-numbers-above-and-the-protocol-synopsis",
+}
+
+EDC_LIB = "ql-gsf_065_please-select-which-of-the-following-edc-systems"
+EDC_OTHER_LIB = "ql-rebuild-105-if-other-please-specify"
+EDC_TEXT_COL = "GP"
+
+RC_LIB = "ql-gsf_087_please-indicate-the-central-imaging-reading-cent"
+RC_OTHER_LIB = "ql-rebuild-109-if-other-please-specify"
+RC_TEXT_COL = "GS"
+RC_YES_COL = "GR"
+
+BLOOD_WHERE_COL = "EO"
+BLOOD_WHERE_LIB = "ql-rebuild-068-if-no-where-will-patients-go-for-blood-draws"
+
+EDC_ALIASES = [
+    ("imedidata", "Medidata Rave"),
+    ("medidata", "Medidata Rave"),
+    ("rave", "Medidata Rave"),
+    ("inform", "Inform"),
+    ("oracle", "Oracle Clinical"),
+    ("redcap", "REDCap"),
+    ("imednet", "iMednet"),
+    ("openclinica", "OpenClinica"),
+]
+RC_ALIASES = [
+    ("duke", "Duke"),
+    ("merit", "MERIT"),
+    ("clario", "Clario"),
+    ("ert", "Clario"),
+    ("oirrc", "OIRRC"),
+    ("adaptive sensory", "Adaptive Sensory Technology (AST)"),
+    (r"\bast\b", "Adaptive Sensory Technology (AST)"),
+    ("birc", "BIRC"),
+    ("ciarc", "CIARC"),
+]
 
 # When Yes carries model text, model lives in the next column
 MODEL_FOLLOWUP: dict[str, tuple[str, str]] = {
@@ -256,12 +333,201 @@ def resolve_ongoing_libs(survey_qs: list) -> None:
         lib = q.get("libraryQuestionId")
         if not lib:
             continue
-        if "how many ongoing" in lab and "dry amd" in lab:
-            COL_LIB["BS"] = lib
         if "interfere with recruit" in lab:
             COL_LIB["BU"] = lib
         if "dry amd clinical trials has your site conducted" in lab:
             COL_LIB["BO"] = lib
+        # Prefer the "in the study's proposed patient population" complement Q
+        if "complement inhibitor" in lab and "proposed patient" in lab:
+            COL_LIB["FM"] = lib
+        elif "complement inhibitor" in lab and "FM" not in COL_LIB:
+            COL_LIB["FM"] = lib
+        if "satellite offices" in lab:
+            COL_LIB["BD"] = lib
+        if "calibration records" in lab and "monitoring" in lab:
+            COL_LIB["DP"] = lib
+        if "separate contract" in lab and "budget" in lab:
+            COL_LIB["GH"] = lib
+
+
+ONGOING_LIB = "ql-rebuild-025-how-many-ongoing-trials-does-your-site-have-in-patie"
+PHASE_LIB = "ql-rebuild-024-which-development-phase-s-does-that-experience-cover"
+PHASE_COLS = {"BP": "Phase 1", "BQ": "Phase 2", "BR": "Phase 3"}
+STUDY_ENROLL = {
+    "BV": "ql-rebuild-027-study-1-number-of-subjects-enrolled",
+    "BX": "ql-rebuild-029-study-2-number-of-subjects-enrolled",
+    "BZ": "ql-rebuild-031-study-3-number-of-subjects-enrolled",
+}
+STUDY_LENGTH = {
+    "BW": "ql-rebuild-028-study-1-length-of-enrollment-period",
+    "BY": "ql-rebuild-030-study-2-length-of-enrollment-period",
+    "CA": "ql-rebuild-032-study-3-length-of-enrollment-period",
+}
+COMPLEMENT_PCT_LIB = "ql-rebuild-059-if-yes-what-percentage-of-dry-amd-patients"
+COMPLEMENT_ROUTINE_LIB = "ql-rebuild-057-does-your-site-routinely-use-complement-inhibitors-t"
+DIARY_EXP_LIB = "ql-rebuild-087-do-you-have-experience-using-paper-patient-diaries-i"
+DIARY_PREF_LIB = "ql-rebuild-111-what-type-of-diary-collection-are-your-patients-most"
+DIARY_COLS = {"GW": "eDiary", "GX": "Paper Diary"}
+IRT_LIB = "ql-rebuild-106-please-select-which-of-the-following-irt-rtsm-system"
+IRT_OTHER_LIB = "ql-rebuild-107-if-other-please-specify"
+SAT_NAME_LIB = "ql-rebuild-020-satellite-institution-name"
+
+
+def bucket_ongoing_count(n: int, opts: list[str]) -> str | None:
+    if n <= 0:
+        target = "0"
+    elif n <= 2:
+        target = "1-2"
+    elif n <= 5:
+        target = "3-5"
+    else:
+        target = ">=6"
+    # Match live option punctuation (en-dash / ≥)
+    for o in opts:
+        norm = o.replace("–", "-").replace("—", "-").replace("≥", ">=").replace(" ", "")
+        if norm == target.replace(" ", "") or (target == ">=6" and ("≥6" in o or ">=6" in o or o.strip() == "6+")):
+            return o
+        if target == "0" and o.strip() == "0":
+            return o
+    return None
+
+
+def bucket_enrollment_months(val, opts: list[str]) -> str | None:
+    if is_junk_value(val):
+        return None
+    s = str(val).strip()
+    if re.match(r"^(o|n/?a|na)$", s, re.I):
+        return None
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*(?:months?)?$", s, re.I)
+    if not m:
+        # already an option-ish label
+        for o in opts:
+            if o.lower() == s.lower():
+                return o
+        return None
+    months = float(m.group(1))
+    if months < 6:
+        want = "< 6"
+    elif months <= 12:
+        want = "6"
+    elif months <= 18:
+        want = "13"
+    else:
+        want = "> 18"
+    for o in opts:
+        ol = o.replace("–", "-").replace("—", "-")
+        if want == "< 6" and ol.startswith("<"):
+            return o
+        if want == "6" and ("6-12" in ol.replace(" ", "") or "6–12" in o):
+            return o
+        if want == "13" and ("13-18" in ol.replace(" ", "") or "13–18" in o):
+            return o
+        if want == "> 18" and ol.startswith(">"):
+            return o
+    return None
+
+
+def format_address(raw) -> str | None:
+    street = str(raw[col_idx("G")] or "").strip() if col_idx("G") < len(raw) else ""
+    street2 = str(raw[col_idx("H")] or "").strip() if col_idx("H") < len(raw) else ""
+    city = str(raw[col_idx("I")] or "").strip() if col_idx("I") < len(raw) else ""
+    state = str(raw[col_idx("J")] or "").strip() if col_idx("J") < len(raw) else ""
+    zipc = str(raw[col_idx("K")] or "").strip() if col_idx("K") < len(raw) else ""
+    junk = {"", "-", "n/a", "na", "address", "address 2", "city/town", "state/province", "zip/postal code", "x", "xx", "xxx"}
+    parts = []
+    for p in (street, street2):
+        if p.lower() not in junk and not re.fullmatch(r"[xX.\-]+", p):
+            parts.append(p)
+    city_state = ", ".join(
+        [p for p in (city, state) if p.lower() not in junk]
+    )
+    if city_state:
+        parts.append(city_state)
+    if zipc.lower() not in junk:
+        if parts:
+            parts[-1] = f"{parts[-1]} {zipc}".strip() if city_state else zipc
+        else:
+            parts.append(zipc)
+    out = ", ".join(parts).strip(" ,")
+    return out or None
+
+
+def address_parts(raw) -> dict:
+    junk = {
+        "",
+        "-",
+        "n/a",
+        "na",
+        "address",
+        "address 2",
+        "city/town",
+        "state/province",
+        "zip/postal code",
+        "x",
+        "xx",
+        "xxx",
+    }
+
+    def clean(letter):
+        if col_idx(letter) >= len(raw):
+            return ""
+        s = str(raw[col_idx(letter)] or "").strip()
+        if s.lower() in junk or re.fullmatch(r"[xX.\-]+", s):
+            return ""
+        return s
+
+    return {
+        "address1": clean("G"),
+        "address2": clean("H"),
+        "city": clean("I"),
+        "state": clean("J"),
+        "zip": clean("K"),
+    }
+
+
+def parse_edc_systems(text: str, opts: list[str]) -> tuple[list[str], str | None]:
+    low = text.lower()
+    matched = []
+    for needle, opt in EDC_ALIASES:
+        if needle in low and opt in opts and opt not in matched:
+            matched.append(opt)
+    leftover = text.strip()
+    if matched and not leftover:
+        return matched, None
+    # If we matched known systems, still keep leftover as Other specify when extra junk
+    if matched:
+        return matched, leftover if len(leftover) > 3 and not all(
+            n in low for n, _ in EDC_ALIASES if n in low
+        ) else None
+    return (["Other"] if "Other" in opts else []), leftover
+
+
+def parse_reading_centers(text: str, opts: list[str]) -> tuple[list[str], str | None]:
+    low = text.lower()
+    matched = []
+    for needle, opt in RC_ALIASES:
+        if needle.startswith("\\b"):
+            if re.search(needle, low) and opt in opts and opt not in matched:
+                matched.append(opt)
+        elif needle in low and opt in opts and opt not in matched:
+            matched.append(opt)
+    if matched:
+        return matched, text.strip() if len(text.strip()) > 40 else None
+    if re.search(r"none|n/?a", low):
+        none = next((o for o in opts if "none" in o.lower()), None)
+        return ([none] if none else []), None
+    return [], text.strip() or None
+
+
+def volume_clean(val) -> str | None:
+    if is_junk_value(val):
+        return None
+    s = str(val).strip()
+    if _EXCEL_DATE_RE.match(s) or ("00:00:00" in s and re.search(r"\d{4}-\d{2}-\d{2}", s)):
+        return None
+    if re.match(r"^(xxx+|n/?a|na|o)$", s, re.I):
+        return None
+    return s
 
 
 def parse_stealth_rows(hdr, data):
@@ -418,7 +684,46 @@ def extract_contacts(raw) -> dict:
     }
 
 
+# Stealth response columns that have real data but NO matching ReBUILD template question.
+# Stored on the response as stealthUnmapped so nothing is dropped for sponsor reporting.
+UNMAPPED_STEALTH_COLS = {
+    "CQ": "physical_exams_pi_subi_onsite",
+    "CX": "octa_capability",
+    "CY": "octa_manufacturer_model",
+    "DC": "microperimetry_capability",
+    "DD": "microperimetry_manufacturer_model",
+    "DI": "ecc_machine",
+    "DJ": "ecc_manufacturer_model",
+    "EM": "freezer_minus70",
+    "EP": "patient_stay_up_to_2_hours",
+    "EQ": "pk_process_within_30_min",
+    "EW": "ecg_onsite_usable",
+    "EX": "ecg_alternate_location",
+    "EZ": "internet_access",
+    "FQ": "genetic_blood_sample_willing",
+    "FR": "site_in_us_canada_argentina",
+    "GT": "central_ecg_reading_center_experience",
+}
+
+
+def collect_unmapped_stealth(raw) -> dict:
+    out = {}
+    for letter, key in UNMAPPED_STEALTH_COLS.items():
+        idx = col_idx(letter)
+        if idx >= len(raw) or is_junk_value(raw[idx]):
+            continue
+        s = str(raw[idx]).strip()
+        # skip question-text residue
+        if _QUESTION_VAL_RE.match(s) and ("?" in s or len(s) > 50):
+            continue
+        out[key] = {"stealthColumn": letter, "value": s}
+    return out
+
+
 def build_answers(row, survey_qs: list) -> list:
+    # Always resolve against the live template libs (never mutate the template itself)
+    resolve_interest_lib(survey_qs)
+    resolve_ongoing_libs(survey_qs)
     q_by_lib = {q.get("libraryQuestionId"): q for q in survey_qs if q.get("libraryQuestionId")}
     raw = row["raw"]
     answers = []
@@ -462,7 +767,20 @@ def build_answers(row, survey_qs: list) -> list:
     add("ql-coord-phone", contacts["coordPhone"] or contacts["altPhone"], "X")
     add("ql-contracts-name", contacts["contractsName"] or contacts["altName"], "Y")
     add("ql-contracts-email", contacts["contractsEmail"] or contacts["altEmail"], "AG")
-    add("ql-contracts-phone", contacts["contractsPhone"] or contacts["altPhone"], "AH")
+    # Live ReBUILD template uses gsf_092 for contracts phone (not ql-contracts-phone)
+    add(
+        "ql-gsf_092_contracting-budgeting-contact-phone-number",
+        contacts["contractsPhone"] or contacts["altPhone"],
+        "AH",
+    )
+    # NOTE: do not write ql-contracts-phone — not on live ReBUILD template
+
+    # Institution name (col F)
+    inst = row.get("inst") or ""
+    if not inst and col_idx("F") < len(raw) and not is_junk_value(raw[col_idx("F")]):
+        inst = str(raw[col_idx("F")]).strip()
+    if inst and inst.lower() not in ("institution name", "name", "company"):
+        add("ql-site-name", inst, "F")
 
     # Simple mapped response columns
     for letter, lib in COL_LIB.items():
@@ -486,22 +804,59 @@ def build_answers(row, survey_qs: list) -> list:
         elif letter == "EU":
             v = centrifuge_coerce(val)
         elif letter == "BO":
-            # map 1-2 style onto radio options
-            s = str(val).strip().replace("–", "-")
-            if is_junk_value(s):
+            # map 1-2 style / bare counts onto radio options
+            s = str(val).strip().replace("–", "-").replace("—", "-")
+            if isinstance(val, float) and val == int(val):
+                s = str(int(val))
+            if is_junk_value(s) or _EXCEL_DATE_RE.match(s) or "00:00:00" in s:
                 v = None
             elif s in opts:
                 v = s
+            elif re.match(r"^\d+(\.0+)?$", s):
+                v = bucket_ongoing_count(int(float(s)), opts)
             elif s in ("1-2", "1–2"):
-                v = next((o for o in opts if "1" in o and "2" in o), s)
+                v = bucket_ongoing_count(1, opts)
             elif s in ("3-5", "3–5"):
-                v = next((o for o in opts if "3" in o and "5" in o), s)
+                v = bucket_ongoing_count(3, opts)
             elif s in ("0", "≥6", ">=6", "6+"):
-                v = next((o for o in opts if o.replace(" ", "") in (s, "≥6", ">=6") or o == s), None)
-                if s == "0":
-                    v = "0"
+                v = bucket_ongoing_count(0 if s == "0" else 6, opts)
             else:
                 v = coerce_to_question_value(s, mq, f"stealth.{letter}")
+                # last chance: bare digit left after coerce
+                if v is not None and re.match(r"^\d+$", str(v)) and str(v) not in opts:
+                    v = bucket_ongoing_count(int(v), opts)
+        elif letter == "FC":
+            s = str(val).strip()
+            v = None
+            if not is_junk_value(s):
+                # Normalize Stealth percent bands → live options
+                low = s.lower().replace("≤", "<=").replace("≥", ">=")
+                for o in opts:
+                    ol = o.lower().replace("≤", "<=").replace("≥", ">=")
+                    if s == o or low == ol:
+                        v = o
+                        break
+                if v is None:
+                    if re.search(r"25\s*%?\s*to\s*<?=?50| >\s*25.*50", low) or ">25 to" in low or ">25% to" in low:
+                        v = next((o for o in opts if "25" in o and "50" in o), None)
+                    elif re.search(r"over\s*50|>\s*50|≥\s*50|>=\s*50", low):
+                        v = next((o for o in opts if "50" in o and ("over" in o.lower() or ">" in o)), None)
+                    elif re.search(r"≤\s*25|<=\s*25|under\s*25|<\s*25|0\s*-\s*25", low) or low in ("25%", "≤25%"):
+                        v = next((o for o in opts if "25" in o and "50" not in o), None)
+                    else:
+                        v = coerce_to_question_value(s, mq, f"stealth.{letter}")
+        elif letter == "FT":
+            s = str(val).strip()
+            yn = None
+            if re.match(r"^other\b", s, re.I):
+                v = next((o for o in opts if o.lower() == "other"), "Other" if "Other" in opts else s)
+            elif s in opts:
+                v = s
+            else:
+                # fuzzy to Weekly / Monthly / etc.
+                v = next((o for o in opts if o.lower() == s.lower()), None)
+                if v is None:
+                    v = coerce_to_question_value(s, mq, f"stealth.{letter}")
         else:
             yn = yes_no_from_stealth(val)
             if yn and typ in ("radio", "select") and opts:
@@ -593,8 +948,344 @@ def build_answers(row, survey_qs: list) -> list:
         if re.match(r"^\d+$", s):
             add(lib, s, letter)
 
-    # stash contacts on answers via sentinel for site patch (caller reads row)
+    # Ongoing Dry AMD/GA trial COUNT (Stealth BS=Yes/No, BT=how many)
+    mq_ong = q_by_lib.get(ONGOING_LIB) or {}
+    ong_opts = [
+        o if isinstance(o, str) else str(o.get("label") or o.get("value") or "")
+        for o in (mq_ong.get("options") or [])
+    ]
+    ong_opts = [o for o in ong_opts if o]
+    bt_idx = col_idx("BT")
+    bs_idx = col_idx("BS")
+    ongoing_n = None
+    if bt_idx < len(raw) and not is_junk_value(raw[bt_idx]):
+        s = str(raw[bt_idx]).strip()
+        if re.match(r"^\d+$", s):
+            ongoing_n = int(s)
+    if ongoing_n is None and bs_idx < len(raw):
+        yn = yes_no_from_stealth(raw[bs_idx])
+        if yn == "No":
+            ongoing_n = 0
+        # Yes without BT → leave blank rather than invent a count
+    if ongoing_n is not None:
+        bucketed = bucket_ongoing_count(ongoing_n, ong_opts)
+        if bucketed:
+            add(ONGOING_LIB, bucketed, "BT" if ongoing_n else "BS")
+
+    # Development phases (checkboxes)
+    phases = []
+    for letter, opt in PHASE_COLS.items():
+        idx = col_idx(letter)
+        if idx < len(raw) and checkbox_checked(raw[idx], opt):
+            phases.append(opt)
+    if phases:
+        add(PHASE_LIB, json.dumps(phases) if len(phases) > 1 else phases[0], "BP-BR")
+
+    # Prior study enrollment #1-3
+    for letter, lib in STUDY_ENROLL.items():
+        idx = col_idx(letter)
+        if idx >= len(raw) or is_junk_value(raw[idx]):
+            continue
+        s = str(raw[idx]).strip()
+        if re.match(r"^(o|n/?a|na|-)$", s, re.I):
+            continue
+        if re.match(r"^\d+$", s):
+            add(lib, s, letter)
+    for letter, lib in STUDY_LENGTH.items():
+        idx = col_idx(letter)
+        if idx >= len(raw):
+            continue
+        mq = q_by_lib.get(lib) or {}
+        opts = [
+            o if isinstance(o, str) else str(o.get("label") or o.get("value") or "")
+            for o in (mq.get("options") or [])
+        ]
+        opts = [o for o in opts if o]
+        bucketed = bucket_enrollment_months(raw[idx], opts)
+        if bucketed:
+            add(lib, bucketed, letter)
+
+    # Satellite institution name
+    be_idx = col_idx("BE")
+    if be_idx < len(raw) and not is_junk_value(raw[be_idx]):
+        sat = str(raw[be_idx]).strip()
+        if sat.lower() not in (
+            "institution name",
+            "alth",
+            "satellite office / other location where study procedures will be performed",
+            "company",
+            "na",
+            "n/a",
+        ):
+            add(SAT_NAME_LIB, sat, "BE")
+
+    # Complement % + routine Yes if they use in proposed population
+    fo_idx = col_idx("FO")
+    if fo_idx < len(raw) and not is_junk_value(raw[fo_idx]):
+        pct = str(raw[fo_idx]).strip()
+        if pct.lower() not in ("open-ended response",):
+            add(COMPLEMENT_PCT_LIB, pct, "FO")
+    if COL_LIB.get("FM") and COL_LIB["FM"] in seen:
+        # If they answered the proposed-population complement Q Yes, also mark routine use
+        fm_ans = next((a for a in answers if a.get("libraryQuestionId") == COL_LIB["FM"]), None)
+        if fm_ans and str(fm_ans.get("value") or "").lower() == "yes":
+            add(COMPLEMENT_ROUTINE_LIB, "Yes", "FM.infer")
+
+    # Patient diaries (checkbox pair)
+    diary_hits = []
+    for letter, opt in DIARY_COLS.items():
+        idx = col_idx(letter)
+        if idx < len(raw) and (
+            checkbox_checked(raw[idx], opt)
+            or (not is_junk_value(raw[idx]) and opt.lower() in str(raw[idx]).strip().lower())
+        ):
+            if opt not in diary_hits:
+                diary_hits.append(opt)
+    if diary_hits:
+        # Experience Q uses "Paper diaries" / "eDiaries"
+        exp_map = {"eDiary": "eDiaries", "Paper Diary": "Paper diaries"}
+        exp_vals = [exp_map.get(x, x) for x in diary_hits]
+        add(DIARY_EXP_LIB, json.dumps(exp_vals) if len(exp_vals) > 1 else exp_vals[0], "GW-GX")
+        add(DIARY_PREF_LIB, json.dumps(diary_hits) if len(diary_hits) > 1 else diary_hits[0], "GW-GX.pref")
+
+    # IRT experience (Stealth Yes/No only — no system list)
+    gq_idx = col_idx("GQ")
+    if gq_idx < len(raw) and not is_junk_value(raw[gq_idx]):
+        yn = yes_no_from_stealth(raw[gq_idx])
+        mq = q_by_lib.get(IRT_LIB) or {}
+        opts = [
+            o if isinstance(o, str) else str(o.get("label") or o.get("value") or "")
+            for o in (mq.get("options") or [])
+        ]
+        if yn == "No" and any("none" in o.lower() for o in opts):
+            none = next(o for o in opts if "none" in o.lower())
+            add(IRT_LIB, none, "GQ")
+        elif yn == "Yes" and "Other" in opts:
+            add(IRT_LIB, "Other", "GQ")
+            add(IRT_OTHER_LIB, "Stealth: IRT experience confirmed; system not specified", "GQ.other")
+
+    # Institution address
+    addr = format_address(raw)
+    add("ql-site-address", addr, "G-K")
+
+    # CFP capability + model
+    cfp_hit = False
+    for letter, opt in CFP_COLS.items():
+        idx = col_idx(letter)
+        if idx < len(raw) and checkbox_checked(raw[idx], opt):
+            cfp_hit = True
+    cfp_model = None
+    midx = col_idx(CFP_MODEL_COL)
+    if midx < len(raw) and not is_junk_value(raw[midx]):
+        cand = str(raw[midx]).strip()
+        if cand.lower() not in ("other", "other (please specify)"):
+            cfp_model = cand
+            cfp_hit = True
+    if cfp_hit:
+        add(CFP_LIB, "Yes", "CZ-DA")
+    if cfp_model:
+        add(CFP_MODEL_LIB, cfp_model, CFP_MODEL_COL)
+
+    # Source review method (checkboxes)
+    source_hits = []
+    for letter, opt in SOURCE_COLS.items():
+        idx = col_idx(letter)
+        if idx >= len(raw) or is_junk_value(raw[idx]):
+            continue
+        s = str(raw[idx]).strip().lower()
+        if letter == "DQ" and "paper" in s:
+            source_hits.append(opt)
+        elif letter == "DR" and ("log-in" in s or "login" in s or "electronic" in s):
+            source_hits.append(opt)
+        elif letter == "DS" and "printout" in s:
+            source_hits.append(opt)
+    other_src = None
+    oidx = col_idx(SOURCE_OTHER_COL)
+    if oidx < len(raw) and not is_junk_value(raw[oidx]):
+        other_src = str(raw[oidx]).strip()
+        if other_src.lower() in ("other", "other (please specify)"):
+            other_src = None
+    if len(source_hits) == 1:
+        add(SOURCE_LIB, source_hits[0], "DQ-DS")
+    elif len(source_hits) > 1:
+        # Prefer EMR remote login when present
+        preferred = next((h for h in source_hits if "log in" in h.lower()), source_hits[-1])
+        add(SOURCE_LIB, preferred, "DQ-DS")
+    elif other_src:
+        add(SOURCE_LIB, "Other", SOURCE_OTHER_COL)
+    if other_src:
+        add(SOURCE_OTHER_LIB, other_src, SOURCE_OTHER_COL)
+
+    # Electronic source system name
+    eidx = col_idx(ESOURCE_SYSTEM_COL)
+    if eidx < len(raw) and not is_junk_value(raw[eidx]):
+        esys = str(raw[eidx]).strip()
+        if esys.lower() not in ("0", "o", "n/a", "na") and not re.match(r"^yes\b", esys, re.I):
+            add(ESOURCE_SYSTEM_LIB, esys, ESOURCE_SYSTEM_COL)
+
+    # Patient identify methods
+    pid_hits = []
+    for letter, opt in PATIENT_ID_COLS.items():
+        idx = col_idx(letter)
+        if idx < len(raw) and (
+            checkbox_checked(raw[idx], opt)
+            or (
+                not is_junk_value(raw[idx])
+                and opt.lower() in str(raw[idx]).strip().lower()
+            )
+        ):
+            if opt not in pid_hits:
+                pid_hits.append(opt)
+    pid_other = None
+    poidx = col_idx(PATIENT_ID_OTHER_COL)
+    if poidx < len(raw) and not is_junk_value(raw[poidx]):
+        pid_other = str(raw[poidx]).strip()
+        if pid_other.lower() in ("other", "other (please specify)"):
+            pid_other = None
+    if pid_other and "Other" not in pid_hits:
+        pid_hits.append("Other")
+    if pid_hits:
+        add(PATIENT_ID_LIB, json.dumps(pid_hits) if len(pid_hits) > 1 else pid_hits[0], "FF-FJ")
+    if pid_other:
+        add(PATIENT_ID_OTHER_LIB, pid_other, PATIENT_ID_OTHER_COL)
+
+    # Volume
+    for letter, lib in VOLUME_COLS.items():
+        idx = col_idx(letter)
+        if idx >= len(raw):
+            continue
+        v = volume_clean(raw[idx])
+        if v:
+            add(lib, v, letter)
+
+    # Blood draw alternate location
+    bidx = col_idx(BLOOD_WHERE_COL)
+    if bidx < len(raw) and not is_junk_value(raw[bidx]):
+        bw = str(raw[bidx]).strip()
+        if not bw.lower().startswith("no - where") and len(bw) > 3:
+            add(BLOOD_WHERE_LIB, bw, BLOOD_WHERE_COL)
+
+    # Independent pharmacy contact blob
+    pharm_name = clean_person_name(raw[col_idx("DY")] if col_idx("DY") < len(raw) else None)
+    pharm_email = clean_email(raw[col_idx("EG")] if col_idx("EG") < len(raw) else None)
+    pharm_phone = clean_phone(raw[col_idx("EH")] if col_idx("EH") < len(raw) else None)
+    pharm_co = None
+    if col_idx("DZ") < len(raw) and not is_junk_value(raw[col_idx("DZ")]):
+        cand = str(raw[col_idx("DZ")]).strip()
+        if cand.lower() not in ("company",):
+            pharm_co = cand
+    pharm_addr_parts = []
+    for letter in ("EA", "EB", "EC", "ED", "EE", "EF"):
+        if col_idx(letter) < len(raw) and not is_junk_value(raw[col_idx(letter)]):
+            s = str(raw[col_idx(letter)]).strip()
+            if s.lower() not in (
+                "company",
+                "address",
+                "address 2",
+                "city/town",
+                "state/province",
+                "zip/postal code",
+                "country",
+                "na",
+                "n/a",
+            ):
+                pharm_addr_parts.append(s)
+    if pharm_name or pharm_email or pharm_phone or pharm_addr_parts:
+        # Skip notes that are not real independent-pharmacy contacts
+        name_low = (pharm_name or "").lower()
+        if re.search(
+            r"not\s+(an\s+)?independent|on[- ]site pharmacy set up|^n\.?a\.?\b|^na\b|error\s*-",
+            name_low,
+        ) and not pharm_email and not pharm_phone:
+            pharm_name = None
+        if not (pharm_name or pharm_email or pharm_phone or pharm_addr_parts):
+            pass
+        else:
+            blob = "; ".join(
+                x
+                for x in [
+                    f"Name: {pharm_name}" if pharm_name else "",
+                    f"Company: {pharm_co}" if pharm_co else "",
+                    f"Email: {pharm_email}" if pharm_email else "",
+                    f"Phone: {pharm_phone}" if pharm_phone else "",
+                    f"Address: {', '.join(pharm_addr_parts)}" if pharm_addr_parts else "",
+                ]
+                if x
+            )
+            # Bypass sanitize_pack_value — question label contains Email/Phone/Address and
+            # would reject a multi-field contact blob as "not a valid email/phone".
+            pharm_lib = "ql-rebuild-062-if-pharmacy-is-independent-to-your-site-please-provi"
+            if blob and pharm_lib not in seen:
+                mq = q_by_lib.get(pharm_lib) or {}
+                seen.add(pharm_lib)
+                answers.append(
+                    {
+                        "questionId": mq.get("id") or pharm_lib,
+                        "libraryQuestionId": pharm_lib,
+                        "label": mq.get("label") or pharm_lib,
+                        "type": mq.get("type") or "text",
+                        "value": blob,
+                        "stealthColumn": "DY-EH",
+                        "source": SOURCE,
+                    }
+                )
+
+    # EDC systems from free text
+    edc_idx = col_idx(EDC_TEXT_COL)
+    if edc_idx < len(raw) and not is_junk_value(raw[edc_idx]):
+        edc_text = str(raw[edc_idx]).strip()
+        mq = q_by_lib.get(EDC_LIB) or {}
+        opts = [
+            o if isinstance(o, str) else str(o.get("label") or o.get("value") or "")
+            for o in (mq.get("options") or [])
+        ]
+        opts = [o for o in opts if o]
+        matched, other = parse_edc_systems(edc_text, opts)
+        if matched:
+            add(EDC_LIB, json.dumps(matched) if len(matched) > 1 else matched[0], EDC_TEXT_COL)
+        if not matched and edc_text:
+            if "Other" in opts:
+                add(EDC_LIB, "Other", EDC_TEXT_COL)
+            add(EDC_OTHER_LIB, edc_text, EDC_TEXT_COL)
+        elif other:
+            add(EDC_OTHER_LIB, other, EDC_TEXT_COL + ".extra")
+
+    # Reading centers from free text
+    rc_txt_idx = col_idx(RC_TEXT_COL)
+    if rc_txt_idx < len(raw) and not is_junk_value(raw[rc_txt_idx]):
+        rc_text = str(raw[rc_txt_idx]).strip()
+        if rc_text not in ("-",):
+            mq = q_by_lib.get(RC_LIB) or {}
+            opts = [
+                o if isinstance(o, str) else str(o.get("label") or o.get("value") or "")
+                for o in (mq.get("options") or [])
+            ]
+            opts = [o for o in opts if o]
+            matched, other = parse_reading_centers(rc_text, opts)
+            if matched:
+                add(RC_LIB, json.dumps(matched) if len(matched) > 1 else matched[0], RC_TEXT_COL)
+                if any("AST" in x or "Adaptive" in x for x in matched):
+                    add(
+                        "ql-rebuild-031-has-your-site-staff-equipment-ever-been-certified-by",
+                        "Yes",
+                        RC_TEXT_COL + ".ast",
+                    )
+            if other and not matched:
+                add(RC_OTHER_LIB, other, RC_TEXT_COL)
+            elif other and matched:
+                add(RC_OTHER_LIB, other, RC_TEXT_COL + ".extra")
+
+    if contacts.get("contractsPhone"):
+        add(
+            "ql-gsf_092_contracting-budgeting-contact-phone-number",
+            contacts["contractsPhone"],
+            "AH.gsf",
+        )
+
+    contacts["_address"] = address_parts(raw)
+    contacts["_addressFormatted"] = addr
     row["_contacts"] = contacts
+    row["_unmapped"] = collect_unmapped_stealth(raw)
     return answers
 
 
@@ -665,6 +1356,7 @@ def main():
             "answerCount": len(answers),
             "answersWithLib": sum(1 for a in answers if a.get("libraryQuestionId")),
             "contacts": contacts,
+            "stealthUnmapped": row.get("_unmapped") or {},
         }
         if site and score >= 0.88:
             matched.append({**rec, "answers": answers})
@@ -697,6 +1389,12 @@ def main():
             if v:
                 merged_c[k] = v
         by_site[sid]["contacts"] = merged_c
+        # unmapped: merge keys, later wins
+        prev_u = by_site[sid].get("stealthUnmapped") or {}
+        next_u = m.get("stealthUnmapped") or {}
+        merged_u = dict(prev_u)
+        merged_u.update(next_u)
+        by_site[sid]["stealthUnmapped"] = merged_u
     matched_sites = list(by_site.values())
 
     phone_filled = sum(
@@ -787,6 +1485,7 @@ def main():
             "stealthInstitution": m["inst"],
             "stealthPi": m["pi"],
             "stealthEmail": m["email"],
+            "stealthUnmapped": m.get("stealthUnmapped") or {},
             "matchHow": m["matchHow"],
             "matchScore": m["matchScore"],
             "answerCount": len(answers),
@@ -829,6 +1528,18 @@ def main():
             set_field("contractsName", contacts.get("contractsName"))
             set_field("contractsEmail", contacts.get("contractsEmail"))
             set_field("contractsPhone", contacts.get("contractsPhone"))
+            # Address — Stealth wins when present (sitePrefill beats survey answers)
+            addr = contacts.get("_address") or {}
+            if isinstance(addr, dict):
+                set_field("address1", addr.get("address1"))
+                set_field("address2", addr.get("address2"))
+                set_field("city", addr.get("city"))
+                set_field("state", addr.get("state"))
+                if addr.get("zip"):
+                    set_field("zip", addr["zip"])
+                    set_field("zipCode", addr["zip"])
+                if contacts.get("_addressFormatted"):
+                    set_field("address", contacts["_addressFormatted"])
             if patched:
                 site["updatedAt"] = now
                 site["stealthGaContactSyncedAt"] = now
@@ -840,7 +1551,7 @@ def main():
     report["sitesPatched"] = sites_patched
     REPORT.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(
-        f"Applied: {written} Stealth GA responses; patched {sites_patched} site records with phones/contacts."
+        f"Applied: {written} Stealth GA responses; patched {sites_patched} site records with phones/contacts/address."
     )
 
 

@@ -299,6 +299,12 @@ def coerce_to_question_value(val, q: dict | None, path: str = "") -> object | No
     path_l = (path or "").lower()
     lab = str(q.get("label") or "").lower()
 
+    # Exact option match wins (protects "3–5" / "1–2" radios from number-stripping)
+    if opts:
+        for o in opts:
+            if s == o or low == o.lower():
+                return o
+
     # Practice setting aliases
     if "practice" in path_l or "practice setting" in lab:
         if opts:
@@ -349,8 +355,10 @@ def coerce_to_question_value(val, q: dict | None, path: str = "") -> object | No
     if path_l.endswith(".ast") or re.search(r"\bast\b|adaptive sensory", lab):
         return _yes_no_from_cert_text(s, "ast")
 
-    # Number questions: only real counts
-    if typ == "number" or (opts and all(re.match(r"^[\d≥>≤\-\–]+$", o) for o in opts[:4])):
+    # Number questions: only real counts.
+    # Do NOT treat range radios like "1–2" / "3–5" / "≥6" as number fields.
+    pure_numeric_opts = bool(opts) and all(re.match(r"^\d+(\.\d+)?$", o) for o in opts)
+    if typ == "number" or pure_numeric_opts:
         if re.match(r"^\d+(\.\d+)?$", s):
             return s
         m = re.search(r"\b(\d+)\b", s)
@@ -447,6 +455,32 @@ def coerce_to_question_value(val, q: dict | None, path: str = "") -> object | No
                     cleaned = cleaned[:117] + "..."
                 return cleaned
         return s
+
+    # Generic radio/select: match options (incl. en-dash ranges / bare counts)
+    if typ in ("radio", "select") and opts:
+        for o in opts:
+            if s == o or low == o.lower():
+                return o
+            if s.replace("-", "–") == o or s.replace("–", "-") == o.replace("–", "-"):
+                return o
+        if re.match(r"^\d+(\.\d+)?$", s):
+            n = int(float(s))
+            if n <= 0 and "0" in opts:
+                return next(o for o in opts if o.strip() == "0")
+            for o in opts:
+                ol = o.replace("–", "-").replace("—", "-").replace("≥", ">=").replace(" ", "")
+                if n <= 2 and ol in ("1-2", "1–2"):
+                    return o
+                if 3 <= n <= 5 and ("3-5" in ol or "3–5" in o):
+                    return o
+                if n >= 6 and (">=6" in ol or "≥6" in o or ol == "6+"):
+                    return o
+        # substring / fuzzy
+        for o in opts:
+            ol = o.lower()
+            if low in ol or ol in low:
+                return o
+        return None
 
     return val
 
