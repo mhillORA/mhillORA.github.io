@@ -141,41 +141,55 @@ def main():
             continue
 
         extracted = bf.extract_pi_pair_from_responses(by_live.get(sid) or [])
-        new_pi = ""
-        new_email = cur_email
-        reason = ""
 
-        # Collect candidate names that match the current (trusted) email
+        # Collect candidate names — Mike pack ALWAYS outranks legacy
         match_names = []
+        prac = re.sub(r"\s+", " ", str(site.get("name") or "").strip().lower())
+        mpi = mike_pi.get(prac) or ""
+        for r in by_live.get(sid) or []:
+            if str(r.get("source") or "").startswith("mike") or str(r.get("id") or "").startswith(
+                "rsp-mike-rebuild"
+            ):
+                for a in r.get("answers") or []:
+                    if a.get("libraryQuestionId") == "ql-pi-name" and a.get("value"):
+                        mpi = str(a.get("value")).strip() or mpi
+                if not mpi:
+                    mpi = str(r.get("displayName") or "").strip()
+        # Also match pack by raw practice key variants
+        if not mpi:
+            for k, v in mike_pi.items():
+                if prac == k or (len(prac) >= 12 and len(k) >= 12 and (prac in k or k in prac)):
+                    mpi = v
+                    break
+
         if cur_email:
-            if legacy_pi and bf.name_matches_email(legacy_pi, cur_email):
-                match_names.append(("legacy-match-email", legacy_pi))
-            # Mike pack / mike answers
-            prac = re.sub(r"\s+", " ", str(site.get("name") or "").strip().lower())
-            mpi = mike_pi.get(prac) or ""
-            for r in by_live.get(sid) or []:
-                if str(r.get("source") or "").startswith("mike"):
-                    for a in r.get("answers") or []:
-                        if a.get("libraryQuestionId") == "ql-pi-name" and a.get("value"):
-                            mpi = str(a.get("value")).strip() or mpi
-                    if not mpi:
-                        mpi = str(r.get("displayName") or "").strip()
             if mpi and bf.name_matches_email(mpi, cur_email):
-                match_names.append(("mike-match-email", mpi))
-            # Any survey name that matches current email (scan all PI names in bucket)
+                match_names.append(("mike-match-email", mpi, 0))  # priority 0 = best
+            if legacy_pi and bf.name_matches_email(legacy_pi, cur_email):
+                match_names.append(("legacy-match-email", legacy_pi, 2))
             for r in by_live.get(sid) or []:
                 for a in r.get("answers") or []:
                     if bf.classify_pi_name(a) is None:
                         continue
                     nm = bf.clean_name(a.get("value"))
                     if nm and bf.looks_like_person_name(nm) and bf.name_matches_email(nm, cur_email):
-                        match_names.append(("survey-match-email", nm))
+                        # mike-sourced answers already covered; other surveys = 1
+                        match_names.append(("survey-match-email", nm, 1))
 
-        if match_names:
-            # Prefer longer / more complete name
-            match_names.sort(key=lambda x: -len(x[1]))
-            reason, new_pi = match_names[0]
+        if mpi and not cur_email:
+            # No email to reconcile — Mike wins outright
+            new_pi = mpi
+            new_email = ""
+            reason = "mike-pack-pi"
+        elif match_names:
+            match_names.sort(key=lambda x: (x[2], -len(x[1])))
+            reason, new_pi, _prio = match_names[0]
             new_email = cur_email
+        elif mpi:
+            # Mike priority even when email local-part doesn't match (user: no blanks / Mike > legacy)
+            new_pi = mpi
+            new_email = cur_email
+            reason = "mike-pack-pi-override"
         elif (
             extracted.get("pi")
             and extracted.get("piEmail")
@@ -194,8 +208,13 @@ def main():
         else:
             continue
 
-        # Normalize: if we still have mismatch, clear name
-        if new_pi and new_email and not bf.name_matches_email(new_pi, new_email):
+        # Only clear on mismatch when we did NOT intentionally take Mike override
+        if (
+            new_pi
+            and new_email
+            and not bf.name_matches_email(new_pi, new_email)
+            and reason != "mike-pack-pi-override"
+        ):
             new_pi = ""
             reason = "clear-mismatched-name"
 
