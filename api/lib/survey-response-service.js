@@ -282,7 +282,24 @@ function isJunkPrefillValue(value, { label = '', libraryQuestionId = '', type = 
     if (looksDate && !isDateQ) return true;
     const identity = /name|contact|coordinator|investigator|email|phone|title|role|institution/.test(`${lab} ${lib}`);
     if (identity && /^(yes|no)$/i.test(s)) return true;
-    if (/please specify|if other|describe/.test(lab) && /^(yes|no)$/i.test(s)) return true;
+    if (/please specify|if other|describe|which system|manufacturer|make\/?model|catalog/.test(lab)
+        && /^(yes|no)$/i.test(s)) return true;
+    // IRB type is Central/Local — bare Yes or study notes are pack bleed
+    if ((/irb\/?ec your site is able to use|type of irb/.test(lab) || lib === 'ql-gf-29-central-irb')
+        && (/^(yes|no)$/i.test(s) || (!/central|local/i.test(s) && s.length > 40))) {
+        return true;
+    }
+    // Count questions must not prefill role labels
+    if ((typ === 'number' || /how many/.test(lab))
+        && /sub-?i|coordinator|photographer|examiner|pharmacist|certified/i.test(s)
+        && !/^\d+(\.\d+)?$/.test(s)) {
+        return true;
+    }
+    // Transportation / advertising bleed into patient-identify methods
+    if (/identify patients/.test(lab) && /transportation|advertising|costs covered/i.test(s)
+        && !/chart|database|referral|physician|dear dr|enrollment/i.test(s)) {
+        return true;
+    }
     if ((lib === 'ql-site-name' || /^institution name$/.test(lab.trim()))
         && /\d|street|suite|ave|road|blvd|drive/i.test(s)
         && (/,/.test(s) || /\d{5}/.test(s) || /suite/i.test(s))) {
