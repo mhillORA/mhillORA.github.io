@@ -151,6 +151,20 @@ function buildSiteRecordPrefill(questions, site, { coordinatorStaff = null, piSt
         'ql-gf-00-name': '', // respondent — leave blank
     };
 
+    // If site PI name disagrees with PI email (backfill mix-up), do not prefill the name —
+    // leave it for cross-survey / Mike answers that still have the correct pair.
+    const sitePi = String(byLib['ql-pi-name'] || '').trim();
+    const sitePiEmail = String(byLib['ql-pi-email'] || '').trim();
+    if (sitePi && sitePiEmail) {
+        const local = sitePiEmail.split('@')[0] || '';
+        const tokens = sitePi.toLowerCase().replace(/[^a-z\s]/g, ' ').split(/\s+/).filter((t) => t.length >= 3
+            && !['md', 'phd', 'do', 'od', 'dr', 'jr', 'sr'].includes(t));
+        const last = tokens[tokens.length - 1] || '';
+        const ok = (last && local.toLowerCase().includes(last))
+            || tokens.some((t) => t.length >= 4 && local.toLowerCase().includes(t));
+        if (!ok) byLib['ql-pi-name'] = '';
+    }
+
     const byQid = {
         'gf_15_research-contact': byLib['ql-coord-name'],
         'gf_16_poc-email': byLib['ql-coord-email'],

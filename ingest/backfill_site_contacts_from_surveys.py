@@ -222,15 +222,41 @@ def classify_pi_name(a: dict) -> int | None:
     qid, lib, label = answer_blob(a)
     low = label.lower()
     key = f"{qid} {lib} {low}"
-    if any(x in key for x in ("ql-pi-name", "gf_08_inv-1-name", "investigator name", "principal investigator")):
+    # Affirmation / meta questions are not PI name fields
+    if re.search(r"reviewed|designee|discuss|meeting|experience|familiar|credential|specialty|phone", low):
+        return None
+    if any(x in key for x in ("ql-pi-name", "gf_08_inv-1-name", "gf_07_investigator", "investigator name", "principal investigator")):
         if "email" in low:
             return None
         if "sub-i" in low or "sub-investigator" in low:
             return None
+        if "principal investigator" in low and "name" not in low and "first" not in low and "last" not in low:
+            # e.g. "Has the Principal Investigator reviewed..."
+            if not re.search(r"\bname\b|first|last", low):
+                return None
         return 1
     if re.search(r"\bpi\b", low) and "name" in low and "email" not in low:
         return 2
+    if "site-details-pi-name" in key or (low.strip().endswith("pi name:") or "| pi name" in low):
+        return 2
     return None
+
+
+def name_matches_email(name: str, email: str) -> bool:
+    """True when PI last name / tokens plausibly belong to the email local-part."""
+    n = clean_name(name)
+    e = first_email(email) or str(email or "").strip().lower()
+    if not n or "@" not in e:
+        return False
+    local = e.split("@", 1)[0]
+    tokens = [t for t in re.split(r"[^a-z]+", n.lower()) if len(t) >= 3]
+    tokens = [t for t in tokens if t not in ("md", "phd", "do", "od", "dr", "jr", "sr")]
+    if not tokens:
+        return False
+    last = tokens[-1]
+    if last in local:
+        return True
+    return any(t in local for t in tokens if len(t) >= 4)
 
 
 def pick_best(candidates: list[tuple[int, str, str, str]]) -> tuple[str, str, str] | None:
@@ -246,13 +272,81 @@ def response_when(doc: dict) -> str:
     return str(doc.get("submittedAt") or doc.get("updatedAt") or doc.get("createdAt") or "")
 
 
+def extract_pi_pair_from_responses(responses: list[dict]) -> dict:
+    """
+    Pick PI name + email as a coherent pair from the same response when possible.
+    Prefer pairs where the name matches the email local-part.
+    """
+    responses = sorted(responses, key=response_when, reverse=True)
+    paired = []  # (score, name, email, name_qid, email_qid, rid)
+    name_only = []
+    email_only = []
+
+    for doc in responses:
+        rid = str(doc.get("id") or "")
+        names = []
+        emails = []
+        for a in doc.get("answers") or []:
+            val = str(a.get("value") or "").strip()
+            if not val or a.get("skipped"):
+                continue
+            qid = str(a.get("questionId") or a.get("libraryQuestionId") or "")
+            email = first_email(val)
+            name = clean_name(val)
+            pc = classify_pi(a)
+            pn = classify_pi_name(a)
+            if pc is not None and email:
+                emails.append((pc, email, qid))
+            if pn is not None and name and looks_like_person_name(name):
+                names.append((pn, name, qid))
+            # Combined cell
+            if pc is not None and email and name and looks_like_person_name(name):
+                paired.append((pc, name, email, qid, qid, rid))
+
+        for ns, nval, nqid in names:
+            for es, eval_, eqid in emails:
+                paired.append((ns + es, nval, eval_, nqid, eqid, rid))
+            name_only.append((ns, nval, nqid, rid))
+        for es, eval_, eqid in emails:
+            email_only.append((es, eval_, eqid, rid))
+
+    # Prefer matching pairs, then any same-response pair
+    matching = [p for p in paired if name_matches_email(p[1], p[2])]
+    pool = matching or paired
+    if pool:
+        pool.sort(key=lambda x: (x[0], -len(x[1])))
+        best = pool[0]
+        return {
+            "pi": best[1],
+            "piEmail": best[2],
+            "piSource": best[3],
+            "piEmailSource": best[4],
+            "piPairResponseId": best[5],
+            "piPairMatched": bool(matching),
+        }
+
+    out = {}
+    if name_only:
+        name_only.sort(key=lambda x: (x[0], -len(x[1])))
+        out["pi"] = name_only[0][1]
+        out["piSource"] = name_only[0][2]
+    if email_only:
+        email_only.sort(key=lambda x: (x[0], -len(x[1])))
+        out["piEmail"] = email_only[0][1]
+        out["piEmailSource"] = email_only[0][2]
+    # If independently chosen and they disagree, drop the name (keep email)
+    if out.get("pi") and out.get("piEmail") and not name_matches_email(out["pi"], out["piEmail"]):
+        out.pop("pi", None)
+        out.pop("piSource", None)
+        out["piNameDroppedMismatchedEmail"] = True
+    return out
+
+
 def extract_from_responses(responses: list[dict]) -> dict:
     """Newest responses first; keep best-priority non-empty values."""
     responses = sorted(responses, key=response_when, reverse=True)
     coord_email_cands = []
     coord_name_cands = []
-    pi_email_cands = []
-    pi_name_cands = []
 
     for doc in responses:
         rid = doc.get("id") or ""
@@ -277,32 +371,18 @@ def extract_from_responses(responses: list[dict]) -> dict:
             if sc is not None and email and name and looks_like_person_name(name):
                 coord_name_cands.append((sc, name, qid, rid))
 
-            pc = classify_pi(a)
-            if pc is not None and email:
-                pi_email_cands.append((pc, email, qid, rid))
-            pn = classify_pi_name(a)
-            if pn is not None and name and looks_like_person_name(name):
-                pi_name_cands.append((pn, name, qid, rid))
-            if pc is not None and email and name and looks_like_person_name(name):
-                pi_name_cands.append((pc, name, qid, rid))
-
     out = {}
     ce = pick_best(coord_email_cands)
     cn = pick_best(coord_name_cands)
-    pe = pick_best(pi_email_cands)
-    pn = pick_best(pi_name_cands)
     if ce:
         out["siteCoordinatorEmail"] = ce[0]
         out["siteCoordinatorEmailSource"] = ce[1]
     if cn:
         out["siteCoordinator"] = cn[0]
         out["siteCoordinatorSource"] = cn[1]
-    if pe:
-        out["piEmail"] = pe[0]
-        out["piEmailSource"] = pe[1]
-    if pn:
-        out["pi"] = pn[0]
-        out["piSource"] = pn[1]
+
+    # PI name+email must stay paired
+    out.update(extract_pi_pair_from_responses(responses))
     return out
 
 
