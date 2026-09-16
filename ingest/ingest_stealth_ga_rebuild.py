@@ -357,6 +357,67 @@ def match_site(row, live_sites, by_email: dict):
     return None, None, 0.0
 
 
+_PHONE_JUNK_RE = re.compile(r"^(n/?a|na|none|null|unknown|-)$", re.I)
+
+
+def clean_phone(val) -> str | None:
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s or _PHONE_JUNK_RE.match(s) or is_junk_value(s):
+        return None
+    digits = re.sub(r"\D", "", s)
+    if len(digits) < 7:
+        return None
+    return s
+
+
+def clean_email(val) -> str | None:
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s or _PHONE_JUNK_RE.match(s) or is_junk_value(s):
+        return None
+    if not _EMAIL_RE.match(s):
+        return None
+    return s
+
+
+def clean_person_name(val) -> str | None:
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s or is_junk_value(s):
+        return None
+    if s.lower() in ("name", "company", "institution name"):
+        return None
+    if re.match(r"^(yes|no|response)$", s, re.I):
+        return None
+    return s
+
+
+def extract_contacts(raw) -> dict:
+    """PI / coordinator / contracts / pharmacy from Stealth contact blocks."""
+    return {
+        "piName": clean_person_name(raw[col_idx("E")] if col_idx("E") < len(raw) else None),
+        "piEmail": clean_email(raw[col_idx("M")] if col_idx("M") < len(raw) else None),
+        "piPhone": clean_phone(raw[col_idx("N")] if col_idx("N") < len(raw) else None),
+        # Block after PI = Primary Research POC / coordinator
+        "coordName": clean_person_name(raw[col_idx("O")] if col_idx("O") < len(raw) else None),
+        "coordEmail": clean_email(raw[col_idx("W")] if col_idx("W") < len(raw) else None),
+        "coordPhone": clean_phone(raw[col_idx("X")] if col_idx("X") < len(raw) else None),
+        # Second contact block = contracting/budgeting
+        "contractsName": clean_person_name(raw[col_idx("Y")] if col_idx("Y") < len(raw) else None),
+        "contractsEmail": clean_email(raw[col_idx("AG")] if col_idx("AG") < len(raw) else None),
+        "contractsPhone": clean_phone(raw[col_idx("AH")] if col_idx("AH") < len(raw) else None),
+        # Fallback "main contact for questions" block → fill gaps
+        "altName": clean_person_name(raw[col_idx("AI")] if col_idx("AI") < len(raw) else None),
+        "altEmail": clean_email(raw[col_idx("AQ")] if col_idx("AQ") < len(raw) else None),
+        "altPhone": clean_phone(raw[col_idx("AR")] if col_idx("AR") < len(raw) else None),
+        "pharmacyPhone": clean_phone(raw[col_idx("EH")] if col_idx("EH") < len(raw) else None),
+    }
+
+
 def build_answers(row, survey_qs: list) -> list:
     q_by_lib = {q.get("libraryQuestionId"): q for q in survey_qs if q.get("libraryQuestionId")}
     raw = row["raw"]
@@ -391,6 +452,18 @@ def build_answers(row, survey_qs: list) -> list:
             }
         )
 
+    # Identity / phones — always write when Stealth has them
+    contacts = extract_contacts(raw)
+    add("ql-pi-name", contacts["piName"], "E")
+    add("ql-pi-email", contacts["piEmail"], "M")
+    add("ql-pi-phone", contacts["piPhone"], "N")
+    add("ql-coord-name", contacts["coordName"] or contacts["altName"], "O")
+    add("ql-coord-email", contacts["coordEmail"] or contacts["altEmail"], "W")
+    add("ql-coord-phone", contacts["coordPhone"] or contacts["altPhone"], "X")
+    add("ql-contracts-name", contacts["contractsName"] or contacts["altName"], "Y")
+    add("ql-contracts-email", contacts["contractsEmail"] or contacts["altEmail"], "AG")
+    add("ql-contracts-phone", contacts["contractsPhone"] or contacts["altPhone"], "AH")
+
     # Simple mapped response columns
     for letter, lib in COL_LIB.items():
         idx = col_idx(letter)
@@ -405,7 +478,6 @@ def build_answers(row, survey_qs: list) -> list:
             opts.append(o if isinstance(o, str) else str(o.get("label") or o.get("value") or ""))
         opts = [o for o in opts if o]
         typ = str(mq.get("type") or "").lower()
-        lab = (mq.get("label") or "").lower()
 
         if letter == "BB":
             v = practice_coerce(val, opts)
@@ -521,6 +593,8 @@ def build_answers(row, survey_qs: list) -> list:
         if re.match(r"^\d+$", s):
             add(lib, s, letter)
 
+    # stash contacts on answers via sentinel for site patch (caller reads row)
+    row["_contacts"] = contacts
     return answers
 
 
@@ -579,6 +653,7 @@ def main():
     for row in stealth_rows:
         site, how, score = match_site(row, live, by_email)
         answers = build_answers(row, survey_qs)
+        contacts = row.get("_contacts") or extract_contacts(row["raw"])
         rec = {
             "pi": row["pi"],
             "inst": row["inst"],
@@ -589,6 +664,7 @@ def main():
             "matchScore": score,
             "answerCount": len(answers),
             "answersWithLib": sum(1 for a in answers if a.get("libraryQuestionId")),
+            "contacts": contacts,
         }
         if site and score >= 0.88:
             matched.append({**rec, "answers": answers})
@@ -613,9 +689,25 @@ def main():
         by_site[sid]["answersWithLib"] = len(merged)
         by_site[sid]["pi"] = m["pi"] or by_site[sid]["pi"]
         by_site[sid]["matchHow"] = by_site[sid]["matchHow"] + "+" + (m["matchHow"] or "")
+        # contacts: fill blanks from later, overwrite phones when present (Stealth wins)
+        prev_c = by_site[sid].get("contacts") or {}
+        next_c = m.get("contacts") or {}
+        merged_c = dict(prev_c)
+        for k, v in next_c.items():
+            if v:
+                merged_c[k] = v
+        by_site[sid]["contacts"] = merged_c
     matched_sites = list(by_site.values())
 
+    phone_filled = sum(
+        1
+        for m in matched_sites
+        if (m.get("contacts") or {}).get("piPhone")
+        or (m.get("contacts") or {}).get("coordPhone")
+        or (m.get("contacts") or {}).get("contractsPhone")
+    )
     print(f"Matched rows: {len(matched)} → unique sites: {len(matched_sites)}  Unmatched rows: {len(unmatched)}")
+    print(f"Sites with at least one Stealth phone: {phone_filled}/{len(matched_sites)}")
     by_how = {}
     for m in matched:
         by_how[m["matchHow"]] = by_how.get(m["matchHow"], 0) + 1
@@ -632,10 +724,19 @@ def main():
         "matchedRows": len(matched),
         "matchedSites": len(matched_sites),
         "unmatched": len(unmatched),
+        "sitesWithPhone": phone_filled,
         "matchHow": by_how,
         "unmatchedSample": unmatched[:25],
         "matchedSample": [
-            {k: v for k, v in m.items() if k != "answers"} for m in matched_sites[:15]
+            {
+                **{k: v for k, v in m.items() if k not in ("answers", "contacts")},
+                "phones": {
+                    "pi": (m.get("contacts") or {}).get("piPhone"),
+                    "coord": (m.get("contacts") or {}).get("coordPhone"),
+                    "contracts": (m.get("contacts") or {}).get("contractsPhone"),
+                },
+            }
+            for m in matched_sites[:15]
         ],
     }
     REPORT.write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -653,11 +754,14 @@ def main():
         id="site-survey-assignments",
         partition_key={"paths": ["/siteId"], "kind": "Hash"},
     )
+    sites_c = db.get_container_client("sites")
 
     written = 0
+    sites_patched = 0
     for m in matched_sites:
         site_id = m["siteId"]
         answers = m["answers"]
+        contacts = m.get("contacts") or {}
         rsp_id = f"rsp-stealth-ga-{site_id}"
         asg_id = f"asg-stealth-ga-{site_id}"
         assignment = {
@@ -694,10 +798,50 @@ def main():
         rsp_c.upsert_item(response)
         written += 1
 
+        # Site record patch — Stealth wins for phones/emails (sitePrefill beats survey answers)
+        try:
+            site = sites_c.read_item(site_id, site_id)
+        except Exception:
+            site = None
+        if site:
+            patched = False
+
+            def set_field(key, val):
+                nonlocal patched
+                if not val:
+                    return
+                if site.get(key) != val:
+                    site[key] = val
+                    patched = True
+
+            set_field("piPhone", contacts.get("piPhone"))
+            set_field("pi_phone", contacts.get("piPhone"))
+            if contacts.get("piEmail"):
+                set_field("piEmail", contacts.get("piEmail"))
+            if contacts.get("piName"):
+                # only fill blank PI name — don't clobber a carefully repaired Heier etc. unless blank
+                if not str(site.get("piName") or site.get("pi") or "").strip():
+                    set_field("piName", contacts["piName"])
+                    set_field("pi", contacts["piName"])
+            set_field("siteCoordinator", contacts.get("coordName"))
+            set_field("siteCoordinatorEmail", contacts.get("coordEmail"))
+            set_field("siteCoordinatorPhone", contacts.get("coordPhone"))
+            set_field("contractsName", contacts.get("contractsName"))
+            set_field("contractsEmail", contacts.get("contractsEmail"))
+            set_field("contractsPhone", contacts.get("contractsPhone"))
+            if patched:
+                site["updatedAt"] = now
+                site["stealthGaContactSyncedAt"] = now
+                sites_c.upsert_item(site)
+                sites_patched += 1
+
     report["status"] = "applied"
     report["written"] = written
+    report["sitesPatched"] = sites_patched
     REPORT.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    print(f"Applied: {written} Stealth GA site responses (Stealth wins via newest prefill).")
+    print(
+        f"Applied: {written} Stealth GA responses; patched {sites_patched} site records with phones/contacts."
+    )
 
 
 if __name__ == "__main__":
