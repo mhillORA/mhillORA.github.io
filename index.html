@@ -3876,16 +3876,34 @@
                 || null;
             const record = liveSite || legacySite || null;
             if (record) {
+                // Prefer street-only address + institution label (never dump composite into name)
+                const looksStreet = (s) => {
+                    const t = String(s || '').trim();
+                    if (!t) return false;
+                    return /\d/.test(t) && /\b(st|street|ave|avenue|rd|road|blvd|drive|dr|suite|ste|lane|ln|way)\b/i.test(t);
+                };
+                const siteName = String(record.name || record.institution_name || '').trim();
+                let street = String(record.address1 || record.streetAddress || record.street || '').trim();
+                const composite = String(record.address || '').trim();
+                if ((!street || !looksStreet(street)) && composite && looksStreet(composite) && composite.toLowerCase() !== siteName.toLowerCase()) {
+                    street = composite.split(',')[0].trim() || street;
+                }
+                if (siteName && street && street.toLowerCase() === siteName.toLowerCase() && !looksStreet(street)) {
+                    street = '';
+                }
                 const recordLib = {
-                    'ql-site-name': record.name || record.institution_name || '',
-                    'ql-site-address': record.address || record.address1
-                        || [record.address1, record.city, record.state].filter(Boolean).join(', ')
-                        || '',
-                    'ql-site-phone': record.phone || record.sitePhone || '',
+                    'ql-site-name': (siteName && looksStreet(siteName) && street) ? '' : siteName,
+                    'ql-site-address': street || '',
+                    'ql-site-phone': record.phone || record.sitePhone || record.mainPhone || '',
                     'ql-pi-name': record.pi || record.piName || '',
                     'ql-pi-email': record.piEmail || '',
+                    'ql-pi-phone': record.piPhone || record.pi_phone || '',
                     'ql-coord-name': record.siteCoordinator || record.coordinator || '',
                     'ql-coord-email': record.siteCoordinatorEmail || record.coordinatorEmail || '',
+                    'ql-coord-phone': record.siteCoordinatorPhone || record.coordinatorPhone || '',
+                    'ql-contracts-name': record.contractsName || record.contractContactName || '',
+                    'ql-contracts-email': record.contractsEmail || record.contractContactEmail || '',
+                    'ql-contracts-phone': record.contractsPhone || record.contractContactPhone || '',
                 };
                 Object.entries(recordLib).forEach(([lib, val]) => {
                     const v = String(val || '').trim();
@@ -7725,37 +7743,60 @@
                         return;
                     }
                     if (e.target.closest('.q-add-other-followup')) {
+                        e.preventDefault();
+                        e.stopPropagation();
                         const qs = syncBuilderFromDom();
                         const parent = qs[idx];
                         if (!parent) return;
-                        const opts = coerceOptionList(parent.options);
-                        if (!opts.some((o) => /^other$/i.test(String(o).trim()))) {
-                            opts.push('Other');
+                        if (!isChoiceQuestionType(parent.type)) {
+                            parent.type = 'radio';
                         }
+                        const opts = coerceOptionList(parent.options);
+                        const otherIdx = opts.findIndex((o) => /^other\b/i.test(String(o).trim()));
+                        const otherValue = otherIdx >= 0 ? opts[otherIdx] : 'Other';
+                        if (otherIdx < 0) opts.push(otherValue);
                         parent.options = opts;
                         parent.type = normalizeSurveyQuestionType(parent.type);
                         const parentId = parent.id || `q_${Date.now().toString(36)}`;
                         parent.id = parentId;
-                        const alreadyFollow = qs.some((q, qi) =>
-                            qi > idx
-                            && q?.logic?.showIf?.questionId === parentId
-                            && (
-                                String(q?.logic?.showIf?.equals || '').toLowerCase() === 'other'
-                                || String(q?.logic?.showIf?.includes || '').toLowerCase() === 'other'
-                            )
-                        );
-                        if (!alreadyFollow) {
+                        const parentLabel = String(parent.label || parent.title || 'Question').trim() || 'Question';
+                        const followLabel = `${parentLabel} — Other (please specify)`;
+                        const isMulti = String(parent.type).toLowerCase() === 'multiselect';
+                        const isOtherTrigger = (q) => {
+                            const si = q?.logic?.showIf;
+                            if (!si || String(si.questionId || '') !== parentId) return false;
+                            const eq = String(si.equals || '').trim().toLowerCase();
+                            const inc = String(si.includes || '').trim().toLowerCase();
+                            const any = Array.isArray(si.includesAny)
+                                ? si.includesAny.map((x) => String(x || '').trim().toLowerCase())
+                                : [];
+                            const o = String(otherValue).trim().toLowerCase();
+                            return eq === o || eq === 'other' || inc === o || inc === 'other'
+                                || any.includes(o) || any.includes('other');
+                        };
+                        const alreadyFollow = qs.find((q, qi) => qi > idx && isOtherTrigger(q));
+                        if (alreadyFollow) {
+                            // Keep branching wired to the real Other option text; refresh label for export context
+                            if (isMulti) {
+                                alreadyFollow.logic = { ...(alreadyFollow.logic || {}), showIf: { questionId: parentId, includes: otherValue } };
+                            } else {
+                                alreadyFollow.logic = { ...(alreadyFollow.logic || {}), showIf: { questionId: parentId, equals: otherValue } };
+                            }
+                            if (!/please specify/i.test(String(alreadyFollow.label || '')) || /^if other|^please specify/i.test(String(alreadyFollow.label || '').trim())) {
+                                alreadyFollow.label = followLabel;
+                            }
+                        } else {
                             const follow = {
                                 id: `q_${Date.now().toString(36)}_other`,
-                                label: 'Please specify (Other)',
-                                help: '',
+                                label: followLabel,
+                                help: 'Shown when Other is selected on the previous question.',
                                 type: 'text',
                                 required: true,
                                 options: [],
                                 logic: {
-                                    showIf: isChoiceQuestionType(parent.type) && String(parent.type).toLowerCase() === 'multiselect'
-                                        ? { questionId: parentId, includes: 'Other' }
-                                        : { questionId: parentId, equals: 'Other' },
+                                    showIf: isMulti
+                                        ? { questionId: parentId, includes: otherValue }
+                                        : { questionId: parentId, equals: otherValue },
                                 },
                                 scoringWeight: 0,
                                 scoringOptions: [],
@@ -7770,7 +7811,7 @@
                         }
                         window.__siteSurveyBuilderQuestions = qs;
                         renderBuilder();
-                        showNotification(alreadyFollow ? 'Other choice ensured (follow-up already present)' : 'Added Other + short-text follow-up', 'success');
+                        showNotification(alreadyFollow ? 'Other follow-up updated with parent context' : 'Added Other + short-text follow-up', 'success');
                         return;
                     }
                     if (e.target.closest('.q-remove-choice')) {

@@ -55,6 +55,11 @@ function readHeader(request, name) {
 function buildLiveSiteFromLegacy(legacy, generateId) {
     const now = new Date().toISOString();
     const mapped = mapToLiveSiteFields(legacy);
+    const phone = String(legacy.phone || legacy.sitePhone || legacy.mainPhone || mapped.phone || '').trim();
+    const piPhone = String(legacy.piPhone || legacy.pi_phone || legacy.investigatorPhone || '').trim();
+    const coordPhone = String(
+        legacy.siteCoordinatorPhone || legacy.coordinatorPhone || legacy.crcPhone || ''
+    ).trim();
     return {
         id: generateId(),
         name: mapped.name || 'Promoted site',
@@ -65,10 +70,14 @@ function buildLiveSiteFromLegacy(legacy, generateId) {
         state: mapped.state,
         zip: mapped.zip,
         zipCode: mapped.zip,
+        phone: phone || undefined,
+        sitePhone: phone || undefined,
         pi: mapped.pi,
         piEmail: mapped.piEmail,
+        piPhone: piPhone || undefined,
         siteCoordinator: mapped.siteCoordinator,
         siteCoordinatorEmail: mapped.siteCoordinatorEmail,
+        siteCoordinatorPhone: coordPhone || undefined,
         notes: legacy.notes || '',
         source: 'promoted-from-legacy',
         promotedFromLegacySiteId: legacy.id,

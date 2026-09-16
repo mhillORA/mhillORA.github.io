@@ -107,6 +107,175 @@ def is_filled(val) -> bool:
     return s not in ("", "null", "None", "none", "n/a", "N/A", "-")
 
 
+_EXCEL_DATE_RE = re.compile(
+    r"^\s*\d{4}-\d{1,2}-\d{1,2}(?:[ T]\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?)?\s*$"
+)
+_STREET_HINT_RE = re.compile(
+    r"\d|street|st\b|ave|avenue|rd\b|road|blvd|drive|dr\b|suite|ste\b|lane|ln\b|way\b",
+    re.I,
+)
+_PHONE_RE = re.compile(r"^\+?[\d\s().-]{7,}$")
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+# Pack practice_type free-text → rebuild radio options
+PRACTICE_ALIASES = {
+    "research institution": "Dedicated Research Center",
+    "dedicated research center": "Dedicated Research Center",
+    "research center": "Dedicated Research Center",
+    "university hospital": "University Hospital",
+    "university ophthalmology department": "University Hospital",
+    "university": "University Hospital",
+    "general hospital": "General Hospital",
+    "hospital": "General Hospital",
+    "doctor's office (group practice)": "Doctor's Office (Group Practice)",
+    "group practice": "Doctor's Office (Group Practice)",
+    "doctor's office (private practice)": "Doctor's Office (Private Practice)",
+    "private practice": "Doctor's Office (Private Practice)",
+    "private practice, speciality clinic": "Doctor's Office (Private Practice)",
+    "private practice, specialty clinic": "Doctor's Office (Private Practice)",
+    "specialty clinic": "Specialized Clinic/Institution",
+    "speciality clinic": "Specialized Clinic/Institution",
+    "specialized clinic/institution": "Specialized Clinic/Institution",
+    "specialized clinic": "Specialized Clinic/Institution",
+}
+
+
+def sanitize_pack_value(path: str, val, label: str = "", qtype: str = "", options: list | None = None) -> object | None:
+    """Drop Excel-date / Yes-No / address-bleed junk before writing answers."""
+    if val is None:
+        return None
+    if isinstance(val, (dict, list)):
+        return val
+    s = str(val).strip()
+    if not is_filled(s):
+        return None
+    # Excel datetime spilled into text fields
+    if _EXCEL_DATE_RE.match(s) or ("00:00:00" in s and re.search(r"\d{4}-\d{2}-\d{2}", s)):
+        return None
+    low_path = (path or "").lower()
+    low_lab = (label or "").lower()
+    typ = str(qtype or "").lower()
+    opts = [str(o).strip() for o in (options or []) if str(o).strip()]
+    yes_no_opts = {o.lower() for o in opts} == {"yes", "no"} or (
+        typ in ("radio", "select") and re.search(r"\byes\b|\bno\b|do you|are you|have you", low_lab)
+    )
+
+    # Identity / name / phone / email fields must not be Yes/No or dates
+    if re.search(r"name|contact|email|phone|institution|title|role", low_path + " " + low_lab):
+        if re.match(r"^(yes|no)$", s, re.I) and not yes_no_opts:
+            return None
+    # Please-specify text must not be bare Yes/No
+    if re.search(r"please specify|if other|describe", low_lab) and re.match(r"^(yes|no)$", s, re.I):
+        return None
+    # Institution name must not be a street address blob
+    if "institution_name" in low_path or low_lab.strip() in ("institution name", "practice name"):
+        if _STREET_HINT_RE.search(s) and ("," in s or re.search(r"\d{5}", s) or "suite" in s.lower()):
+            return None
+    # Practice type must not be an address / phone / email
+    if "practice_type" in low_path or "practice setting" in low_lab:
+        if _STREET_HINT_RE.search(s) and (re.search(r"\d", s) or "suite" in s.lower()):
+            return None
+        if _EMAIL_RE.match(s) or (_PHONE_RE.match(s) and len(re.sub(r"\D", "", s)) >= 10):
+            return None
+    # Phone fields: must look like a phone
+    if "phone" in low_path or re.search(r"\bphone\b", low_lab):
+        digits = re.sub(r"\D", "", s)
+        if len(digits) < 7 or _EMAIL_RE.match(s) or re.match(r"^(yes|no)$", s, re.I):
+            return None
+    # Email fields
+    if "email" in low_path or re.search(r"\bemail\b", low_lab):
+        if not _EMAIL_RE.match(s):
+            return None
+    # Address must not be an email
+    if "address" in low_path or re.search(r"\baddress\b", low_lab):
+        if _EMAIL_RE.match(s) or re.match(r"^(yes|no|na|n/?a)$", s, re.I):
+            return None
+    return val
+
+
+def coerce_to_question_value(val, q: dict | None, path: str = "") -> object | None:
+    """Shape pack free-text into the live question's options/type when possible."""
+    if val is None or not q:
+        return val
+    s = str(val).strip()
+    if not s:
+        return None
+    typ = str(q.get("type") or "text").lower()
+    opts = []
+    for o in q.get("options") or []:
+        if isinstance(o, dict):
+            opts.append(str(o.get("label") or o.get("value") or "").strip())
+        else:
+            opts.append(str(o).strip())
+    opts = [o for o in opts if o]
+    low = s.lower()
+    path_l = (path or "").lower()
+
+    # Practice setting aliases
+    if "practice" in path_l or "practice setting" in str(q.get("label") or "").lower():
+        if opts:
+            if s in opts:
+                return s
+            alias = PRACTICE_ALIASES.get(low)
+            if alias and alias in opts:
+                return alias
+            # fuzzy contains
+            for o in opts:
+                ol = o.lower()
+                if low in ol or ol in low:
+                    return o
+            # token overlap
+            best, bs = None, 0.0
+            for o in opts:
+                r = SequenceMatcher(None, low, o.lower()).ratio()
+                if r > bs:
+                    best, bs = o, r
+            if best and bs >= 0.55:
+                return best
+            if re.search(r"other", low) and any(o.lower() == "other" for o in opts):
+                return next(o for o in opts if o.lower() == "other")
+            return None  # don't dump free-text into radio
+
+    # Yes/No radios: any real capability answer → Yes
+    if typ in ("radio", "select") and {o.lower() for o in opts} == {"yes", "no"}:
+        if re.match(r"^(yes|y|true|1)$", s, re.I):
+            return "Yes"
+        if re.match(r"^(no|n|false|0)$", s, re.I):
+            return "No"
+        if re.search(r"unable|not available|do not have|don't have|none", low):
+            return "No"
+        # manufacturer / free text means they have it
+        return "Yes"
+
+    # Multiselect (e.g. SD-OCT brands)
+    if typ in ("multiselect", "checkboxes", "checkbox") and opts:
+        # exact / contains match against options
+        matched = []
+        for o in opts:
+            ol = o.lower()
+            if low == ol or ol in low or low in ol:
+                matched.append(o)
+        if "heidelberg" in low and "zeiss" in low:
+            both = next((o for o in opts if o.lower() == "both"), None)
+            if both:
+                return both
+        if matched:
+            # Prefer a single best option; "Both" wins if both brands present
+            if len(matched) > 1:
+                both = next((o for o in matched if o.lower() == "both"), None)
+                if both:
+                    return both
+            return matched[0]
+        other = next((o for o in opts if o.lower() == "other"), None)
+        if other and not re.match(r"^(yes|no)$", s, re.I):
+            return other
+        if re.match(r"^(yes|y)$", s, re.I):
+            return None  # can't map Yes onto brand list
+        return None
+
+    return val
+
+
 def slug(s: str) -> str:
     t = re.sub(r"[^a-z0-9]+", "-", str(s or "").lower()).strip("-")
     return t[:48] or "site"
@@ -243,6 +412,7 @@ def build_answers(pack_site: dict, field_map: dict, survey_qs: list) -> list:
         for q in survey_qs
         if q.get("libraryQuestionId")
     }
+    q_by_id = {q.get("id"): q for q in survey_qs if q.get("id")}
     answers = []
     seen_libs = set()
     for sec in ("section_1_site_profile", "section_2_indication_history"):
@@ -252,7 +422,21 @@ def build_answers(pack_site: dict, field_map: dict, survey_qs: list) -> list:
             meta = path_meta.get(path) or {}
             lib = meta.get("libraryQuestionId")
             cid = meta.get("canonicalId")
-            mq = q_by_lib.get(lib) if lib else None
+            mq = (q_by_lib.get(lib) if lib else None) or q_by_id.get(meta.get("mightyQuestionId"))
+            label = (mq or {}).get("label") or meta.get("mikeLabel") or meta.get("mightyLabel") or path
+            qtype = (mq or {}).get("type") or "text"
+            opts = (mq or {}).get("options") or []
+            clean = sanitize_pack_value(path, val, label, qtype, opts)
+            if clean is None:
+                continue
+            val = coerce_to_question_value(clean, mq, path)
+            if val is None or (isinstance(val, str) and not is_filled(val)):
+                continue
+            # Prefer pack practice_name over feasibility address bleed for institution
+            if path.endswith("institution_name") or path == "contact_info.institution_name":
+                practice = str(pack_site.get("practice_name") or "").strip()
+                if practice and _STREET_HINT_RE.search(str(val)):
+                    val = practice
             # one answer per library id (first filled wins; pack usually one)
             if lib and lib in seen_libs:
                 continue
@@ -261,9 +445,9 @@ def build_answers(pack_site: dict, field_map: dict, survey_qs: list) -> list:
             answers.append(
                 {
                     "questionId": (mq or {}).get("id") or cid or path,
-                    "libraryQuestionId": lib,
-                    "label": (mq or {}).get("label") or meta.get("mikeLabel") or path,
-                    "type": (mq or {}).get("type") or "text",
+                    "libraryQuestionId": lib or (mq or {}).get("libraryQuestionId"),
+                    "label": label,
+                    "type": qtype,
                     "value": val if not isinstance(val, (dict, list)) else json.dumps(val),
                     "mikeCanonicalId": cid,
                     "mikePackPath": path,

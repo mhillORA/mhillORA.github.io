@@ -107,6 +107,11 @@ function buildPrefillMapForQuestions(questions, responseList, { preferRole } = {
             if (found) {
                 const bridged = readBridgedAnswerValue(found);
                 if (!bridged) continue;
+                if (isJunkPrefillValue(bridged, {
+                    label: q?.label || q?.title || found.label,
+                    libraryQuestionId: libId || found.libraryQuestionId,
+                    type: q?.type || found.type,
+                })) continue;
                 map[qid] = bridged;
                 break;
             }
@@ -138,7 +143,11 @@ function buildSiteRecordPrefill(questions, site, { coordinatorStaff = null, piSt
         'ql-site-phone': site.phone || site.sitePhone || site.mainPhone || '',
         'ql-pi-name': normalized.pi || pi.name || '',
         'ql-pi-email': normalized.piEmail || pi.email || '',
-        'ql-pi-phone': site.piPhone || pi.phone || pi.phoneNumber || '',
+        'ql-pi-phone': site.piPhone || site.pi_phone || pi.phone || pi.phoneNumber || site.phone || '',
+        'ql-contracts-name': site.contractsName || site.contractContactName || site.budgetContactName || '',
+        'ql-contracts-email': site.contractsEmail || site.contractContactEmail || site.budgetContactEmail || '',
+        'ql-contracts-phone': site.contractsPhone || site.contractContactPhone || site.budgetContactPhone || '',
+        'ql-gsf_092_contracting-budgeting-contact-phone-number': site.contractsPhone || site.contractContactPhone || site.budgetContactPhone || '',
         'ql-gf-00-name': '', // respondent — leave blank
     };
 
@@ -171,6 +180,22 @@ function buildSiteRecordPrefill(questions, site, { coordinatorStaff = null, piSt
             test: (n) => n.includes('primary research point of contact title') || n.includes('primary research point of contact role'),
             value: byLib['ql-primary-contact-role'],
         },
+        {
+            test: (n) => n.includes('investigator phone'),
+            value: byLib['ql-pi-phone'],
+        },
+        {
+            test: (n) => (n.includes('contracting') && n.includes('name')) || n.includes('budgeting contact first'),
+            value: byLib['ql-contracts-name'],
+        },
+        {
+            test: (n) => (n.includes('contracting') && n.includes('email')) || n.includes('budgeting contact email'),
+            value: byLib['ql-contracts-email'],
+        },
+        {
+            test: (n) => (n.includes('contracting') && n.includes('phone')) || n.includes('budgeting contact phone'),
+            value: byLib['ql-contracts-phone'],
+        },
     ];
 
     for (const q of Array.isArray(questions) ? questions : []) {
@@ -178,7 +203,11 @@ function buildSiteRecordPrefill(questions, site, { coordinatorStaff = null, piSt
         if (!qid) continue;
         const libId = String(q?.libraryQuestionId || '');
         let val = '';
+        // Contracts phone sometimes linked under a gsf-style library id
         if (libId && byLib[libId]) val = byLib[libId];
+        else if (/contract/i.test(libId) && /phone/i.test(libId + (q?.label || ''))) {
+            val = byLib['ql-contracts-phone'];
+        }
         if (!val && byQid[qid]) val = byQid[qid];
         if (!val) {
             const norm = normalizeQuestionLabel(q?.label || q?.title);
@@ -190,7 +219,13 @@ function buildSiteRecordPrefill(questions, site, { coordinatorStaff = null, piSt
             }
         }
         val = String(val || '').trim();
-        if (val) map[qid] = val;
+        if (val && !isJunkPrefillValue(val, {
+            label: q?.label || q?.title,
+            libraryQuestionId: libId,
+            type: q?.type,
+        })) {
+            map[qid] = val;
+        }
     }
     return map;
 }
@@ -218,6 +253,40 @@ function mergeAnswers(incoming, priorAnswers) {
 
 function normalizeAnswerValue(value) {
     return String(value ?? '').trim();
+}
+
+/** Reject Excel-date / Yes-No / address-bleed values that should never prefill identity fields. */
+function isJunkPrefillValue(value, { label = '', libraryQuestionId = '', type = '' } = {}) {
+    const s = normalizeAnswerValue(value);
+    if (!s) return true;
+    const lab = String(label || '').toLowerCase();
+    const lib = String(libraryQuestionId || '').toLowerCase();
+    const typ = String(type || '').toLowerCase();
+    const looksDate = /^\d{4}-\d{1,2}-\d{1,2}([ T]\d{1,2}:\d{2}(:\d{2}(\.\d+)?)?)?$/.test(s)
+        || (/\d{4}-\d{2}-\d{2}/.test(s) && s.includes('00:00:00'));
+    const isDateQ = typ === 'date' || /\bdate\b|dob|birth|when did/.test(lab);
+    if (looksDate && !isDateQ) return true;
+    const identity = /name|contact|coordinator|investigator|email|phone|title|role|institution/.test(`${lab} ${lib}`);
+    if (identity && /^(yes|no)$/i.test(s)) return true;
+    if (/please specify|if other|describe/.test(lab) && /^(yes|no)$/i.test(s)) return true;
+    if ((lib === 'ql-site-name' || /^institution name$/.test(lab.trim()))
+        && /\d|street|suite|ave|road|blvd|drive/i.test(s)
+        && (/,/.test(s) || /\d{5}/.test(s) || /suite/i.test(s))) {
+        return true;
+    }
+    if (/practice setting|practice type/.test(lab)
+        && /\d/.test(s)
+        && /street|suite|ave|road|blvd|drive|hospital drive/i.test(s)) {
+        return true;
+    }
+    if (/\bphone\b/.test(lab) || /phone/.test(lib)) {
+        const digits = s.replace(/\D/g, '');
+        if (digits.length < 7 || /@/.test(s) || /^(yes|no)$/i.test(s)) return true;
+    }
+    if (/\bemail\b/.test(lab) || /email/.test(lib)) {
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s)) return true;
+    }
+    return false;
 }
 
 function findAnswerForQuestionId(answers, questionId) {

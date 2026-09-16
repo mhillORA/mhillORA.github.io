@@ -631,15 +631,21 @@ function buildPublicPayload({
         coordinatorStaff,
         piStaff,
     });
-    // Cross-survey first (label / libraryQuestionId / gen-feas ids), then same-survey ids, then draft.
+    // Cross-survey / Mike history first; live site record applied after so identity fields win.
     const crossPrefill = buildPrefillMapForQuestions(qList, siteRoleResponses || (prior ? [prior] : []), {
         preferRole: assignment?.targetRole,
     });
+    // Prefill layers (later wins):
+    // 1) survey defaults
+    // 2) cross-survey / Mike history (equipment, practice, non-identity)
+    // 3) same-survey prior submission
+    // 4) live site record for identity/contact (wins over poisoned pack values)
+    // 5) in-progress draft (respondent always wins)
     const prefill = {
         ...(definition?.defaultValues || {}),
-        ...sitePrefill,
         ...crossPrefill,
         ...answersToPrefillMap(prior?.answers),
+        ...sitePrefill,
         ...answersToPrefillMap(draftAnswers || assignment.draftAnswers),
     };
     const hasPrior =
