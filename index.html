@@ -1239,6 +1239,36 @@
                 });
             }
 
+            async updateSiteSurveyResponse(id, response) {
+                return this.request(`/site-survey-responses/${encodeURIComponent(id)}`, {
+                    method: 'PUT',
+                    body: JSON.stringify(response)
+                });
+            }
+
+            /** Persist reviewedAt on response docs (full PUT merge from cached rows). */
+            async markSiteSurveyResponsesReviewed(ids) {
+                const list = Array.isArray(ids) ? ids : [ids];
+                const now = new Date().toISOString();
+                let updated = 0;
+                for (const rid of list) {
+                    if (!rid) continue;
+                    const cached = (allSiteSurveyResponses || []).find((r) => r && r.id === rid);
+                    if (!cached) continue;
+                    if (cached.reviewedAt) {
+                        updated += 1;
+                        continue;
+                    }
+                    const next = { ...cached, reviewedAt: now, reviewed: true };
+                    const saved = await this.updateSiteSurveyResponse(rid, next);
+                    const idx = (allSiteSurveyResponses || []).findIndex((r) => r && r.id === rid);
+                    if (idx >= 0) allSiteSurveyResponses[idx] = saved || next;
+                    else allSiteSurveyResponses.push(saved || next);
+                    updated += 1;
+                }
+                return { ok: true, updated };
+            }
+
             privacyHeaders() {
                 const h = {};
                 try {
@@ -1422,7 +1452,11 @@
         let commsPanel = 'templates'; // templates | questions | links | status | responses | activity | privacy
         let commsStatusFilter = 'all'; // all | completed | in_progress | not_started | stale
         let commsStatusSurveyId = null; // null = template overview; else drill into one survey
+        let commsResponsesSurveyId = null; // null = responses by survey; else drill into one survey
+        let commsResponsesFilter = 'all'; // all | new | reviewed
         const COMMS_LIST_CAP = 25;
+
+        const isSurveyResponseReviewed = (r) => !!(r && (r.reviewedAt || r.reviewed === true));
 
         const SESSION_USER_KEY = 'artemis.session.user';
         // Simple admin backdoor for recovery/testing only (client-side) — local/dev only
@@ -5281,6 +5315,14 @@
 
         const createSiteSurveyResponseModal = (response) => {
             if (!response) return;
+            // Opening a response counts as reviewed (best-effort; don't block the modal)
+            if (!isSurveyResponseReviewed(response) && response.id) {
+                apiService.markSiteSurveyResponsesReviewed([response.id]).then(() => {
+                    if (activeTab === 'feasibility' && commsPanel === 'responses') {
+                        try { renderFeasibility(); } catch (_) { /* ignore */ }
+                    }
+                }).catch(() => { /* ignore */ });
+            }
             const siteName = resolveSponsorSiteDisplayName(response.siteId, response);
             const def = (allSiteSurveyDefinitions || []).find(d => d.id === response.surveyId);
             const surveyTitle = formatSponsorSurveyTitle(def, response.surveyId);
@@ -5742,6 +5784,7 @@
             const pendingLinks = assignments.filter(a => String(a.status || '').toLowerCase() !== 'submitted').length;
             const notes = Array.isArray(window.__siteSurveyNotifications) ? window.__siteSurveyNotifications : [];
             const unread = notes.filter(n => n && !n.read).length;
+            const newResponses = responses.filter((r) => !isSurveyResponseReviewed(r)).length;
 
             const filterSiteName = commsSiteFilterId
                 ? ((allSites || []).find(s => s.id === commsSiteFilterId)?.name || commsSiteFilterId)
@@ -5818,7 +5861,7 @@
                         ${tab('questions', 'Questions', (allSiteSurveyQuestionLibrary || []).filter(q => q && q.status !== 'archived').length)}
                         ${tab('status', 'Status', pendingLinks)}
                         ${tab('links', 'Links', assignments.length)}
-                        ${tab('responses', 'Responses', responses.length)}
+                        ${tab('responses', 'Responses', newResponses ? `${newResponses} new` : responses.length)}
                         ${tab('activity', 'Activity', unread || notes.length)}
                         ${tab('privacy', 'Privacy')}
                     </div>
@@ -6014,6 +6057,10 @@
             if (actionsEl) {
                 if (commsPanel === 'responses') {
                     actionsEl.innerHTML = `
+                        ${commsResponsesSurveyId
+                            ? `<button type="button" id="comms-responses-back-btn" class="text-xs font-medium px-2 py-1 rounded border border-gray-300 dark:border-gray-600">← All surveys</button>`
+                            : ''}
+                        <button type="button" id="comms-responses-mark-read-btn" class="text-xs font-medium px-2 py-1 rounded border border-gray-300 dark:border-gray-600">Mark ${commsResponsesSurveyId ? 'survey' : 'all'} read</button>
                         <button type="button" id="jump-survey-reporting-btn" class="text-xs font-medium text-indigo-600 dark:text-indigo-400 hover:underline">Question report →</button>
                         <button type="button" id="comms-sponsor-excel-btn" class="text-xs font-medium px-2 py-1 rounded bg-teal-700 text-white">Sponsor Excel</button>
                         <button type="button" id="comms-sponsor-pdf-btn" class="text-xs font-medium px-2 py-1 rounded bg-indigo-600 text-white">Sponsor PDF</button>`;
@@ -6106,11 +6153,13 @@
                 body.innerHTML = rows.length === 0 ? empty('No links yet. Hit Send survey.') : shown.join('');
                 if (footerEl) footerEl.textContent = rows.length > cap ? `Showing ${cap} of ${rows.length}.` : `${rows.length} link${rows.length === 1 ? '' : 's'}`;
             } else if (commsPanel === 'status') {
+                const siteNameById = new Map((allSites || []).map((s) => [s.id, s.name || s.id]));
+                const surveyTitleById = new Map(allDefs.map((d) => [d.id, d.title || d.id]));
                 const enriched = assignments.map((a) => {
                     const kind = classifySurveyInviteStatus(a);
-                    const siteName = allSites.find(s => s.id === a.siteId)?.name || a.siteId || '—';
+                    const siteName = siteNameById.get(a.siteId) || a.siteId || '—';
                     const surveyId = a.surveyId || '';
-                    const surveyTitle = allDefs.find(d => d.id === surveyId)?.title || surveyId || '(untitled survey)';
+                    const surveyTitle = surveyTitleById.get(surveyId) || surveyId || '(untitled survey)';
                     const lastAt = a.submittedAt || a.draftSavedAt || a.openedAt || a.sentAt || a.updatedAt || a.createdAt || '';
                     return { a, kind, siteName, surveyId, surveyTitle, lastAt };
                 });
@@ -6144,10 +6193,17 @@
                         : 'bg-white dark:bg-gray-900 text-gray-700 dark:text-gray-200 border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-800'}" data-status-filter="${id}">${label} <span class="opacity-80">${count}</span></button>`;
                 };
 
-                const responseByAsg = new Map();
-                responses.forEach((r) => {
-                    if (r && r.assignmentId) responseByAsg.set(String(r.assignmentId), r);
-                });
+                // Only needed when drilling into a survey (View buttons on completed rows)
+                let responseByAsg = null;
+                const getResponseByAsg = () => {
+                    if (!responseByAsg) {
+                        responseByAsg = new Map();
+                        responses.forEach((r) => {
+                            if (r && r.assignmentId) responseByAsg.set(String(r.assignmentId), r);
+                        });
+                    }
+                    return responseByAsg;
+                };
 
                 const sortItems = (list) => list.slice().sort((x, y) => {
                     const rank = { not_started: 0, in_progress: 1, stale: 2, completed: 3 };
@@ -6166,7 +6222,7 @@
                         ? ` · reminded ${new Date(item.a.lastRemindedAt).toLocaleDateString()}`
                         : '';
                     if (item.kind === 'completed') {
-                        const resp = responseByAsg.get(String(item.a.id));
+                        const resp = getResponseByAsg().get(String(item.a.id));
                         return `
                             <div class="comms-row flex items-center gap-2 px-2.5 py-2 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700/40" data-search="${escapeHtml(search)}">
                                 <div class="min-w-0 flex-1">
@@ -6338,29 +6394,186 @@
                     });
                 }
             } else if (commsPanel === 'responses') {
-                const rows = responses.map(r => {
-                    const siteName = allSites.find(s => s.id === r.siteId)?.name || r.siteId;
-                    const def = allDefs.find(d => d.id === r.surveyId);
-                    const surveyTitle = def?.title || r.surveyId;
-                    const answerCount = asSurveyList(r.answers).filter(a => a && String(a.value ?? '').trim() !== '').length;
+                const siteNameById = new Map((allSites || []).map((s) => [s.id, s.name || s.id]));
+                const surveyTitleById = new Map(allDefs.map((d) => [d.id, d.title || d.id]));
+                const enriched = responses.map((r) => {
+                    const siteName = siteNameById.get(r.siteId) || r.siteId || '—';
+                    const surveyId = r.surveyId || '_unknown';
+                    const surveyTitle = surveyTitleById.get(surveyId) || surveyId || '(untitled survey)';
+                    const reviewed = isSurveyResponseReviewed(r);
                     const when = r.submittedAt || r.createdAt || '';
-                    const whenLabel = when ? new Date(when).toLocaleString() : '—';
-                    const search = `${siteName} ${surveyTitle} ${r.targetRole || ''}`.toLowerCase();
-                    return `
-                        <div class="comms-row flex items-center gap-2 px-2.5 py-2 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700/40" data-search="${escapeHtml(search)}">
-                            <div class="min-w-0 flex-1">
-                                <div class="flex items-center gap-2 min-w-0">
-                                    <div class="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">${escapeHtml(siteName)}</div>
-                                    ${surveyOutcomeBadgeHtml(r, def)}
-                                </div>
-                                <div class="text-xs text-gray-500 dark:text-gray-400 truncate">${escapeHtml(surveyTitle)} · ${escapeHtml(formatSiteSurveyRoleLabel(r.targetRole))} · ${answerCount} ans · ${escapeHtml(whenLabel)}</div>
-                            </div>
-                            <button type="button" class="view-site-survey-response-btn px-2 py-1 rounded text-xs bg-gray-100 dark:bg-gray-700 shrink-0" data-response-id="${escapeHtml(r.id)}">View</button>
-                        </div>`;
+                    return { r, siteName, surveyId, surveyTitle, reviewed, when };
                 });
-                const shown = rows.slice(0, cap);
-                body.innerHTML = rows.length === 0 ? empty('No responses yet.') : shown.join('');
-                if (footerEl) footerEl.textContent = rows.length > cap ? `Showing latest ${cap} of ${rows.length}.` : `${rows.length} response${rows.length === 1 ? '' : 's'}`;
+                const bySurvey = new Map();
+                enriched.forEach((item) => {
+                    if (!bySurvey.has(item.surveyId)) {
+                        bySurvey.set(item.surveyId, {
+                            surveyId: item.surveyId,
+                            surveyTitle: item.surveyTitle,
+                            items: [],
+                            total: 0,
+                            newCount: 0,
+                        });
+                    }
+                    const g = bySurvey.get(item.surveyId);
+                    g.items.push(item);
+                    g.total += 1;
+                    if (!item.reviewed) g.newCount += 1;
+                });
+                const surveyGroups = [...bySurvey.values()].sort((a, b) => {
+                    if (b.newCount !== a.newCount) return b.newCount - a.newCount;
+                    return String(a.surveyTitle).localeCompare(String(b.surveyTitle));
+                });
+
+                const filter = ['all', 'new', 'reviewed'].includes(commsResponsesFilter)
+                    ? commsResponsesFilter
+                    : 'all';
+                const chipBtn = (id, label, count) => {
+                    const on = filter === id;
+                    return `<button type="button" class="comms-responses-filter-btn px-2.5 py-1 rounded-md text-xs font-medium border ${on
+                        ? 'bg-indigo-600 text-white border-indigo-600'
+                        : 'bg-white dark:bg-gray-900 text-gray-700 dark:text-gray-200 border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-800'}" data-responses-filter="${id}">${label} <span class="opacity-80">${count}</span></button>`;
+                };
+
+                const focused = commsResponsesSurveyId
+                    ? surveyGroups.find((g) => g.surveyId === commsResponsesSurveyId) || null
+                    : null;
+
+                if (!commsResponsesSurveyId || !focused) {
+                    if (titleEl) titleEl.textContent = 'Responses by survey';
+                    body.innerHTML = surveyGroups.length === 0
+                        ? empty('No responses yet.')
+                        : `
+                            <div class="px-1 mb-2 text-xs text-gray-500 dark:text-gray-400">
+                                ${surveyGroups.length} survey${surveyGroups.length === 1 ? '' : 's'} · ${enriched.filter((x) => !x.reviewed).length} new · open a survey to review · View marks as read
+                            </div>
+                            ${surveyGroups.map((g) => {
+                                const search = `${g.surveyTitle} ${g.surveyId}`.toLowerCase();
+                                return `
+                                    <div class="comms-row mb-2 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden" data-search="${escapeHtml(search)}">
+                                        <div class="px-3 py-2.5 flex flex-wrap items-center gap-2 bg-gray-50/80 dark:bg-gray-900/30">
+                                            <div class="min-w-0 flex-1">
+                                                <div class="text-sm font-semibold text-gray-900 dark:text-gray-100 truncate">${escapeHtml(g.surveyTitle)}</div>
+                                                <div class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                                                    ${g.total} response${g.total === 1 ? '' : 's'}${g.newCount ? ` · ${g.newCount} new` : ' · all reviewed'}
+                                                </div>
+                                            </div>
+                                            <div class="flex items-center gap-1.5 shrink-0">
+                                                ${g.newCount
+                                                    ? `<button type="button" class="mark-survey-responses-read-btn px-2 py-1 rounded text-xs border border-gray-300 dark:border-gray-600" data-survey-id="${escapeHtml(g.surveyId)}">Mark read (${g.newCount})</button>`
+                                                    : ''}
+                                                <button type="button" class="comms-responses-open-survey-btn px-2 py-1 rounded text-xs bg-indigo-600 text-white" data-survey-id="${escapeHtml(g.surveyId)}">View responses</button>
+                                            </div>
+                                        </div>
+                                    </div>`;
+                            }).join('')}`;
+                    if (footerEl) {
+                        footerEl.textContent = `${enriched.length} response${enriched.length === 1 ? '' : 's'} across ${surveyGroups.length} survey${surveyGroups.length === 1 ? '' : 's'}`;
+                    }
+                } else {
+                    if (titleEl) titleEl.textContent = focused.surveyTitle;
+                    const counts = {
+                        all: focused.total,
+                        new: focused.newCount,
+                        reviewed: focused.total - focused.newCount,
+                    };
+                    const filtered = focused.items
+                        .filter((x) => {
+                            if (filter === 'new') return !x.reviewed;
+                            if (filter === 'reviewed') return x.reviewed;
+                            return true;
+                        })
+                        .sort((a, b) => String(b.when || '').localeCompare(String(a.when || '')));
+                    const shown = filtered.slice(0, cap);
+                    body.innerHTML = `
+                        <div class="flex flex-wrap gap-1.5 mb-3 px-1">
+                            ${chipBtn('all', 'All', counts.all)}
+                            ${chipBtn('new', 'New', counts.new)}
+                            ${chipBtn('reviewed', 'Reviewed', counts.reviewed)}
+                        </div>
+                        ${filtered.length === 0
+                            ? empty('Nothing in this filter.')
+                            : shown.map((item) => {
+                                const def = allDefs.find((d) => d.id === item.surveyId);
+                                const answerCount = asSurveyList(item.r.answers).filter((a) => a && String(a.value ?? '').trim() !== '').length;
+                                const whenLabel = item.when ? new Date(item.when).toLocaleString() : '—';
+                                const search = `${item.siteName} ${item.surveyTitle} ${item.r.targetRole || ''} ${item.r.email || ''}`.toLowerCase();
+                                return `
+                                    <div class="comms-row flex items-center gap-2 px-2.5 py-2 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700/40 ${item.reviewed ? '' : 'bg-emerald-50/50 dark:bg-emerald-950/20'}" data-search="${escapeHtml(search)}">
+                                        <div class="min-w-0 flex-1">
+                                            <div class="flex items-center gap-2 min-w-0 flex-wrap">
+                                                <div class="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">${escapeHtml(item.siteName)}</div>
+                                                ${item.reviewed
+                                                    ? ''
+                                                    : '<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-100 text-emerald-800 dark:bg-emerald-900/50 dark:text-emerald-200">New</span>'}
+                                                ${surveyOutcomeBadgeHtml(item.r, def)}
+                                            </div>
+                                            <div class="text-xs text-gray-500 dark:text-gray-400 truncate">${escapeHtml(formatSiteSurveyRoleLabel(item.r.targetRole))} · ${answerCount} ans · ${escapeHtml(whenLabel)}</div>
+                                        </div>
+                                        <div class="flex items-center gap-1 shrink-0">
+                                            ${item.reviewed
+                                                ? ''
+                                                : `<button type="button" class="mark-one-response-read-btn px-2 py-1 rounded text-xs border border-gray-300 dark:border-gray-600" data-response-id="${escapeHtml(item.r.id)}">Mark read</button>`}
+                                            <button type="button" class="view-site-survey-response-btn px-2 py-1 rounded text-xs bg-gray-100 dark:bg-gray-700" data-response-id="${escapeHtml(item.r.id)}">View</button>
+                                        </div>
+                                    </div>`;
+                            }).join('')}
+                    `;
+                    if (footerEl) {
+                        footerEl.textContent = filtered.length > cap
+                            ? `Showing latest ${cap} of ${filtered.length} · ${focused.surveyTitle}`
+                            : `${filtered.length} response${filtered.length === 1 ? '' : 's'} · ${focused.surveyTitle}`;
+                    }
+                }
+
+                body.querySelectorAll('.comms-responses-filter-btn').forEach((btn) => {
+                    btn.addEventListener('click', () => {
+                        commsResponsesFilter = btn.getAttribute('data-responses-filter') || 'all';
+                        renderFeasibility();
+                    });
+                });
+                body.querySelectorAll('.comms-responses-open-survey-btn').forEach((btn) => {
+                    btn.addEventListener('click', () => {
+                        commsResponsesSurveyId = btn.getAttribute('data-survey-id') || null;
+                        commsResponsesFilter = 'all';
+                        renderFeasibility();
+                    });
+                });
+
+                const backBtn = document.getElementById('comms-responses-back-btn');
+                if (backBtn && !backBtn.dataset.bound) {
+                    backBtn.dataset.bound = '1';
+                    backBtn.addEventListener('click', () => {
+                        commsResponsesSurveyId = null;
+                        commsResponsesFilter = 'all';
+                        renderFeasibility();
+                    });
+                }
+
+                const markAllBtn = document.getElementById('comms-responses-mark-read-btn');
+                if (markAllBtn && !markAllBtn.dataset.bound) {
+                    markAllBtn.dataset.bound = '1';
+                    markAllBtn.addEventListener('click', async () => {
+                        const scope = enriched.filter((x) =>
+                            !x.reviewed && (!commsResponsesSurveyId || x.surveyId === commsResponsesSurveyId)
+                        );
+                        const ids = scope.map((x) => x.r.id).filter(Boolean);
+                        if (!ids.length) {
+                            showNotification('Nothing new to mark', 'success');
+                            return;
+                        }
+                        try {
+                            markAllBtn.disabled = true;
+                            await apiService.markSiteSurveyResponsesReviewed(ids);
+                            showNotification(`Marked ${ids.length} read`, 'success');
+                            renderFeasibility();
+                        } catch (err) {
+                            showNotification(err.message || 'Mark read failed', 'error');
+                        } finally {
+                            markAllBtn.disabled = false;
+                        }
+                    });
+                }
             } else if (commsPanel === 'activity') {
                 const isErr = (n) => {
                     const k = String(n.kind || '');
@@ -8882,12 +9095,19 @@
             const provider = payload?.emailProvider || {};
             const emailed = results.filter(r => r.email?.ok).length;
             const missing = results.filter(r => r.email?.error === 'missing_recipient').length;
-            const manual = results.filter(r => !r.email?.ok && r.email?.error === 'no_email_provider').length;
+            const noProvider = results.filter(r => r.email?.error === 'no_email_provider').length;
+            const deliveryErrors = results.filter(r => r.email && r.email.ok === false && r.email.error && r.email.error !== 'missing_recipient' && r.email.error !== 'no_email_provider');
+            // Reminder/resend payloads often omit emailProvider — infer from delivery results.
+            const configured = provider.configured === true
+                || emailed > 0
+                || (provider.modes && provider.modes.length > 0)
+                || results.some((r) => r.email?.mode && r.email.mode !== 'manual' && r.email.mode !== 'none');
             const deliveryLabel = (r) => {
                 if (r.email?.ok) return `Sent (${r.email.mode})`;
                 if (r.email?.error === 'missing_recipient') return 'No email on site';
                 if (r.email?.error === 'no_email_provider') return 'Not configured — copy link';
-                return r.email?.error || r.email?.mode || 'manual';
+                if (r.email?.error) return r.email.error;
+                return r.email?.mode || 'manual';
             };
             const rows = results.map(r => `
                 <tr class="border-t border-gray-100 dark:border-gray-700">
@@ -8899,16 +9119,27 @@
                         <button type="button" class="copy-site-survey-link-btn text-indigo-600 dark:text-indigo-400 text-sm hover:underline" data-url="${escapeHtml(r.inviteUrl || '')}">Copy link</button>
                     </td>
                 </tr>`).join('');
-            const setupHint = provider.configured
-                ? `<p class="text-xs text-emerald-700 dark:text-emerald-300 mt-2">Email provider active: ${(provider.modes || []).join(', ') || 'yes'} · ${emailed} sent</p>`
-                : `<p class="text-xs text-amber-800 dark:text-amber-200 mt-2">Email is not configured yet — links were created; copy them or set <code class="bg-amber-100 dark:bg-amber-900/40 px-1 rounded">SURVEY_EMAIL_FROM</code> + Graph Mail.Send (see docs/SURVEY_EMAIL_SETUP.md).</p>`;
+            let setupHint = '';
+            if (configured && emailed) {
+                const modes = (provider.modes && provider.modes.length)
+                    ? provider.modes.join(', ')
+                    : [...new Set(results.filter((r) => r.email?.ok).map((r) => r.email.mode).filter(Boolean))].join(', ') || 'yes';
+                setupHint = `<p class="text-xs text-emerald-700 dark:text-emerald-300 mt-2">Email provider active: ${escapeHtml(modes)} · ${emailed} sent</p>`;
+            } else if (configured && deliveryErrors.length) {
+                const sample = deliveryErrors[0]?.email;
+                setupHint = `<p class="text-xs text-amber-800 dark:text-amber-200 mt-2">Email provider is configured but delivery failed${sample?.error ? ` (${escapeHtml(sample.error)})` : ''}${sample?.detail ? `: ${escapeHtml(String(sample.detail).slice(0, 160))}` : ''}. Links below still work — copy or retry.</p>`;
+            } else if (configured && missing && !emailed) {
+                setupHint = `<p class="text-xs text-amber-800 dark:text-amber-200 mt-2">Email is configured, but ${missing} site${missing === 1 ? '' : 's'} had no recipient address on file.</p>`;
+            } else if (!configured || noProvider) {
+                setupHint = `<p class="text-xs text-amber-800 dark:text-amber-200 mt-2">Email is not configured yet — links were created; copy them or set <code class="bg-amber-100 dark:bg-amber-900/40 px-1 rounded">SURVEY_EMAIL_FROM</code> + Graph Mail.Send (see docs/SURVEY_EMAIL_SETUP.md).</p>`;
+            }
             const modalHTML = `
                 <div class="modal-backdrop">
                     <div class="modal-content import-modal-content dark:bg-gray-800" style="max-width: 48rem;">
                         <div class="p-6 space-y-4">
                             <div>
                                 <h2 class="text-xl font-bold text-gray-900 dark:text-gray-100">Links created</h2>
-                                <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Confirmation that the sites listed received an invite for <strong>${escapeHtml(payload.surveyTitle || payload.surveyId || 'survey')}</strong>. Once this prompt is closed, you are unable to copy the links below. Please resend email if any sites have issues accessing the link.${missing ? ` ${missing} missing site email.` : ''}${manual ? ` ${manual} need email setup.` : ''}</p>
+                                <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Confirmation that the sites listed received an invite for <strong>${escapeHtml(payload.surveyTitle || payload.surveyId || 'survey')}</strong>. Once this prompt is closed, you are unable to copy the links below. Please resend email if any sites have issues accessing the link.${missing ? ` ${missing} missing site email.` : ''}${noProvider && !configured ? ` ${noProvider} need email setup.` : ''}</p>
                                 ${setupHint}
                             </div>
                             <div class="overflow-x-auto max-h-80 overflow-y-auto">
@@ -9014,7 +9245,7 @@
                                 inviteUrl: r.inviteUrl,
                                 email: r.email || (r.error ? { ok: false, error: r.error } : { ok: false }),
                             })),
-                            emailProvider: { configured: true, modes: ['reminder'] },
+                            emailProvider: result?.emailProvider || undefined,
                         });
                         showNotification(`Reminders sent: ${result?.sent || 0} of ${result?.targeted || 0}`, 'success');
                     } else {
@@ -9035,8 +9266,9 @@
                                 inviteUrl: result?.inviteUrl,
                                 email: result?.email,
                             }],
+                            emailProvider: result?.emailProvider || undefined,
                         });
-                        showNotification('Reminder emailed', 'success');
+                        showNotification(result?.email?.ok ? 'Reminder emailed' : 'Reminder created — check delivery status', result?.email?.ok ? 'success' : 'error');
                     }
                     allSiteSurveyAssignments = await apiService.getSiteSurveyAssignments().catch(() => allSiteSurveyAssignments);
                     if (activeTab === 'feasibility') render();
@@ -15307,6 +15539,41 @@
                 }).catch(err => showNotification(err.message || 'Failed', 'error'));
                 return;
             }
+            const markSurveyResponsesReadBtn = e.target.closest('.mark-survey-responses-read-btn');
+            if (markSurveyResponsesReadBtn) {
+                const sid = markSurveyResponsesReadBtn.getAttribute('data-survey-id');
+                const ids = (allSiteSurveyResponses || [])
+                    .filter((r) => r && !r._archived && r.surveyId === sid && !isSurveyResponseReviewed(r))
+                    .map((r) => r.id)
+                    .filter(Boolean);
+                if (!ids.length) {
+                    showNotification('Nothing new to mark', 'success');
+                    return;
+                }
+                markSurveyResponsesReadBtn.disabled = true;
+                apiService.markSiteSurveyResponsesReviewed(ids)
+                    .then(() => {
+                        showNotification(`Marked ${ids.length} read`, 'success');
+                        if (activeTab === 'feasibility') renderFeasibility();
+                    })
+                    .catch((err) => showNotification(err.message || 'Mark read failed', 'error'))
+                    .finally(() => { markSurveyResponsesReadBtn.disabled = false; });
+                return;
+            }
+            const markOneResponseReadBtn = e.target.closest('.mark-one-response-read-btn');
+            if (markOneResponseReadBtn) {
+                const rid = markOneResponseReadBtn.getAttribute('data-response-id');
+                if (!rid) return;
+                markOneResponseReadBtn.disabled = true;
+                apiService.markSiteSurveyResponsesReviewed([rid])
+                    .then(() => {
+                        showNotification('Marked read', 'success');
+                        if (activeTab === 'feasibility') renderFeasibility();
+                    })
+                    .catch((err) => showNotification(err.message || 'Mark read failed', 'error'))
+                    .finally(() => { markOneResponseReadBtn.disabled = false; });
+                return;
+            }
             const resendSurveyBtn = e.target.closest('.resend-site-survey-btn');
             if (resendSurveyBtn) {
                 const assignmentId = resendSurveyBtn.getAttribute('data-assignment-id');
@@ -15324,7 +15591,8 @@
                                 targetEmail: result?.targetEmail,
                                 inviteUrl: result?.inviteUrl,
                                 email: result?.email
-                            }]
+                            }],
+                            emailProvider: result?.emailProvider || undefined,
                         });
                         await initializeDataLoaders();
                         showNotification('New secure link created', 'success');

@@ -1711,7 +1711,10 @@ function registerSurveySecureRoutes(app, deps) {
                     };
                 }
                 return {
-                    jsonBody: result,
+                    jsonBody: {
+                        ...result,
+                        emailProvider: emailProviderStatus(),
+                    },
                     headers: corsHeaders(),
                 };
             } catch (error) {
@@ -1813,6 +1816,7 @@ function registerSurveySecureRoutes(app, deps) {
                         targeted: targets.length,
                         sent,
                         failed,
+                        emailProvider: emailProviderStatus(),
                         results,
                     },
                     headers: corsHeaders(),
