@@ -88,6 +88,8 @@ function normalizeSiteFields(site) {
             zip: '',
             zipCode: '',
             pi: '',
+            piFirstName: '',
+            piLastName: '',
             piEmail: '',
             pi2Name: '',
             pi2Email: '',
@@ -104,11 +106,25 @@ function normalizeSiteFields(site) {
     let city = trimStr(site.city || site.address_city || '');
     let state = trimStr(site.state || site.address_state || '');
     let zip = trimStr(site.zipCode || site.zip || site.postal || site.address_zip || '');
-    const pi = trimStr(site.pi || site.piName || '');
+    const piParsed = parsePersonName(site.pi || site.piName || '', {
+        firstName: site.piFirstName || site.pi_first_name || '',
+        lastName: site.piLastName || site.pi_last_name || '',
+    });
+    const pi = piParsed.display;
+    const piFirstName = piParsed.first;
+    const piLastName = piParsed.last;
     const piEmail = trimStr(site.piEmail || '');
-    const pi2Name = trimStr(site.pi2Name || '');
+    const pi2Parsed = parsePersonName(site.pi2Name || '', {
+        firstName: site.pi2FirstName || '',
+        lastName: site.pi2LastName || '',
+    });
+    const pi2Name = pi2Parsed.display;
     const pi2Email = trimStr(site.pi2Email || '');
-    const pi3Name = trimStr(site.pi3Name || '');
+    const pi3Parsed = parsePersonName(site.pi3Name || '', {
+        firstName: site.pi3FirstName || '',
+        lastName: site.pi3LastName || '',
+    });
+    const pi3Name = pi3Parsed.display;
     const pi3Email = trimStr(site.pi3Email || '');
 
     // City wrongly stored as address1 (e.g. "San Antonio")
@@ -187,6 +203,8 @@ function normalizeSiteFields(site) {
         zip,
         zipCode: zip,
         pi,
+        piFirstName,
+        piLastName,
         piEmail,
         pi2Name,
         pi2Email,
@@ -241,6 +259,77 @@ function siteNamePrefill(site) {
     return resolveSiteName(site);
 }
 
+/** Titles / credentials stripped when parsing person names. */
+const PERSON_NAME_CREDENTIALS = /\b(md|m\.d\.|do|d\.o\.|phd|ph\.d\.|od|o\.d\.|dr|doctor|jr|sr|ii|iii|iv)\b/gi;
+
+/**
+ * Parse a person name into { first, last, display } with First Last ordering.
+ * - Explicit first/last fields win
+ * - "Last, First Middle" → First Middle Last
+ * - Bare "TokenA TokenB" is kept as-is (assume already First … Last — do not auto-flip)
+ */
+function parsePersonName(raw, { firstName = '', lastName = '' } = {}) {
+    let first = trimStr(firstName);
+    let last = trimStr(lastName);
+    const original = trimStr(raw);
+
+    if (first || last) {
+        const display = [first, last].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+        return { first, last, display: display || original };
+    }
+
+    if (!original) return { first: '', last: '', display: '' };
+
+    // "Last, First Middle"
+    if (original.includes(',')) {
+        const [left, ...rest] = original.split(',');
+        last = trimStr(left).replace(PERSON_NAME_CREDENTIALS, ' ').replace(/\s+/g, ' ').trim();
+        first = rest.join(',').replace(PERSON_NAME_CREDENTIALS, ' ').replace(/\s+/g, ' ').trim();
+        const display = [first, last].filter(Boolean).join(' ').trim();
+        return { first, last, display: display || original };
+    }
+
+    const cleaned = original.replace(PERSON_NAME_CREDENTIALS, ' ').replace(/\s+/g, ' ').trim();
+    const parts = cleaned.split(/\s+/).filter(Boolean);
+    if (parts.length === 0) return { first: '', last: '', display: original };
+    if (parts.length === 1) return { first: parts[0], last: '', display: parts[0] };
+
+    // Assume already First … Last (Western clinical default). Keep order.
+    first = parts.slice(0, -1).join(' ');
+    last = parts[parts.length - 1];
+    return { first, last, display: `${first} ${last}`.trim() };
+}
+
+/** Prefer First Last for survey prefill / display. */
+function formatPersonNameFirstLast(raw, opts = {}) {
+    return parsePersonName(raw, opts).display;
+}
+
+/**
+ * Soft check: does email local-part look like it belongs to this First Last name?
+ * Catches Last-First / wrong-PI mix-ups without forced flips on bare two-token names.
+ */
+function personNameMatchesEmail(displayName, email) {
+    const local = String(email || '').split('@')[0].toLowerCase().replace(/[^a-z]/g, '');
+    if (!local || local.length < 3) return true;
+    const { first, last } = parsePersonName(displayName);
+    const f = first.toLowerCase().replace(/[^a-z]/g, '');
+    const l = last.toLowerCase().replace(/[^a-z]/g, '');
+    if (l && l.length >= 3 && local.includes(l)) return true;
+    if (f && f.length >= 3 && local.includes(f)) return true;
+    // initials style: madam → m + adam
+    if (f && l && local.length >= 3) {
+        const initialFirst = `${f[0]}${l}`;
+        const initialLast = `${l[0]}${f}`;
+        if (local === initialFirst || local === initialLast) return true;
+        if (local.startsWith(initialFirst) || local.startsWith(initialLast)) return true;
+        if (initialFirst.startsWith(local.slice(0, Math.min(local.length, initialFirst.length)))) {
+            if (local.includes(f) || local.includes(l)) return true;
+        }
+    }
+    return false;
+}
+
 module.exports = {
     looksLikeStreet,
     looksLikeCityOnly,
@@ -253,4 +342,7 @@ module.exports = {
     uniqueInvestigatorNames,
     siteAddressPrefill,
     siteNamePrefill,
+    parsePersonName,
+    formatPersonNameFirstLast,
+    personNameMatchesEmail,
 };

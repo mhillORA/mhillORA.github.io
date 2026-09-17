@@ -6847,18 +6847,36 @@
             return t === 'select' || t === 'radio' || t === 'multiselect';
         };
 
-        /** Coerce options from strings, {label,value} objects, or newline text into a clean string[]. */
-        const coerceOptionList = (raw) => {
+        /** Coerce options from strings, {label,value} objects, or newline text into a string[].
+         *  keepBlank: mid-edit builder rows may be empty — preserve slots until save finalize. */
+        const coerceOptionList = (raw, { keepBlank = false } = {}) => {
             if (raw == null || raw === '') return [];
             if (typeof raw === 'string') {
-                return raw.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+                const lines = raw.split(/\r?\n/).map((s) => s.trim());
+                return keepBlank ? lines : lines.filter(Boolean);
             }
             if (!Array.isArray(raw)) return [];
-            return raw.map((o) => {
+            const mapped = raw.map((o) => {
                 if (typeof o === 'string' || typeof o === 'number') return String(o).trim();
                 if (o && typeof o === 'object') return String(o.label ?? o.value ?? '').trim();
                 return '';
-            }).filter(Boolean);
+            });
+            return keepBlank ? mapped : mapped.filter(Boolean);
+        };
+
+        /** Save/public path: strip blanks + collapse accidental duplicate empties. */
+        const finalizeChoiceOptions = (raw) => coerceOptionList(raw, { keepBlank: false });
+
+        /** Unique placeholder when adding a choice (empty strings are stripped by render otherwise). */
+        const nextNewChoiceLabel = (existing) => {
+            const opts = coerceOptionList(existing, { keepBlank: true }).map((o) => String(o).trim().toLowerCase());
+            let n = 1;
+            let label = 'New choice';
+            while (opts.includes(label.toLowerCase())) {
+                n += 1;
+                label = `New choice ${n}`;
+            }
+            return label;
         };
 
         const optionsFromScoring = (scoringOptions) => coerceOptionList(
@@ -6866,15 +6884,45 @@
                 .map((o) => (o && typeof o === 'object' ? (o.value ?? o.label) : o))
         );
 
-        /** Resolve display/storage options for builder — never invent empties that wipe radio/multiselect. */
-        const resolveBuilderOptions = (q, libItem = null) => {
+        /** Resolve display/storage options for builder — never invent empties that wipe radio/multiselect.
+         *  keepBlank: true while editing so Add choice / cleared rows survive sync→render. */
+        const resolveBuilderOptions = (q, libItem = null, { keepBlank = false } = {}) => {
             const type = normalizeSurveyQuestionType(q?.type);
             if (!isChoiceQuestionType(type)) return [];
-            let opts = coerceOptionList(q?.options);
+            let opts = coerceOptionList(q?.options, { keepBlank });
             if (!opts.length) opts = optionsFromScoring(q?.scoringOptions);
             if (!opts.length && libItem) opts = coerceOptionList(libItem.options);
             if (!opts.length && (type === 'radio' || type === 'select')) opts = ['Yes', 'No'];
+            // Mid-edit: if we have at least one real choice, keep blank slots; else don't invent blanks
+            if (keepBlank && opts.some(Boolean) === false && opts.length === 0 && (type === 'radio' || type === 'select')) {
+                opts = ['Yes', 'No'];
+            }
             return opts;
+        };
+
+        /** Align scoringOptions rows to current choice list by index (preserve pts/pf when renaming). */
+        const alignScoringOptionsToChoices = (options, prevScoring, { scoreOn = false } = {}) => {
+            const opts = coerceOptionList(options, { keepBlank: true });
+            const prev = Array.isArray(prevScoring) ? prevScoring : [];
+            if (!scoreOn) return [];
+            return opts.map((val, oi) => {
+                const trimmed = String(val || '').trim();
+                const byValue = trimmed
+                    ? prev.find((o) => String(o?.value || '').trim() === trimmed)
+                    : null;
+                const byIndex = prev[oi] && typeof prev[oi] === 'object' ? prev[oi] : null;
+                const match = byValue || byIndex;
+                const pts = match && typeof match.points === 'number' ? match.points : 0;
+                const base = { value: trimmed, points: pts };
+                if (!trimmed) return null;
+                if (match && (match.notInterested === true || String(match.disposition || '').toLowerCase() === 'not_interested')) {
+                    return { ...base, knockout: true, notInterested: true, disposition: 'not_interested' };
+                }
+                if (match && (match.knockout || match.fail)) {
+                    return { ...base, knockout: true };
+                }
+                return base;
+            }).filter(Boolean);
         };
 
         const normalizeLibraryLabelKey = (label) => String(label || '').trim().toLowerCase().replace(/\s+/g, ' ');
@@ -7542,7 +7590,7 @@
                     const endIfOn = !!endIf;
                     const qType = normalizeSurveyQuestionType(q.type);
                     const isSelect = isChoiceQuestionType(qType);
-                    const opts = isSelect ? resolveBuilderOptions(q) : [];
+                    const opts = isSelect ? resolveBuilderOptions(q, null, { keepBlank: true }) : [];
                     // Keep in-memory options aligned so reorder/sync never starts from []
                     if (isSelect) q.options = opts;
                     const scored = (q.scoringWeight || 0) > 0 || q.knockout || (q.scoringOptions || []).some(o => o && (o.knockout || o.fail));
@@ -8013,22 +8061,25 @@
                 const choiceInputs = list
                     ? [...list.querySelectorAll('input[data-choice-input="1"], input[name^="q_choice_"]')]
                     : [];
-                const fromDom = choiceInputs.map((inp) => String(inp.value || '').trim()).filter(Boolean);
+                // Mid-edit: keep blank slots so Add/Remove/reorder don't collapse rows the user is clearing
+                const fromDomKeep = choiceInputs.map((inp) => String(inp.value || '').trim());
+                const fromDom = fromDomKeep.filter(Boolean);
                 const hiddenRaw = (card.querySelector(`input[name="q_options_${idx}"]`)?.value
                     || card.querySelector(`[data-options-backup="${idx}"]`)?.value
                     || '').trim();
                 const fromHidden = coerceOptionList(hiddenRaw);
                 const fromScore = optionsFromScoring(prevQ?.scoringOptions);
-                const prev = coerceOptionList(prevQ?.options);
+                const prev = coerceOptionList(prevQ?.options, { keepBlank: true });
                 if (choiceInputs.length > 0) {
-                    // DOM rows present: prefer typed values, but don't wipe to [] if inputs are briefly empty during edit
-                    if (fromDom.length) return fromDom;
+                    // Prefer live DOM (incl. blanks). If every input is empty, fall back rather than wipe.
+                    if (fromDomKeep.some(Boolean)) return fromDomKeep;
                     if (fromHidden.length) return fromHidden;
-                    return prev;
+                    if (prev.some(Boolean)) return prev;
+                    return fromDomKeep.length ? fromDomKeep : prev;
                 }
                 return fromDom.length ? fromDom
                     : (fromHidden.length ? fromHidden
-                        : (prev.length ? prev
+                        : (prev.filter(Boolean).length ? prev.filter(Boolean)
                             : fromScore));
             };
 
@@ -8040,8 +8091,9 @@
                     const card = root.querySelector(`[data-q-card="${idx}"]`);
                     if (!card) return;
                     const prevType = q.type;
-                    const prevOptions = coerceOptionList(q.options);
+                    const prevOptions = coerceOptionList(q.options, { keepBlank: true });
                     const prevLogic = q.logic && typeof q.logic === 'object' ? q.logic : null;
+                    const prevScoring = Array.isArray(q.scoringOptions) ? q.scoringOptions : [];
 
                     q.label = (card.querySelector(`input[name="q_label_${idx}"]`)?.value || '').trim();
                     q.help = meaningfulQuestionHelp(card.querySelector(`input[name="q_help_${idx}"]`)?.value || '');
@@ -8070,11 +8122,11 @@
                     if (isChoiceQuestionType(q.type)) {
                         let opts = readChoiceOptionsFromCard(card, idx, { ...q, options: prevOptions });
                         // Absolute guard: never drop a prior choice list to empty on reorder/sync
-                        if (!opts.length && prevOptions.length) opts = prevOptions;
-                        q.options = resolveBuilderOptions({ ...q, options: opts });
+                        if (!opts.some(Boolean) && prevOptions.some(Boolean)) opts = prevOptions;
+                        q.options = resolveBuilderOptions({ ...q, options: opts }, null, { keepBlank: true });
                         const grid = card.querySelector(`[data-score-option-grid="${idx}"]`);
                         if (grid && scoreOn && (q.type === 'select' || q.type === 'radio' || q.type === 'multiselect')) {
-                            q.scoringOptions = [...grid.querySelectorAll('[data-score-opt-row]')].map((row) => {
+                            const fromGrid = [...grid.querySelectorAll('[data-score-opt-row]')].map((row) => {
                                 const oi = Number(row.getAttribute('data-score-opt-row'));
                                 const ptsInput = row.querySelector(`input[name="q_opt_pts_${idx}_${oi}"]`) || row.querySelector('input[type="number"]');
                                 const checkedPf = row.querySelector(`input[name="q_opt_pf_${idx}_${oi}"]:checked`);
@@ -8093,6 +8145,12 @@
                                 }
                                 return base;
                             }).filter(o => o.value);
+                            // Merge grid rows with any newly-added choices not yet in the scoring grid
+                            q.scoringOptions = alignScoringOptionsToChoices(q.options, fromGrid.length ? fromGrid : prevScoring, { scoreOn: true });
+                            q.knockout = q.scoringOptions.some(o => o.knockout || o.notInterested) || q.knockoutFailValues.length > 0 || q.knockoutOnBlank;
+                        } else if (scoreOn && (q.type === 'select' || q.type === 'radio' || q.type === 'multiselect')) {
+                            // Scoring on but grid missing (e.g. mid-type change) — keep aligned prior scoring
+                            q.scoringOptions = alignScoringOptionsToChoices(q.options, prevScoring, { scoreOn: true });
                             q.knockout = q.scoringOptions.some(o => o.knockout || o.notInterested) || q.knockoutFailValues.length > 0 || q.knockoutOnBlank;
                         } else if (!scoreOn) {
                             q.scoringOptions = [];
@@ -8249,17 +8307,34 @@
                     if (e.target.closest('.q-add-choice')) {
                         const qs = syncBuilderFromDom();
                         if (!qs[idx]) return;
-                        // Use a real placeholder — empty strings are stripped by coerceOptionList/render
-                        const opts = coerceOptionList(qs[idx].options);
-                        let n = 1;
-                        let label = 'New choice';
-                        while (opts.some((o) => String(o).trim().toLowerCase() === label.toLowerCase())) {
-                            n += 1;
-                            label = `New choice ${n}`;
+                        if (!isChoiceQuestionType(qs[idx].type)) {
+                            qs[idx].type = 'select';
                         }
+                        const opts = coerceOptionList(qs[idx].options, { keepBlank: true });
+                        const label = nextNewChoiceLabel(opts);
                         qs[idx].options = [...opts, label];
+                        const scoreOn = (qs[idx].scoringWeight || 0) > 0
+                            || (Array.isArray(qs[idx].scoringOptions) && qs[idx].scoringOptions.length > 0)
+                            || qs[idx].knockout;
+                        if (scoreOn) {
+                            qs[idx].scoringOptions = alignScoringOptionsToChoices(
+                                qs[idx].options,
+                                qs[idx].scoringOptions,
+                                { scoreOn: true }
+                            );
+                        }
                         window.__siteSurveyBuilderQuestions = qs;
                         renderBuilder();
+                        // Focus the new choice input so the user can rename immediately
+                        requestAnimationFrame(() => {
+                            const card = builderRoot.querySelector(`[data-q-card="${idx}"]`);
+                            const inputs = card?.querySelectorAll('[data-choice-input="1"]');
+                            const last = inputs && inputs[inputs.length - 1];
+                            if (last) {
+                                last.focus();
+                                last.select();
+                            }
+                        });
                         return;
                     }
                     if (e.target.closest('.q-add-other-followup')) {
@@ -8338,9 +8413,19 @@
                         const oi = parseInt(e.target.closest('.q-remove-choice').getAttribute('data-choice-oi'), 10);
                         const qs = syncBuilderFromDom();
                         if (!qs[idx] || Number.isNaN(oi)) return;
-                        qs[idx].options = (qs[idx].options || []).filter((_, i) => i !== oi);
+                        const before = coerceOptionList(qs[idx].options, { keepBlank: true });
+                        const prevScore = Array.isArray(qs[idx].scoringOptions) ? qs[idx].scoringOptions : [];
+                        qs[idx].options = before.filter((_, i) => i !== oi);
                         if (isChoiceQuestionType(qs[idx].type)) {
-                            qs[idx].options = resolveBuilderOptions(qs[idx]);
+                            qs[idx].options = resolveBuilderOptions(qs[idx], null, { keepBlank: true });
+                        }
+                        if (prevScore.length) {
+                            const keptScore = prevScore.filter((_, i) => i !== oi);
+                            qs[idx].scoringOptions = alignScoringOptionsToChoices(
+                                qs[idx].options,
+                                keptScore,
+                                { scoreOn: true }
+                            );
                         }
                         window.__siteSurveyBuilderQuestions = qs;
                         renderBuilder();
@@ -8370,7 +8455,7 @@
                         const qs = syncBuilderFromDom();
                         qs[idx].type = normalizeSurveyQuestionType(typeSelect.value);
                         if (isChoiceQuestionType(qs[idx].type)) {
-                            qs[idx].options = resolveBuilderOptions(qs[idx]);
+                            qs[idx].options = resolveBuilderOptions(qs[idx], null, { keepBlank: true });
                         } else {
                             qs[idx].options = [];
                         }
@@ -14785,15 +14870,16 @@
                         const scoreOn = !!card?.querySelector(`.q-score-enable[data-score-for="${idx}"]`)?.checked;
                         let options = [];
                         if (isChoiceQuestionType(type)) {
-                            options = coerceOptionList(q.options);
+                            options = finalizeChoiceOptions(q.options);
                             if (!options.length && card) {
-                                options = [...card.querySelectorAll(`[data-choice-list="${idx}"] input[data-choice-input="1"], [data-choice-list="${idx}"] input[name^="q_choice_"]`)]
-                                    .map(inp => inp.value.trim())
-                                    .filter(Boolean);
+                                options = finalizeChoiceOptions(
+                                    [...card.querySelectorAll(`[data-choice-list="${idx}"] input[data-choice-input="1"], [data-choice-list="${idx}"] input[name^="q_choice_"]`)]
+                                        .map(inp => inp.value)
+                                );
                             }
                             if (!options.length) {
                                 const hidden = (card?.querySelector(`input[name="q_options_${idx}"]`)?.value || '').trim();
-                                options = coerceOptionList(hidden);
+                                options = finalizeChoiceOptions(hidden);
                             }
                             if (!options.length) options = optionsFromScoring(q.scoringOptions);
                             if ((type === 'radio' || type === 'select') && options.length < 2) {
@@ -14931,20 +15017,35 @@
                             : 0;
                         let scoringOptions = [];
                         const optGrid = questionsRoot.querySelector(`[data-score-option-grid="${idx}"]`);
-                        if (scoreOn && optGrid && (type === 'select' || type === 'radio')) {
-                            scoringOptions = [...optGrid.querySelectorAll('[data-score-opt-row]')].map((row, oi) => {
-                                const ptsInput = row.querySelector(`input[name="q_opt_pts_${idx}_${oi}"]`) || row.querySelector('input[type="number"]');
-                                const failRadio = row.querySelector(`input[name="q_opt_pf_${idx}_${oi}"][value="fail"]`)
-                                    || row.querySelector('input[data-opt-ko="1"]');
-                                const val = (options[oi] || ptsInput?.getAttribute('data-opt-value') || '').trim();
-                                const pts = parseFloat(ptsInput?.value || '0');
-                                const knockoutFlag = !!failRadio?.checked;
-                                return {
-                                    value: val,
-                                    points: Number.isNaN(pts) ? 0 : pts,
-                                    ...(knockoutFlag ? { knockout: true } : {}),
-                                };
-                            }).filter(o => o.value);
+                        if (scoreOn && isChoiceQuestionType(type)) {
+                            if (optGrid) {
+                                scoringOptions = [...optGrid.querySelectorAll('[data-score-opt-row]')].map((row, oi) => {
+                                    const ptsInput = row.querySelector(`input[name="q_opt_pts_${idx}_${oi}"]`) || row.querySelector('input[type="number"]');
+                                    const checkedPf = row.querySelector(`input[name="q_opt_pf_${idx}_${oi}"]:checked`);
+                                    const pf = String(checkedPf?.value || 'pass').trim().toLowerCase();
+                                    const failRadio = row.querySelector(`input[name="q_opt_pf_${idx}_${oi}"][value="fail"]`)
+                                        || row.querySelector('input[data-opt-ko="1"]');
+                                    const val = (options[oi] || ptsInput?.getAttribute('data-opt-value') || '').trim();
+                                    const pts = parseFloat(ptsInput?.value || '0');
+                                    const base = {
+                                        value: val,
+                                        points: Number.isNaN(pts) ? 0 : pts,
+                                    };
+                                    if (!val) return null;
+                                    if (pf === 'not_interested') {
+                                        return { ...base, knockout: true, notInterested: true, disposition: 'not_interested' };
+                                    }
+                                    if (pf === 'fail' || !!failRadio?.checked) {
+                                        return { ...base, knockout: true };
+                                    }
+                                    return base;
+                                }).filter(Boolean);
+                            }
+                            // Prefer post-sync memory when grid was incomplete (e.g. newly added choice)
+                            if ((!scoringOptions.length || scoringOptions.length < options.length)
+                                && Array.isArray(q.scoringOptions) && q.scoringOptions.length) {
+                                scoringOptions = alignScoringOptionsToChoices(options, q.scoringOptions, { scoreOn: true });
+                            }
                         }
                         const category = (questionsRoot.querySelector(`[name="q_category_${idx}"]`)?.value || q.category || 'General').trim() || 'General';
                         const section = (questionsRoot.querySelector(`[name="q_section_${idx}"]`)?.value || q.section || 'Page 1').trim() || 'Page 1';
@@ -14953,7 +15054,7 @@
                         const knockoutFailValues = scoreOn
                             ? String(failRaw).split('\n').map((s) => s.trim()).filter(Boolean)
                             : [];
-                        const knockout = scoringOptions.some(o => o.knockout)
+                        const knockout = scoringOptions.some(o => o.knockout || o.notInterested)
                             || knockoutFailValues.length > 0
                             || knockoutOnBlank;
 
@@ -14961,7 +15062,7 @@
                         if ((type === 'select' || type === 'radio' || type === 'multiselect') && options.length < 2) {
                             throw new Error(`Question ${idx + 1}: add at least two answer choices`);
                         }
-                        if (scoreOn && (type === 'select' || type === 'radio') && scoringOptions.length === 0 && options.length >= 2) {
+                        if (scoreOn && isChoiceQuestionType(type) && scoringOptions.length === 0 && options.length >= 2) {
                             const weight = scoringWeight || 10;
                             scoringOptions = options.map((opt, oi) => ({
                                 value: opt,
