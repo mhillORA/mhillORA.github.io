@@ -368,6 +368,72 @@ function inviteEmailCopy({
     };
 }
 
+/** Friendly nudge for invites that are not started or still in progress.
+ * Always reiterates due date, survey link, and password (when known).
+ */
+function reminderInviteCopy(opts = {}) {
+    const kind = String(opts.reminderKind || opts.statusKind || '').toLowerCase();
+    const inProgress = kind === 'in_progress' || kind === 'draft' || kind === 'opened';
+    const rolePart = String(opts.roleSubjectLabel || opts.roleLabel || 'Site').trim() || 'Site';
+    const code = String(opts.studyCode || '').trim();
+    const studyLine =
+        String(opts.studyTitle || '').trim() ||
+        (String(opts.protocolName || '').trim()
+            ? String(opts.protocolName).trim()
+            : 'this clinical trial');
+    const dueFallback =
+        String(opts.dueDate || '').trim() || formatInviteCloseDate(opts.expiresAt) || '';
+    const pwd = String(opts.password || '').trim();
+    const passwordRequired = Boolean(opts.passwordRequired) || Boolean(pwd);
+
+    const subject =
+        String(opts.subjectOverride || '').trim() ||
+        (code
+            ? `Reminder || ${code} || Feasibility Survey || ${rolePart}`
+            : `Reminder || Feasibility Survey || ${rolePart}`);
+
+    const opener = inProgress
+        ? `This is a friendly reminder to finish the feasibility survey for ${studyLine}. It looks like you already started — thank you. Please complete and submit when you can.`
+        : `This is a friendly reminder to complete the feasibility survey for ${studyLine}. We have not received a submission yet and would appreciate your response.`;
+
+    const lines = [
+        'Hello,',
+        '',
+        opener,
+        '',
+        'Here are your survey details again:',
+        '',
+        dueFallback
+            ? `Due date: ${dueFallback}`
+            : 'Due date: please complete as soon as possible.',
+        '',
+        'Survey link:',
+        '{{inviteUrl}}',
+        '',
+    ];
+    if (pwd) {
+        lines.push(`Password: ${pwd}`, '');
+    } else if (passwordRequired) {
+        lines.push(
+            'Password: use the same password from your original invitation email.',
+            ''
+        );
+    }
+    lines.push(
+        'If you have already submitted, thank you — you can ignore this message.',
+        '',
+        'Thank you,',
+        'Ora Site Profiles'
+    );
+
+    return inviteEmailCopy({
+        ...opts,
+        password: pwd,
+        subjectOverride: subject,
+        bodyOverride: lines.join('\n'),
+    });
+}
+
 function applyBodyTemplate(template, vars) {
     let text = String(template || '');
     for (const [key, value] of Object.entries(vars || {})) {
@@ -489,6 +555,7 @@ function emailProviderStatus() {
 module.exports = {
     deliverSurveyEmail,
     inviteEmailCopy,
+    reminderInviteCopy,
     defaultInviteBodyTemplate,
     defaultInviteSubjectTemplate,
     defaultRebuildStudyTitle,

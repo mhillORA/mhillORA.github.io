@@ -42,6 +42,7 @@ const {
 const {
     deliverSurveyEmail,
     inviteEmailCopy,
+    reminderInviteCopy,
     formatInviteCloseDate,
     opsNotifyCopy,
     emailProviderStatus,
@@ -740,6 +741,22 @@ function attachInviteToken(assignment, { expiresInDays, baseUrl } = {}) {
     assignment.inviteCreatedAt = new Date().toISOString();
     const inviteUrl = baseUrl ? buildInviteUrl(baseUrl, raw) : null;
     return { raw, inviteUrl, prefix };
+}
+
+/** Mirror of Status board classification for reminder targeting. */
+function classifyInviteStatus(assignment) {
+    if (!assignment) return 'not_started';
+    if (assignment.revokedAt) return 'stale';
+    const status = String(assignment.status || '').toLowerCase();
+    if (status === 'submitted') return 'completed';
+    const expMs = assignment.expiresAt ? Date.parse(assignment.expiresAt) : NaN;
+    if (Number.isFinite(expMs) && expMs < Date.now()) return 'stale';
+    const hasDraft = Boolean(assignment.draftSavedAt)
+        || (Array.isArray(assignment.draftAnswers) && assignment.draftAnswers.length > 0)
+        || status === 'draft'
+        || status === 'in_progress';
+    if (hasDraft || assignment.openedAt) return 'in_progress';
+    return 'not_started';
 }
 
 function registerSurveySecureRoutes(app, deps) {
@@ -1529,6 +1546,119 @@ function registerSurveySecureRoutes(app, deps) {
     });
 
     // ---------- Ops: rotate / resend token for one assignment ----------
+    const resendOneAssignment = async ({
+        assignment,
+        baseUrl,
+        body = {},
+        getContainer,
+    }) => {
+        const now = new Date().toISOString();
+        const reminder = body.reminder === true || body.mode === 'reminder';
+        const statusKind = classifyInviteStatus(assignment);
+        if (reminder && statusKind === 'completed') {
+            return {
+                skipped: true,
+                reason: 'already_submitted',
+                assignment: redactAssignment(assignment),
+            };
+        }
+
+        assignment.revokedAt = undefined;
+        assignment.updatedAt = now;
+        assignment.lastSentAt = now;
+        assignment.sendCount = (assignment.sendCount || 0) + 1;
+        if (reminder) {
+            assignment.lastRemindedAt = now;
+            assignment.remindCount = (assignment.remindCount || 0) + 1;
+        }
+        if (body.expiresInDays) {
+            assignment.expiresAt = defaultExpiresAt(clampExpiresInDays(body.expiresInDays));
+        } else if (!assignment.expiresAt || isExpired(assignment.expiresAt)) {
+            assignment.expiresAt = defaultExpiresAt(DEFAULT_TTL_DAYS);
+        }
+
+        const { inviteUrl } = attachInviteToken(assignment, {
+            expiresInDays: clampExpiresInDays(body.expiresInDays || DEFAULT_TTL_DAYS),
+            baseUrl,
+        });
+        await getContainer(ASSIGNMENTS).items.upsert(assignment);
+
+        const siteName = await resolveSiteName(getContainer, assignment.siteId);
+        const email = assignment.targetEmail ||
+            (await resolveRecipientEmail(getContainer, assignment.siteId, assignment.targetRole));
+
+        let emailResult = { ok: false, mode: 'manual' };
+        if (body.sendEmail !== false && email) {
+            assignment.targetEmail = email;
+            const resendCc = parseCcList(body?.cc || assignment.emailCc || '');
+            const resendSubject = String(
+                body?.subject || (reminder ? '' : assignment.emailSubject) || ''
+            )
+                .trim()
+                .slice(0, 200);
+            let resendFiles = [];
+            let attachmentNames = [];
+            try {
+                const docs = await loadAttachmentDocs(
+                    getContainer,
+                    assignment.attachmentIds || []
+                );
+                resendFiles = emailAttachmentPayload(docs);
+                attachmentNames = docs.map((d) => d.fileName).filter(Boolean);
+            } catch (_) {}
+            const copyOpts = {
+                siteName,
+                roleLabel: roleLabel(assignment.targetRole),
+                roleSubjectLabel: roleSubjectLabel(assignment.targetRole),
+                inviteUrl,
+                expiresAt: assignment.expiresAt,
+                attachmentNames,
+                studyCode: assignment.studyCode,
+                studyTitle: assignment.studyTitle,
+                password: String(body?.password || body?.emailPassword || '').trim(),
+                passwordRequired: Boolean(assignment.passwordHash),
+                dueDate: formatInviteCloseDate(assignment.expiresAt),
+                subjectOverride: resendSubject,
+                bodyOverride: reminder
+                    ? ''
+                    : String(body?.emailBody || body?.body || assignment.emailBodyTemplate || '').trim(),
+                reminderKind: statusKind,
+            };
+            const copy = reminder
+                ? reminderInviteCopy(copyOpts)
+                : inviteEmailCopy(copyOpts);
+            emailResult = await deliverSurveyEmail({
+                to: email,
+                cc: resendCc,
+                subject: copy.subject,
+                text: copy.text,
+                html: copy.html,
+                attachments: resendFiles,
+                meta: {
+                    assignmentId: assignment.id,
+                    resend: !reminder,
+                    reminder: !!reminder,
+                    statusKind,
+                },
+            });
+            await getContainer(ASSIGNMENTS).items.upsert({
+                ...assignment,
+                targetEmail: email,
+            });
+        }
+
+        return {
+            skipped: false,
+            ok: true,
+            reminder: !!reminder,
+            statusKind,
+            assignment: redactAssignment(assignment),
+            inviteUrl,
+            targetEmail: email || null,
+            email: emailResult,
+        };
+    };
+
     app.http('siteSurveyResend', {
         methods: ['POST', 'OPTIONS'],
         authLevel: 'anonymous',
@@ -1564,90 +1694,131 @@ function registerSurveySecureRoutes(app, deps) {
                     };
                 }
 
-                const now = new Date().toISOString();
-                assignment.revokedAt = undefined;
-                assignment.updatedAt = now;
-                assignment.lastSentAt = now;
-                assignment.sendCount = (assignment.sendCount || 0) + 1;
-                if (body.expiresInDays) {
-                    assignment.expiresAt = defaultExpiresAt(clampExpiresInDays(body.expiresInDays));
-                } else if (!assignment.expiresAt || isExpired(assignment.expiresAt)) {
-                    assignment.expiresAt = defaultExpiresAt(DEFAULT_TTL_DAYS);
-                }
-
-                const { inviteUrl } = attachInviteToken(assignment, {
-                    expiresInDays: clampExpiresInDays(body.expiresInDays || DEFAULT_TTL_DAYS),
+                const result = await resendOneAssignment({
+                    assignment,
                     baseUrl,
+                    body,
+                    getContainer,
                 });
-                // attachInviteToken always sets expiresAt — preserve if we set above
-                await getContainer(ASSIGNMENTS).items.upsert(assignment);
-
-                const siteName = await resolveSiteName(getContainer, assignment.siteId);
-                const email = assignment.targetEmail ||
-                    (await resolveRecipientEmail(getContainer, assignment.siteId, assignment.targetRole));
-
-                let emailResult = { ok: false, mode: 'manual' };
-                if (body.sendEmail !== false && email) {
-                    assignment.targetEmail = email;
-                    const resendCc = parseCcList(body?.cc || assignment.emailCc || '');
-                    const resendSubject = String(
-                        body?.subject || assignment.emailSubject || ''
-                    )
-                        .trim()
-                        .slice(0, 200);
-                    let resendFiles = [];
-                    let attachmentNames = [];
-                    try {
-                        const docs = await loadAttachmentDocs(
-                            getContainer,
-                            assignment.attachmentIds || []
-                        );
-                        resendFiles = emailAttachmentPayload(docs);
-                        attachmentNames = docs.map((d) => d.fileName).filter(Boolean);
-                    } catch (_) {}
-                    const copy = inviteEmailCopy({
-                        siteName,
-                        roleLabel: roleLabel(assignment.targetRole),
-                        roleSubjectLabel: roleSubjectLabel(assignment.targetRole),
-                        inviteUrl,
-                        expiresAt: assignment.expiresAt,
-                        attachmentNames,
-                        studyCode: assignment.studyCode,
-                        studyTitle: assignment.studyTitle,
-                        password: String(body?.password || body?.emailPassword || '').trim(),
-                        dueDate: formatInviteCloseDate(assignment.expiresAt),
-                        subjectOverride: resendSubject,
-                        bodyOverride: String(
-                            body?.emailBody || body?.body || assignment.emailBodyTemplate || ''
-                        ).trim(),
-                    });
-                    emailResult = await deliverSurveyEmail({
-                        to: email,
-                        cc: resendCc,
-                        subject: copy.subject,
-                        text: copy.text,
-                        html: copy.html,
-                        attachments: resendFiles,
-                        meta: { assignmentId: assignment.id, resend: true },
-                    });
-                    await getContainer(ASSIGNMENTS).items.upsert({
-                        ...assignment,
-                        targetEmail: email,
-                    });
+                if (result.skipped) {
+                    return {
+                        status: 409,
+                        jsonBody: {
+                            error: 'Survey already submitted — reminder not sent.',
+                            ...result,
+                        },
+                        headers: corsHeaders(),
+                    };
                 }
-
                 return {
-                    jsonBody: {
-                        ok: true,
-                        assignment: redactAssignment(assignment),
-                        inviteUrl,
-                        targetEmail: email || null,
-                        email: emailResult,
-                    },
+                    jsonBody: result,
                     headers: corsHeaders(),
                 };
             } catch (error) {
                 return handleError(context, error, 'site-survey-resend');
+            }
+        },
+    });
+
+    // ---------- Ops: bulk reminders for incomplete invites on one survey ----------
+    app.http('siteSurveyRemind', {
+        methods: ['POST', 'OPTIONS'],
+        authLevel: 'anonymous',
+        route: 'site-survey-remind',
+        handler: async (request, context) => {
+            if (request.method === 'OPTIONS') {
+                return { status: 204, headers: corsHeaders() };
+            }
+            try {
+                const body = await request.json().catch(() => ({}));
+                const baseUrl = String(body?.baseUrl || '').replace(/\/$/, '');
+                const surveyId = String(body?.surveyId || '').trim();
+                if (!baseUrl || !surveyId) {
+                    return {
+                        status: 400,
+                        jsonBody: { error: 'surveyId and baseUrl are required' },
+                        headers: corsHeaders(),
+                    };
+                }
+                const kindsRaw = Array.isArray(body?.kinds) && body.kinds.length
+                    ? body.kinds.map((k) => String(k || '').toLowerCase())
+                    : ['not_started', 'in_progress'];
+                const kinds = new Set(kindsRaw.filter((k) =>
+                    ['not_started', 'in_progress', 'stale'].includes(k)
+                ));
+                if (!kinds.size) {
+                    return {
+                        status: 400,
+                        jsonBody: { error: 'kinds must include not_started, in_progress, and/or stale' },
+                        headers: corsHeaders(),
+                    };
+                }
+
+                const idFilter = Array.isArray(body?.assignmentIds)
+                    ? new Set(body.assignmentIds.map((x) => String(x || '')).filter(Boolean))
+                    : null;
+
+                const { resources } = await getContainer(ASSIGNMENTS).items
+                    .query({
+                        query: 'SELECT * FROM c WHERE c.surveyId = @sid',
+                        parameters: [{ name: '@sid', value: surveyId }],
+                    })
+                    .fetchAll();
+
+                const targets = (resources || []).filter((a) => {
+                    if (!a) return false;
+                    if (idFilter && !idFilter.has(String(a.id))) return false;
+                    return kinds.has(classifyInviteStatus(a));
+                });
+
+                const results = [];
+                for (const assignment of targets) {
+                    try {
+                        const result = await resendOneAssignment({
+                            assignment: { ...assignment },
+                            baseUrl,
+                            body: {
+                                ...body,
+                                reminder: true,
+                                sendEmail: body.sendEmail !== false,
+                            },
+                            getContainer,
+                        });
+                        results.push({
+                            assignmentId: assignment.id,
+                            siteId: assignment.siteId,
+                            targetEmail: result.targetEmail,
+                            statusKind: result.statusKind,
+                            skipped: !!result.skipped,
+                            email: result.email,
+                            inviteUrl: result.inviteUrl,
+                        });
+                    } catch (err) {
+                        results.push({
+                            assignmentId: assignment.id,
+                            siteId: assignment.siteId,
+                            error: err?.message || String(err),
+                        });
+                    }
+                }
+
+                const sent = results.filter((r) => r.email?.ok).length;
+                const failed = results.filter((r) => r.error || (r.email && r.email.ok === false)).length;
+
+                return {
+                    jsonBody: {
+                        ok: true,
+                        surveyId,
+                        kinds: [...kinds],
+                        targeted: targets.length,
+                        sent,
+                        failed,
+                        results,
+                    },
+                    headers: corsHeaders(),
+                };
+            } catch (error) {
+                return handleError(context, error, 'site-survey-remind');
             }
         },
     });
