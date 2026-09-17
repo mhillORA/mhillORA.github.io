@@ -1408,7 +1408,8 @@
         let lastReportData = [];
         /** When set, Feasibility tab filters assignments/responses to this site id */
         let commsSiteFilterId = null;
-        let commsPanel = 'templates'; // templates | questions | links | responses | activity | privacy
+        let commsPanel = 'templates'; // templates | questions | links | status | responses | activity | privacy
+        let commsStatusFilter = 'all'; // all | completed | in_progress | not_started | stale
         const COMMS_LIST_CAP = 25;
 
         const SESSION_USER_KEY = 'artemis.session.user';
@@ -2098,9 +2099,9 @@
                       <div data-dash-role="ops" class="rounded-xl border border-[#1B2A4A]/15 dark:border-[#1B2A4A]/40 bg-gradient-to-r from-[#1B2A4A]/5 to-transparent dark:from-[#1B2A4A]/25 p-4 sm:p-5">
                           <div class="text-sm font-semibold text-[#1B2A4A] dark:text-indigo-200 mb-3">Needs attention</div>
                           <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                              <button type="button" data-nav-tab="feasibility" data-feasibility-panel="links" class="cursor-pointer text-left rounded-lg bg-white/80 dark:bg-gray-800/80 border border-gray-200 dark:border-gray-700 px-4 py-3 hover:border-[#1B2A4A]/40 transition">
+                              <button type="button" data-nav-tab="feasibility" data-feasibility-panel="status" class="cursor-pointer text-left rounded-lg bg-white/80 dark:bg-gray-800/80 border border-gray-200 dark:border-gray-700 px-4 py-3 hover:border-[#1B2A4A]/40 transition">
                                   <div class="text-2xl font-bold text-gray-900 dark:text-gray-100">${openSurveyLinks}</div>
-                                  <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">Open survey links</div>
+                                  <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">Surveys not finished</div>
                               </button>
                               <button type="button" data-nav-tab="feasibility" data-feasibility-panel="responses" class="cursor-pointer text-left rounded-lg bg-white/80 dark:bg-gray-800/80 border border-gray-200 dark:border-gray-700 px-4 py-3 hover:border-[#1B2A4A]/40 transition">
                                   <div class="text-2xl font-bold text-gray-900 dark:text-gray-100">${recentResponses}</div>
@@ -5803,6 +5804,7 @@
                     <div class="flex flex-wrap gap-1.5 p-1 rounded-lg bg-gray-100 dark:bg-gray-800/80 border border-gray-200 dark:border-gray-700">
                         ${tab('templates', 'Templates', allDefs.length)}
                         ${tab('questions', 'Questions', (allSiteSurveyQuestionLibrary || []).filter(q => q && q.status !== 'archived').length)}
+                        ${tab('status', 'Status', pendingLinks)}
                         ${tab('links', 'Links', assignments.length)}
                         ${tab('responses', 'Responses', responses.length)}
                         ${tab('activity', 'Activity', unread || notes.length)}
@@ -5848,7 +5850,7 @@
                             <div class="flex items-center gap-2" id="comms-panel-actions"></div>
                         </div>
                         <div class="p-2 sm:p-3">
-                            <div id="comms-search-wrap" class="mb-2 ${['templates','questions','links','responses'].includes(commsPanel) ? '' : 'hidden'}">
+                            <div id="comms-search-wrap" class="mb-2 ${['templates','questions','links','status','responses'].includes(commsPanel) ? '' : 'hidden'}">
                                 <input id="comms-list-search" type="search" placeholder="Filter list…" class="w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 px-3 py-1.5 text-sm" />
                             </div>
                             <div id="comms-panel-body" class="max-h-[min(58vh,560px)] overflow-y-auto space-y-1"></div>
@@ -5938,6 +5940,30 @@
         // Back-compat alias used nowhere critical after cleanup
         const surveyDefCardHtml = (d, opts) => surveyDefRowHtml(d, opts);
 
+        /** Classify a sent invite for the Status board. */
+        const classifySurveyInviteStatus = (a) => {
+            if (!a) return 'not_started';
+            if (a.revokedAt) return 'stale';
+            const status = String(a.status || '').toLowerCase();
+            if (status === 'submitted') return 'completed';
+            const expMs = a.expiresAt ? Date.parse(a.expiresAt) : NaN;
+            if (Number.isFinite(expMs) && expMs < Date.now()) return 'stale';
+            const hasDraft = Boolean(a.draftSavedAt)
+                || (Array.isArray(a.draftAnswers) && a.draftAnswers.length > 0)
+                || status === 'draft'
+                || status === 'in_progress';
+            if (hasDraft) return 'in_progress';
+            if (a.openedAt) return 'in_progress';
+            return 'not_started';
+        };
+
+        const surveyInviteStatusMeta = (kind) => ({
+            completed: { label: 'Completed', chip: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-200' },
+            in_progress: { label: 'In progress', chip: 'bg-amber-100 text-amber-900 dark:bg-amber-900/40 dark:text-amber-100' },
+            not_started: { label: 'Not started', chip: 'bg-slate-100 text-slate-700 dark:bg-slate-700 dark:text-slate-100' },
+            stale: { label: 'Expired / revoked', chip: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-200' },
+        }[kind] || { label: kind || 'Unknown', chip: 'bg-gray-100 text-gray-600' });
+
         const renderFeasibility = () => {
             const body = document.getElementById('comms-panel-body');
             const titleEl = document.getElementById('comms-panel-title');
@@ -5960,13 +5986,14 @@
 
             const notes = Array.isArray(window.__siteSurveyNotifications) ? window.__siteSurveyNotifications : [];
             const cap = COMMS_LIST_CAP;
-            const showSearch = ['templates', 'questions', 'links', 'responses'].includes(commsPanel);
+            const showSearch = ['templates', 'questions', 'links', 'status', 'responses'].includes(commsPanel);
             if (searchWrap) searchWrap.classList.toggle('hidden', !showSearch);
 
             const titles = {
                 templates: 'Templates',
                 questions: 'Question library',
                 links: 'Secure links',
+                status: 'Send status',
                 responses: 'Responses',
                 activity: 'Activity',
                 privacy: 'Privacy tools'
@@ -5978,6 +6005,10 @@
                         <button type="button" id="jump-survey-reporting-btn" class="text-xs font-medium text-indigo-600 dark:text-indigo-400 hover:underline">Question report →</button>
                         <button type="button" id="comms-sponsor-excel-btn" class="text-xs font-medium px-2 py-1 rounded bg-teal-700 text-white">Sponsor Excel</button>
                         <button type="button" id="comms-sponsor-pdf-btn" class="text-xs font-medium px-2 py-1 rounded bg-indigo-600 text-white">Sponsor PDF</button>`;
+                } else if (commsPanel === 'status') {
+                    actionsEl.innerHTML = `
+                        <button type="button" id="comms-status-copy-incomplete-btn" class="text-xs font-medium px-2 py-1 rounded border border-gray-300 dark:border-gray-600">Copy incomplete</button>
+                        <button type="button" id="comms-status-refresh-btn" class="text-xs font-medium px-2 py-1 rounded bg-indigo-600 text-white">Refresh</button>`;
                 } else if (commsPanel === 'activity') {
                     actionsEl.innerHTML = `<button type="button" id="mark-survey-notifications-read-btn" class="text-xs font-medium text-emerald-700 dark:text-emerald-300 hover:underline">Mark all read</button>`;
                 } else if (commsPanel === 'questions') {
@@ -6059,6 +6090,174 @@
                 const shown = rows.slice(0, cap);
                 body.innerHTML = rows.length === 0 ? empty('No links yet. Hit Send survey.') : shown.join('');
                 if (footerEl) footerEl.textContent = rows.length > cap ? `Showing ${cap} of ${rows.length}.` : `${rows.length} link${rows.length === 1 ? '' : 's'}`;
+            } else if (commsPanel === 'status') {
+                const enriched = assignments.map((a) => {
+                    const kind = classifySurveyInviteStatus(a);
+                    const siteName = allSites.find(s => s.id === a.siteId)?.name || a.siteId || '—';
+                    const surveyTitle = allDefs.find(d => d.id === a.surveyId)?.title || a.surveyId || '—';
+                    const lastAt = a.submittedAt || a.draftSavedAt || a.openedAt || a.sentAt || a.updatedAt || a.createdAt || '';
+                    return { a, kind, siteName, surveyTitle, lastAt };
+                });
+                const counts = {
+                    all: enriched.length,
+                    completed: enriched.filter(x => x.kind === 'completed').length,
+                    in_progress: enriched.filter(x => x.kind === 'in_progress').length,
+                    not_started: enriched.filter(x => x.kind === 'not_started').length,
+                    stale: enriched.filter(x => x.kind === 'stale').length,
+                };
+                const incomplete = counts.in_progress + counts.not_started + counts.stale;
+                const filter = ['all', 'completed', 'in_progress', 'not_started', 'stale'].includes(commsStatusFilter)
+                    ? commsStatusFilter
+                    : 'all';
+                const filtered = enriched
+                    .filter(x => filter === 'all' ? true : x.kind === filter)
+                    .slice()
+                    .sort((x, y) => {
+                        const rank = { not_started: 0, in_progress: 1, stale: 2, completed: 3 };
+                        const rd = (rank[x.kind] ?? 9) - (rank[y.kind] ?? 9);
+                        if (rd !== 0) return rd;
+                        return String(y.lastAt || '').localeCompare(String(x.lastAt || ''));
+                    });
+
+                const chipBtn = (id, label, count) => {
+                    const on = filter === id;
+                    return `<button type="button" class="comms-status-filter-btn px-2.5 py-1 rounded-md text-xs font-medium border ${on
+                        ? 'bg-indigo-600 text-white border-indigo-600'
+                        : 'bg-white dark:bg-gray-900 text-gray-700 dark:text-gray-200 border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-800'}" data-status-filter="${id}">${label} <span class="opacity-80">${count}</span></button>`;
+                };
+
+                const rowHtml = ({ a, kind, siteName, surveyTitle, lastAt }) => {
+                    const meta = surveyInviteStatusMeta(kind);
+                    const whenLabel = lastAt ? new Date(lastAt).toLocaleString() : '—';
+                    const role = formatSiteSurveyRoleLabel(a.targetRole);
+                    const search = `${siteName} ${surveyTitle} ${a.targetEmail || ''} ${role} ${meta.label}`.toLowerCase();
+                    const canResend = kind !== 'completed';
+                    return `
+                        <div class="comms-row flex items-center gap-2 px-2.5 py-2 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700/40 border border-transparent hover:border-gray-200 dark:hover:border-gray-600" data-search="${escapeHtml(search)}">
+                            <div class="min-w-0 flex-1">
+                                <div class="flex items-center gap-2 min-w-0 flex-wrap">
+                                    <div class="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">${escapeHtml(siteName)}</div>
+                                    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold ${meta.chip}">${escapeHtml(meta.label)}</span>
+                                </div>
+                                <div class="text-xs text-gray-500 dark:text-gray-400 truncate">
+                                    ${escapeHtml(role)}${a.targetEmail ? ` · ${escapeHtml(a.targetEmail)}` : ''} · ${escapeHtml(surveyTitle)} · ${escapeHtml(whenLabel)}
+                                </div>
+                            </div>
+                            ${canResend
+                                ? `<button type="button" class="resend-site-survey-btn px-2 py-1 rounded text-xs bg-gray-100 dark:bg-gray-700 shrink-0" data-assignment-id="${escapeHtml(a.id)}">Resend</button>`
+                                : ''}
+                        </div>`;
+                };
+
+                // Resolve response for completed rows (prefer assignmentId match)
+                const responseByAsg = new Map();
+                responses.forEach((r) => {
+                    if (r && r.assignmentId) responseByAsg.set(String(r.assignmentId), r);
+                });
+
+                const rowsHtml = filtered.map((item) => {
+                    if (item.kind === 'completed') {
+                        const resp = responseByAsg.get(String(item.a.id));
+                        const meta = surveyInviteStatusMeta(item.kind);
+                        const whenLabel = item.lastAt ? new Date(item.lastAt).toLocaleString() : '—';
+                        const role = formatSiteSurveyRoleLabel(item.a.targetRole);
+                        const search = `${item.siteName} ${item.surveyTitle} ${item.a.targetEmail || ''} ${role} ${meta.label}`.toLowerCase();
+                        return `
+                            <div class="comms-row flex items-center gap-2 px-2.5 py-2 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700/40" data-search="${escapeHtml(search)}">
+                                <div class="min-w-0 flex-1">
+                                    <div class="flex items-center gap-2 min-w-0 flex-wrap">
+                                        <div class="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">${escapeHtml(item.siteName)}</div>
+                                        <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold ${meta.chip}">${escapeHtml(meta.label)}</span>
+                                    </div>
+                                    <div class="text-xs text-gray-500 dark:text-gray-400 truncate">
+                                        ${escapeHtml(role)}${item.a.targetEmail ? ` · ${escapeHtml(item.a.targetEmail)}` : ''} · ${escapeHtml(item.surveyTitle)} · ${escapeHtml(whenLabel)}
+                                    </div>
+                                </div>
+                                ${resp
+                                    ? `<button type="button" class="view-site-survey-response-btn px-2 py-1 rounded text-xs bg-gray-100 dark:bg-gray-700 shrink-0" data-response-id="${escapeHtml(resp.id)}">View</button>`
+                                    : ''}
+                            </div>`;
+                    }
+                    return rowHtml(item);
+                });
+
+                const statusCap = 200;
+                const shown = rowsHtml.slice(0, statusCap);
+                body.innerHTML = `
+                    <div class="flex flex-wrap gap-1.5 mb-3 px-1">
+                        ${chipBtn('all', 'All', counts.all)}
+                        ${chipBtn('completed', 'Completed', counts.completed)}
+                        ${chipBtn('in_progress', 'In progress', counts.in_progress)}
+                        ${chipBtn('not_started', 'Not started', counts.not_started)}
+                        ${chipBtn('stale', 'Expired', counts.stale)}
+                    </div>
+                    <div class="px-1 mb-2 text-xs text-gray-500 dark:text-gray-400">
+                        ${counts.completed} completed · ${incomplete} still open
+                        ${filter !== 'all' ? ` · showing ${surveyInviteStatusMeta(filter).label.toLowerCase()}` : ''}
+                    </div>
+                    ${filtered.length === 0
+                        ? empty(assignments.length === 0 ? 'No surveys sent yet. Hit Send survey.' : 'Nothing in this filter.')
+                        : shown.join('')}
+                `;
+                if (footerEl) {
+                    footerEl.textContent = filtered.length > statusCap
+                        ? `Showing ${statusCap} of ${filtered.length}.`
+                        : `${filtered.length} invite${filtered.length === 1 ? '' : 's'}`;
+                }
+
+                body.querySelectorAll('.comms-status-filter-btn').forEach((btn) => {
+                    btn.addEventListener('click', () => {
+                        commsStatusFilter = btn.getAttribute('data-status-filter') || 'all';
+                        renderFeasibility();
+                    });
+                });
+
+                const copyBtn = document.getElementById('comms-status-copy-incomplete-btn');
+                if (copyBtn && !copyBtn.dataset.bound) {
+                    copyBtn.dataset.bound = '1';
+                    copyBtn.addEventListener('click', async () => {
+                        const lines = enriched
+                            .filter(x => x.kind !== 'completed')
+                            .map(x => {
+                                const meta = surveyInviteStatusMeta(x.kind);
+                                return [
+                                    x.siteName,
+                                    formatSiteSurveyRoleLabel(x.a.targetRole),
+                                    x.a.targetEmail || '',
+                                    meta.label,
+                                    x.surveyTitle,
+                                ].join('\t');
+                            });
+                        const text = ['Site\tRole\tEmail\tStatus\tSurvey', ...lines].join('\n');
+                        try {
+                            await navigator.clipboard.writeText(text);
+                            showNotification(`Copied ${lines.length} incomplete invite${lines.length === 1 ? '' : 's'}`, 'success');
+                        } catch (_) {
+                            showNotification('Could not copy list', 'error');
+                        }
+                    });
+                }
+                const refreshBtn = document.getElementById('comms-status-refresh-btn');
+                if (refreshBtn && !refreshBtn.dataset.bound) {
+                    refreshBtn.dataset.bound = '1';
+                    refreshBtn.addEventListener('click', async () => {
+                        try {
+                            refreshBtn.disabled = true;
+                            const [asg, resp] = await Promise.all([
+                                apiService.getSiteSurveyAssignments().catch(() => null),
+                                apiService.getSiteSurveyResponses().catch(() => null),
+                            ]);
+                            if (Array.isArray(asg)) allSiteSurveyAssignments = asg;
+                            if (Array.isArray(resp)) allSiteSurveyResponses = resp;
+                            showNotification('Status refreshed', 'success');
+                            render();
+                        } catch (err) {
+                            showNotification(err.message || 'Refresh failed', 'error');
+                        } finally {
+                            refreshBtn.disabled = false;
+                        }
+                    });
+                }
             } else if (commsPanel === 'responses') {
                 const rows = responses.map(r => {
                     const siteName = allSites.find(s => s.id === r.siteId)?.name || r.siteId;
