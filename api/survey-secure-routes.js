@@ -669,6 +669,9 @@ function buildPublicPayload({
             openedAt: assignment.openedAt || null,
             submittedAt: assignment.submittedAt || null,
             draftSavedAt: assignment.draftSavedAt || null,
+            draftPageIndex: Number.isFinite(Number(assignment.draftPageIndex))
+                ? Math.floor(Number(assignment.draftPageIndex))
+                : null,
         },
         survey: {
             id: definition.id,
@@ -988,6 +991,7 @@ function registerSurveySecureRoutes(app, deps) {
                     email: body.email,
                     displayName: body.displayName,
                     isDraft: true,
+                    pageIndex: body.pageIndex,
                 });
                 return {
                     status: 200,
@@ -995,6 +999,7 @@ function registerSurveySecureRoutes(app, deps) {
                         ok: true,
                         draft: true,
                         draftSavedAt: result.assignment?.draftSavedAt,
+                        draftPageIndex: result.assignment?.draftPageIndex,
                     },
                     headers: corsHeaders(),
                 };

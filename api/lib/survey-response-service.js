@@ -820,7 +820,7 @@ async function resolvePublicSurveyQuestions(getContainer, definition, opts = {})
  * Upsert a submitted (or draft) response bound to an assignment.
  * @returns {{ resource, resubmitted: boolean, created: boolean }}
  */
-async function writeSurveyResponse(deps, { assignment, answers, email, displayName, isDraft = false }) {
+async function writeSurveyResponse(deps, { assignment, answers, email, displayName, isDraft = false, pageIndex } = {}) {
     const { getContainer, generateId, validateSurveyResponsesSchema } = deps;
     const now = new Date().toISOString();
     const asgC = getContainer('site-survey-assignments');
@@ -838,6 +838,7 @@ async function writeSurveyResponse(deps, { assignment, answers, email, displayNa
     };
 
     if (isDraft) {
+        const pageIdx = Number(pageIndex);
         const draftAssignment = {
             ...assignment,
             draftAnswers: body.answers,
@@ -845,6 +846,9 @@ async function writeSurveyResponse(deps, { assignment, answers, email, displayNa
             status: String(assignment.status || '').toLowerCase() === 'submitted' ? 'submitted' : 'opened',
             updatedAt: now,
         };
+        if (Number.isFinite(pageIdx) && pageIdx >= 0) {
+            draftAssignment.draftPageIndex = Math.floor(pageIdx);
+        }
         const { resource } = await asgC.items.upsert(draftAssignment);
         return { resource, resubmitted: false, created: false, draft: true, assignment: resource };
     }
@@ -908,11 +912,13 @@ async function writeSurveyResponse(deps, { assignment, answers, email, displayNa
             updatedAt: now,
             draftAnswers: null,
             draftSavedAt: null,
+            draftPageIndex: null,
             lastSubmittedAt: now,
             siteDisposition: updatedDisposition || null,
         };
         delete asgSubmitted.draftAnswers;
         delete asgSubmitted.draftSavedAt;
+        delete asgSubmitted.draftPageIndex;
         await asgC.items.upsert(asgSubmitted);
 
         return { resource: { ...resource, resubmitted: true }, resubmitted: true, created: false };
@@ -937,6 +943,7 @@ async function writeSurveyResponse(deps, { assignment, answers, email, displayNa
     };
     delete asgFirst.draftAnswers;
     delete asgFirst.draftSavedAt;
+    delete asgFirst.draftPageIndex;
     await asgC.items.upsert(asgFirst);
 
     return { resource, resubmitted: false, created: true };
