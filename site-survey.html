@@ -1046,20 +1046,52 @@
       if (pw && !headers['X-Survey-Password']) {
         headers['X-Survey-Password'] = pw;
       }
-      const res = await fetch(`${API}${path}`, {
-        ...options,
-        headers,
-      });
-      const text = await res.text();
-      let data = null;
-      try { data = text ? JSON.parse(text) : null; } catch { data = text; }
-      if (!res.ok) {
-        const err = new Error((data && data.error) || text || res.statusText);
-        err.status = res.status;
-        err.payload = data;
-        throw err;
+      const method = String(options.method || 'GET').toUpperCase();
+      const retries = Number(options.retries);
+      const maxAttempts = Number.isFinite(retries)
+        ? Math.max(1, retries)
+        : (method === 'POST' || method === 'PUT' || method === 'PATCH' ? 3 : 1);
+      let lastErr = null;
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        try {
+          const res = await fetch(`${API}${path}`, {
+            ...options,
+            headers,
+          });
+          const text = await res.text();
+          let data = null;
+          try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+          if (!res.ok) {
+            const err = new Error((data && data.error) || text || res.statusText);
+            err.status = res.status;
+            err.payload = data;
+            // Retry transient gateway / cold-start failures
+            if (attempt < maxAttempts && (res.status === 502 || res.status === 503 || res.status === 504)) {
+              lastErr = err;
+              await new Promise((r) => setTimeout(r, 400 * attempt));
+              continue;
+            }
+            throw err;
+          }
+          return data;
+        } catch (err) {
+          lastErr = err;
+          const msg = String(err?.message || err || '');
+          const networkFail = !err?.status && /failed to fetch|networkerror|load failed|fetch/i.test(msg);
+          if (attempt < maxAttempts && networkFail) {
+            await new Promise((r) => setTimeout(r, 450 * attempt));
+            continue;
+          }
+          if (networkFail) {
+            const nice = new Error('Network hiccup — draft did not reach the server. Tap Save draft again.');
+            nice.status = 0;
+            nice.cause = err;
+            throw nice;
+          }
+          throw err;
+        }
       }
-      return data;
+      throw lastErr || new Error('Request failed');
     }
 
     /** Fire-and-forget bug report to Cosmos (via API). Never includes answers. */
@@ -1688,7 +1720,7 @@
       if (lbl) lbl.textContent = `${filled} of ${rows.length} answered`;
     }
 
-    function collectAnswers(form, questions) {
+    function collectAnswers(form, questions, { slim = false } = {}) {
       return questions.map((q, idx) => {
         const id = q.id || `q_${idx}`;
         const row = form.querySelector(`.q[data-qid="${CSS.escape ? CSS.escape(id) : id}"]`);
@@ -1696,16 +1728,25 @@
         const confirmWrap = row?.querySelector('.q-confirm');
         const confirmEl = confirmWrap?.querySelector('input[data-confirm-for]');
         const needsConfirm = !!(confirmWrap && !confirmWrap.hidden && confirmEl);
-        return {
+        const base = {
           questionId: id,
-          label: q.label || q.title || `Question ${idx + 1}`,
-          type: (q.type || 'text').toLowerCase(),
-          libraryQuestionId: q.libraryQuestionId || undefined,
-          sensitivity: q.sensitivity || 'none',
           skipped: !visible,
           value: visible ? readQuestionValue(form, q, id) : null,
           // Prefill on file → must check confirm; blank/new answers → no confirm needed
           confirmed: visible ? (needsConfirm ? !!confirmEl.checked : true) : false,
+        };
+        if (slim) {
+          return {
+            ...base,
+            type: (q.type || 'text').toLowerCase(),
+          };
+        }
+        return {
+          ...base,
+          label: q.label || q.title || `Question ${idx + 1}`,
+          type: (q.type || 'text').toLowerCase(),
+          libraryQuestionId: q.libraryQuestionId || undefined,
+          sensitivity: q.sensitivity || 'none',
         };
       });
     }
@@ -2642,7 +2683,7 @@
             body: JSON.stringify({
               t: token,
               action: 'draft',
-              answers: collectAnswers(form, questions),
+              answers: collectAnswers(form, questions, { slim: true }),
               pageIndex,
               saveReason: reason,
             }),
@@ -2795,7 +2836,9 @@
             body: JSON.stringify({
               t: token,
               action,
-              answers: collectAnswers(form, questions),
+              answers: collectAnswers(form, questions, {
+                slim: action === 'draft' || action === 'save',
+              }),
               pageIndex,
             }),
           });
