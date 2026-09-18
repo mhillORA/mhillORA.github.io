@@ -372,8 +372,6 @@ function inviteEmailCopy({
  * Always reiterates due date, survey link, and password (when known).
  */
 function reminderInviteCopy(opts = {}) {
-    const kind = String(opts.reminderKind || opts.statusKind || '').toLowerCase();
-    const inProgress = kind === 'in_progress' || kind === 'draft' || kind === 'opened';
     const rolePart = String(opts.roleSubjectLabel || opts.roleLabel || 'Site').trim() || 'Site';
     const code = String(opts.studyCode || '').trim();
     const studyLine =
@@ -392,9 +390,7 @@ function reminderInviteCopy(opts = {}) {
             ? `Reminder || ${code} || Feasibility Survey || ${rolePart}`
             : `Reminder || Feasibility Survey || ${rolePart}`);
 
-    const opener = inProgress
-        ? `This is a reminder to finish the feasibility survey for ${studyLine}. It looks like you already started — please complete and submit when you can.`
-        : `This is a reminder to complete the feasibility survey for ${studyLine}. We have not received a submission yet.`;
+    const opener = `This is a reminder to complete the feasibility survey for ${studyLine}.`;
 
     const lines = [
         'Hello,',
