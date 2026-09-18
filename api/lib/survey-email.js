@@ -457,17 +457,57 @@ function plainTextToInviteHtml(text) {
         .map((b) => b.trim())
         .filter(Boolean);
     if (!blocks.length) return '';
-    return blocks
-        .map((block) => {
-            const withBreaks = escapeHtml(block).replace(/\n/g, '<br/>');
-            // Autolink bare https URLs in custom body
-            const linked = withBreaks.replace(
-                /(https?:\/\/[^\s<]+)/g,
-                '<a href="$1">$1</a>'
-            );
-            return `<p>${linked}</p>`;
-        })
-        .join('\n');
+
+    const renderInline = (line) => {
+        let s = escapeHtml(line);
+        // **bold** (simple, non-nested)
+        s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+        s = s.replace(
+            /(https?:\/\/[^\s<]+)/g,
+            '<a href="$1">$1</a>'
+        );
+        return s;
+    };
+
+    const isBullet = (l) => /^\s*[-*•]\s+/.test(l);
+    const isNumbered = (l) => /^\s*\d+[.)]\s+/.test(l);
+
+    const renderBlock = (block) => {
+        const lines = block.split(/\n/).map((l) => l.trimEnd());
+        const out = [];
+        let i = 0;
+        while (i < lines.length) {
+            if (isBullet(lines[i])) {
+                const items = [];
+                while (i < lines.length && isBullet(lines[i])) {
+                    items.push(lines[i].replace(/^\s*[-*•]\s+/, '').trim());
+                    i += 1;
+                }
+                out.push(`<ul>${items.map((t) => `<li>${renderInline(t)}</li>`).join('')}</ul>`);
+                continue;
+            }
+            if (isNumbered(lines[i])) {
+                const items = [];
+                while (i < lines.length && isNumbered(lines[i])) {
+                    items.push(lines[i].replace(/^\s*\d+[.)]\s+/, '').trim());
+                    i += 1;
+                }
+                out.push(`<ol>${items.map((t) => `<li>${renderInline(t)}</li>`).join('')}</ol>`);
+                continue;
+            }
+            const para = [];
+            while (i < lines.length && !isBullet(lines[i]) && !isNumbered(lines[i])) {
+                para.push(lines[i]);
+                i += 1;
+            }
+            if (para.some((l) => String(l || '').trim())) {
+                out.push(`<p>${para.map((l) => renderInline(l)).join('<br/>')}</p>`);
+            }
+        }
+        return out.join('\n');
+    };
+
+    return blocks.map(renderBlock).filter(Boolean).join('\n');
 }
 
 /** Exact ops template from ReBUILD send example — placeholders filled at send time. */
@@ -558,4 +598,5 @@ module.exports = {
     formatInviteCloseDate,
     opsNotifyCopy,
     emailProviderStatus,
+    plainTextToInviteHtml,
 };
