@@ -393,8 +393,8 @@ function reminderInviteCopy(opts = {}) {
             : `Reminder || Feasibility Survey || ${rolePart}`);
 
     const opener = inProgress
-        ? `This is a friendly reminder to finish the feasibility survey for ${studyLine}. It looks like you already started — thank you. Please complete and submit when you can.`
-        : `This is a friendly reminder to complete the feasibility survey for ${studyLine}. We have not received a submission yet and would appreciate your response.`;
+        ? `This is a reminder to finish the feasibility survey for ${studyLine}. It looks like you already started — please complete and submit when you can.`
+        : `This is a reminder to complete the feasibility survey for ${studyLine}. We have not received a submission yet.`;
 
     const lines = [
         'Hello,',
@@ -420,9 +420,9 @@ function reminderInviteCopy(opts = {}) {
         );
     }
     lines.push(
-        'If you have already submitted, thank you — you can ignore this message.',
+        'If you have already submitted, you can ignore this message.',
         '',
-        'Thank you,',
+        'Best regards,',
         'Ora Site Profiles'
     );
 
@@ -481,7 +481,7 @@ function defaultInviteSubjectTemplate() {
 
 function defaultInviteBodyTemplate() {
     return [
-        'Thank you again for your interest in {{studyCode}}, {{studyTitle}}.',
+        'Following up on your interest in {{studyCode}}, {{studyTitle}}.',
         '',
         'I have attached {{attachmentNames}} for your review and support of the next step, the Feasibility Survey. The survey will take approximately 30 minutes, depending on the answers. All information provided via this survey will be kept confidential.',
         '',
@@ -492,7 +492,7 @@ function defaultInviteBodyTemplate() {
         '',
         'Please complete this feasibility survey by {{dueDate}}.',
         '',
-        'Thank you again for your time. We look forward to working with you on this study!',
+        'We look forward to working with you on this study.',
         '',
         'Best regards,',
         'The Ora Team',
