@@ -28,6 +28,16 @@ REASON_ID = "rebuild_014_if-not-interested-what-is-the-reason"
 COMMENTS_ID = "rebuild_016_do-you-have-any-additional-comments-you-"
 COLORADO_ID = "1a0908a7c621f7958cd"
 
+# Locked Kari wording — do not derive from live options (they can get split/cased wrong).
+REASON_OPTIONS = [
+    "Lack of patients meeting eligibility criteria",
+    "Competing studies, ongoing or planned",
+    "Lack of time and/or research staff",
+    "Lack of equipment",
+    "Protocol-related concerns",
+    "Other",
+]
+
 ASSUMPTIONS = (
     "To support the planned study timelines across approximately 45 sites, "
     "each site should project to screen 2 patients per month and randomize at least "
@@ -122,8 +132,9 @@ def main():
     interest["logic"] = interest.get("logic") if isinstance(interest.get("logic"), dict) else {}
     interest["logic"].pop("endSurveyIf", None)
 
-    opts = [str(o).strip() for o in (reason.get("options") or []) if str(o).strip()]
+    opts = list(REASON_OPTIONS)
     reason["options"] = opts
+    reason["type"] = "multiselect"
     reason["scoringOptions"] = [
         {
             "value": o,
@@ -173,7 +184,7 @@ def main():
     site["piLastName"] = "Murtaza"
     site["updatedAt"] = datetime.now(timezone.utc).isoformat()
     sites.upsert_item(site)
-    print("Updated Colorado Retina PI → Adam Murtaza (First Last)")
+    print("Updated Colorado Retina PI -> Adam Murtaza (First Last)")
 
 
 if __name__ == "__main__":

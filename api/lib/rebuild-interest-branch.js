@@ -12,6 +12,16 @@ const INTEREST_ID = 'rebuild_013_has-the-investigator-reviewed-the-protoc';
 const REASON_ID = 'rebuild_014_if-not-interested-what-is-the-reason';
 const COMMENTS_ID = 'rebuild_016_do-you-have-any-additional-comments-you-';
 
+/** Locked Kari reason choices — never trust a corrupted/split live list. */
+const REASON_OPTIONS = [
+    'Lack of patients meeting eligibility criteria',
+    'Competing studies, ongoing or planned',
+    'Lack of time and/or research staff',
+    'Lack of equipment',
+    'Protocol-related concerns',
+    'Other',
+];
+
 function isRebuildSurveyDoc(doc) {
     if (!doc || typeof doc !== 'object') return false;
     const id = String(doc.id || '').trim();
@@ -53,10 +63,15 @@ function ensureRebuildInterestBranching(doc) {
         changed = true;
     }
 
-    const opts = (Array.isArray(reason.options) ? reason.options : [])
-        .map((o) => (typeof o === 'string' ? o : String(o?.label ?? o?.value ?? '')).trim())
-        .filter(Boolean);
-    if (!opts.length) return changed;
+    const opts = REASON_OPTIONS.slice();
+    if (snap(reason.options || []) !== snap(opts)) {
+        reason.options = opts;
+        changed = true;
+    }
+    if (String(reason.type || '').toLowerCase() !== 'multiselect') {
+        reason.type = 'multiselect';
+        changed = true;
+    }
 
     const wantReasonLogic = {
         showIf: { questionId: INTEREST_ID, equals: 'No' },
@@ -106,6 +121,7 @@ module.exports = {
     INTEREST_ID,
     REASON_ID,
     COMMENTS_ID,
+    REASON_OPTIONS,
     isRebuildSurveyDoc,
     ensureRebuildInterestBranching,
 };
