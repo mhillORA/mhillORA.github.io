@@ -483,7 +483,7 @@ function plainTextToInviteHtml(text) {
                     items.push(lines[i].replace(/^\s*[-*•]\s+/, '').trim());
                     i += 1;
                 }
-                out.push(`<ul>${items.map((t) => `<li>${renderInline(t)}</li>`).join('')}</ul>`);
+                out.push(`<ul style="margin:8px 0 12px 0;padding:0 0 0 22px;list-style-type:disc;">${items.map((t) => `<li style="margin:0 0 6px 0;">${renderInline(t)}</li>`).join('')}</ul>`);
                 continue;
             }
             if (isNumbered(lines[i])) {
