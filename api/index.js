@@ -1,5 +1,6 @@
 const { app } = require('@azure/functions');
 const { CosmosClient } = require('@azure/cosmos');
+const { ensureRebuildInterestBranching } = require('./lib/rebuild-interest-branch');
 
 // Node.js 18+ has fetch built-in, no polyfill needed
 
@@ -1092,6 +1093,7 @@ async function crudHandler(context, request, containerName) {
                             break;
                         case 'site-survey-definitions':
                             validateSurveyDefinitionsSchema(body);
+                            ensureRebuildInterestBranching(body);
                             break;
                         case 'site-survey-question-library':
                             validateSurveyQuestionLibrarySchema(body);
@@ -1219,6 +1221,7 @@ async function crudHandler(context, request, containerName) {
                             break;
                         case 'site-survey-definitions':
                             validateSurveyDefinitionsSchema(requestBody);
+                            ensureRebuildInterestBranching(requestBody);
                             break;
                         case 'site-survey-question-library':
                             validateSurveyQuestionLibrarySchema(requestBody);

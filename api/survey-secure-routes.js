@@ -57,12 +57,29 @@ const {
     MAX_FILES,
     MAX_BYTES,
 } = require('./lib/survey-attachments');
+const { ensureRebuildInterestBranching } = require('./lib/rebuild-interest-branch');
 
 const ASSIGNMENTS = 'site-survey-assignments';
 const DEFINITIONS = 'site-survey-definitions';
 const NOTIFICATIONS = 'site-survey-notifications';
 const SITES = 'sites';
 const SITE_STAFF = 'site-staff';
+
+/** If Kari's not-interested branch was wiped, repair Cosmos once and serve the fixed doc. */
+async function loadSurveyDefinition(getContainer, surveyId) {
+    const defRead = await getContainer(DEFINITIONS).item(surveyId, surveyId).read();
+    const definition = defRead.resource;
+    if (!definition) return null;
+    if (ensureRebuildInterestBranching(definition)) {
+        definition.updatedAt = new Date().toISOString();
+        try {
+            await getContainer(DEFINITIONS).items.upsert(definition);
+        } catch (_) {
+            // Still serve the repaired in-memory copy even if upsert fails
+        }
+    }
+    return definition;
+}
 
 /** Simple per-instance rate limit (best-effort; use Front Door for hard limits). */
 const rateBuckets = new Map();
@@ -797,10 +814,7 @@ function registerSurveySecureRoutes(app, deps) {
 
             let definition = null;
             try {
-                const defRead = await getContainer(DEFINITIONS)
-                    .item(assignment.surveyId, assignment.surveyId)
-                    .read();
-                definition = defRead.resource;
+                definition = await loadSurveyDefinition(getContainer, assignment.surveyId);
             } catch (_) {
                 definition = null;
             }
@@ -1025,10 +1039,7 @@ function registerSurveySecureRoutes(app, deps) {
             // Light server-side required check against merged questions (gen feas + study)
             let definition = null;
             try {
-                const defRead = await getContainer(DEFINITIONS)
-                    .item(assignment.surveyId, assignment.surveyId)
-                    .read();
-                definition = defRead.resource;
+                definition = await loadSurveyDefinition(getContainer, assignment.surveyId);
             } catch (_) {}
             const questions = definition
                 ? await resolvePublicSurveyQuestions(getContainer, definition, {
@@ -1393,8 +1404,7 @@ function registerSurveySecureRoutes(app, deps) {
 
                 let definition = null;
                 try {
-                    const defRead = await getContainer(DEFINITIONS).item(surveyId, surveyId).read();
-                    definition = defRead.resource;
+                    definition = await loadSurveyDefinition(getContainer, surveyId);
                 } catch (_) {}
                 if (!definition) {
                     return {
@@ -1917,8 +1927,7 @@ function registerSurveySecureRoutes(app, deps) {
 
                 let definition = null;
                 try {
-                    const defRead = await getContainer(DEFINITIONS).item(surveyId, surveyId).read();
-                    definition = defRead.resource;
+                    definition = await loadSurveyDefinition(getContainer, surveyId);
                 } catch (_) {
                     definition = null;
                 }
