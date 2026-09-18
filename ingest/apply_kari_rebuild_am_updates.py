@@ -28,12 +28,13 @@ REASON_ID = "rebuild_014_if-not-interested-what-is-the-reason"
 COMMENTS_ID = "rebuild_016_do-you-have-any-additional-comments-you-"
 COLORADO_ID = "1a0908a7c621f7958cd"
 
-# Locked Kari wording — do not derive from live options (they can get split/cased wrong).
+# Allie's current reason choices (ops-owned wording — do not "fix" back to the old combined line).
 REASON_OPTIONS = [
-    "Lack of patients meeting eligibility criteria",
+    "Lack of Patients",
+    "Eligibility Criteria",
     "Competing studies, ongoing or planned",
     "Lack of time and/or research staff",
-    "Lack of equipment",
+    "Lack of Equipment",
     "Protocol-related concerns",
     "Other",
 ]

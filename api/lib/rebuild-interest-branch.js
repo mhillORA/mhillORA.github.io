@@ -1,26 +1,18 @@
 /**
- * Lock Kari's ReBUILD not-interested branch so builder saves / syncs can't wipe it.
+ * Lock ReBUILD not-interested branching so builder saves / syncs can't wipe it.
  *
- * Contract (do not change without Kari + ops sign-off):
+ * Contract:
  *  Q1 interest (Yes/No) — No does NOT end the survey
  *  Q2 reasons — show only when Q1 = No; any reason ends early
  *  Comments — stay visible through end-early (showThroughQuestionId)
  *  Reason choices — disposition not_interested
+ *
+ * Option labels on Q2 are owned by ops (e.g. Allie) — do not overwrite them here.
  */
 const REBUILD_SURVEY_ID = 'survey-rebuild-mytx272am-201';
 const INTEREST_ID = 'rebuild_013_has-the-investigator-reviewed-the-protoc';
 const REASON_ID = 'rebuild_014_if-not-interested-what-is-the-reason';
 const COMMENTS_ID = 'rebuild_016_do-you-have-any-additional-comments-you-';
-
-/** Locked Kari reason choices — never trust a corrupted/split live list. */
-const REASON_OPTIONS = [
-    'Lack of patients meeting eligibility criteria',
-    'Competing studies, ongoing or planned',
-    'Lack of time and/or research staff',
-    'Lack of equipment',
-    'Protocol-related concerns',
-    'Other',
-];
 
 function isRebuildSurveyDoc(doc) {
     if (!doc || typeof doc !== 'object') return false;
@@ -29,9 +21,15 @@ function isRebuildSurveyDoc(doc) {
     return id === REBUILD_SURVEY_ID || code === 'MYTX272AM-201';
 }
 
+function coerceOptionLabels(raw) {
+    return (Array.isArray(raw) ? raw : [])
+        .map((o) => (typeof o === 'string' ? o : String(o?.label ?? o?.value ?? '')).trim())
+        .filter(Boolean);
+}
+
 /**
- * Re-assert branching + not_interested scoring on the live definition shape.
- * Safe to call repeatedly. Mutates `doc` in place. Returns true if anything changed.
+ * Re-assert branching + not_interested scoring. Preserves live reason option labels.
+ * Mutates `doc` in place. Returns true if anything changed.
  */
 function ensureRebuildInterestBranching(doc) {
     if (!isRebuildSurveyDoc(doc)) return false;
@@ -47,7 +45,6 @@ function ensureRebuildInterestBranching(doc) {
     let changed = false;
     const snap = (v) => JSON.stringify(v);
 
-    // Q1: never end-early on No (reasons must still show)
     if (interest.logic && interest.logic.endSurveyIf) {
         const nextLogic = { ...interest.logic };
         delete nextLogic.endSurveyIf;
@@ -63,11 +60,9 @@ function ensureRebuildInterestBranching(doc) {
         changed = true;
     }
 
-    const opts = REASON_OPTIONS.slice();
-    if (snap(reason.options || []) !== snap(opts)) {
-        reason.options = opts;
-        changed = true;
-    }
+    const opts = coerceOptionLabels(reason.options);
+    if (!opts.length) return changed;
+
     if (String(reason.type || '').toLowerCase() !== 'multiselect') {
         reason.type = 'multiselect';
         changed = true;
@@ -121,7 +116,6 @@ module.exports = {
     INTEREST_ID,
     REASON_ID,
     COMMENTS_ID,
-    REASON_OPTIONS,
     isRebuildSurveyDoc,
     ensureRebuildInterestBranching,
 };
