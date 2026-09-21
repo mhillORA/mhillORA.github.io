@@ -9051,12 +9051,13 @@
                                     <div>
                                         <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
                                             <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Sites</label>
-                                            <div class="flex gap-2 text-xs">
+                                            <div class="flex gap-2 text-xs items-center">
+                                                <span id="send-survey-selected-count" class="font-semibold text-gray-600 dark:text-gray-300">${prefillSiteId ? '1 selected' : 'None selected'}</span>
                                                 <button type="button" id="survey-send-select-all" class="text-indigo-600 dark:text-indigo-400 hover:underline">Select all visible</button>
                                                 <button type="button" id="survey-send-select-none" class="text-indigo-600 dark:text-indigo-400 hover:underline">Clear</button>
                                             </div>
                                         </div>
-                                        <p class="text-[11px] text-gray-500 dark:text-gray-400 mb-2">% = prior feasibility on file (hover for detail). Search and sort below.</p>
+                                        <p class="text-[11px] text-gray-500 dark:text-gray-400 mb-2">% = prior feasibility on file (hover for detail). Search and sort below — selections persist across search.</p>
                                         <div class="flex flex-wrap gap-2 mb-2">
                                             <input id="send-survey-site-search" type="search" placeholder="Search sites, email, PI…" class="flex-1 min-w-[12rem] rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-1.5 text-sm" />
                                             <select id="send-survey-site-sort" class="rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-2 py-1.5 text-sm" title="Re-sort the site list">
@@ -9259,16 +9260,33 @@
                 e.target.dataset.touched = '1';
             });
 
+            /** Keep Set in sync with visible checkboxes without dropping filtered-out picks. */
+            const syncCheckedSiteIdsFromDom = () => {
+                form?.querySelectorAll('input[name="siteIds"]').forEach((cb) => {
+                    const id = String(cb.value || '').trim();
+                    if (!id) return;
+                    if (cb.checked) checkedSiteIds.add(id);
+                    else checkedSiteIds.delete(id);
+                });
+            };
+
+            const refreshSelectedSiteCount = () => {
+                const el = document.getElementById('send-survey-selected-count');
+                if (!el) return;
+                const n = checkedSiteIds.size;
+                el.textContent = n ? `${n} selected` : 'None selected';
+            };
+
             const refreshSendSiteList = () => {
                 const list = document.getElementById('send-survey-site-list');
                 if (!list) return;
-                checkedSiteIds.clear();
-                form?.querySelectorAll('input[name="siteIds"]:checked').forEach((cb) => {
-                    checkedSiteIds.add(cb.value);
-                });
+                // Do NOT clear the Set — hidden (filtered) checkboxes leave the DOM and
+                // would otherwise wipe every pick except the last visible one.
+                syncCheckedSiteIdsFromDom();
                 const sid = form?.querySelector('[name="surveyId"]')?.value || '';
                 list.innerHTML = buildSiteRowsHtml(sid, { sort: sendSiteSort, filter: sendSiteFilter })
                     || '<div class="text-sm text-gray-500 p-2">No sites</div>';
+                refreshSelectedSiteCount();
             };
 
             const refreshSendScoringNote = () => {
@@ -9321,11 +9339,33 @@
                     .join(' · ');
             });
             document.getElementById('survey-send-select-all')?.addEventListener('click', () => {
-                document.querySelectorAll('#site-survey-assignment-form input[name="siteIds"]').forEach(cb => { cb.checked = true; });
+                document.querySelectorAll('#site-survey-assignment-form input[name="siteIds"]').forEach((cb) => {
+                    cb.checked = true;
+                    const id = String(cb.value || '').trim();
+                    if (id) checkedSiteIds.add(id);
+                });
+                refreshSelectedSiteCount();
             });
             document.getElementById('survey-send-select-none')?.addEventListener('click', () => {
-                document.querySelectorAll('#site-survey-assignment-form input[name="siteIds"]').forEach(cb => { cb.checked = false; });
+                checkedSiteIds.clear();
+                document.querySelectorAll('#site-survey-assignment-form input[name="siteIds"]').forEach((cb) => {
+                    cb.checked = false;
+                });
+                refreshSelectedSiteCount();
             });
+            document.getElementById('send-survey-site-list')?.addEventListener('change', (e) => {
+                const cb = e.target?.closest?.('input[name="siteIds"]');
+                if (!cb) return;
+                const id = String(cb.value || '').trim();
+                if (!id) return;
+                if (cb.checked) checkedSiteIds.add(id);
+                else checkedSiteIds.delete(id);
+                refreshSelectedSiteCount();
+            });
+            // Source of truth for confirm + send (survives search/filter rebuilds).
+            form.__checkedSiteIds = checkedSiteIds;
+            form.__syncCheckedSiteIdsFromDom = syncCheckedSiteIdsFromDom;
+            refreshSelectedSiteCount();
         };
 
         /** Contact name + email for a site/role — mirrors server resolveRecipientEmail fields. */
@@ -15389,7 +15429,18 @@
                 if (errEl) errEl.classList.add('hidden');
                 try {
                     const surveyId = form.surveyId.value;
-                    const siteIds = [...form.querySelectorAll('input[name="siteIds"]:checked')].map(cb => cb.value);
+                    // Prefer the persistent Set (keeps picks hidden by search/filter).
+                    if (typeof form.__syncCheckedSiteIdsFromDom === 'function') {
+                        form.__syncCheckedSiteIdsFromDom();
+                    }
+                    let siteIds;
+                    if (form.__checkedSiteIds instanceof Set) {
+                        siteIds = [...form.__checkedSiteIds].filter(Boolean);
+                    } else {
+                        siteIds = [...form.querySelectorAll('input[name="siteIds"]:checked')]
+                            .map((cb) => cb.value)
+                            .filter(Boolean);
+                    }
                     const targetRoles = [];
                     if (form.role_coordinator?.checked) targetRoles.push('coordinator');
                     if (form.role_pi?.checked) targetRoles.push('pi');
