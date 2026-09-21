@@ -476,9 +476,21 @@ def address_parts(raw) -> dict:
             return ""
         return s
 
+    a1 = clean("G")
+    a2 = clean("H")
+    # House number alone on G + street name on H → one street line (keep suite/unit on H)
+    if re.fullmatch(r"\d{1,6}[A-Za-z]?", a1 or "") and a2:
+        if not re.match(
+            r"^(suite|ste\.?|apt\.?|apartment|unit|#|bldg\.?|building|floor|fl\.?)\b",
+            a2,
+            re.I,
+        ):
+            a1 = f"{a1} {a2}".strip()
+            a2 = ""
+
     return {
-        "address1": clean("G"),
-        "address2": clean("H"),
+        "address1": a1,
+        "address2": a2,
         "city": clean("I"),
         "state": clean("J"),
         "zip": clean("K"),
@@ -632,10 +644,24 @@ def clean_phone(val) -> str | None:
     s = str(val).strip()
     if not s or _PHONE_JUNK_RE.match(s) or is_junk_value(s):
         return None
+    s = re.sub(r"_x000[dD]_", "", s).strip()
     digits = re.sub(r"\D", "", s)
     if len(digits) < 7:
         return None
-    return s
+    # Normalize US NANP to 555-555-5555 (keep extension as " x ####")
+    ext = ""
+    ext_m = re.search(r"(?:ext\.?|extension|x)\s*[:.]?\s*(\d{1,8})\s*$", s, re.I)
+    if ext_m:
+        ext = ext_m.group(1)
+        s = s[: ext_m.start()].strip()
+        digits = re.sub(r"\D", "", s)
+    d = digits
+    if len(d) == 11 and d.startswith("1"):
+        d = d[1:]
+    if len(d) == 10:
+        formatted = f"{d[0:3]}-{d[3:6]}-{d[6:10]}"
+        return f"{formatted} x {ext}" if ext else formatted
+    return s if not ext else f"{s} x {ext}"
 
 
 def clean_email(val) -> str | None:
