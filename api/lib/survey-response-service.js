@@ -818,6 +818,86 @@ async function resolvePublicSurveyQuestions(getContainer, definition, opts = {})
 }
 
 /**
+ * After a site submits, push their address/phone (etc.) onto the live site record
+ * so Artemis + future surveys use what they entered — not our seed data.
+ * Non-fatal if site doc missing / upsert fails.
+ */
+async function applySiteSubmittedFieldsToSite(getContainer, siteId, answers) {
+    if (!siteId || !Array.isArray(answers) || !answers.length) return null;
+    const { normalizePhone } = require('./site-field-map');
+
+    const byLib = new Map();
+    for (const a of answers) {
+        if (!answerIsFilled(a)) continue;
+        const lib = String(
+            resolveStoredAnswerLibraryId(a) || a.libraryQuestionId || a.questionId || ''
+        ).trim();
+        const val = String(readBridgedAnswerValue(a) || readAnswerValue(a) || '').trim();
+        if (!lib || !val) continue;
+        byLib.set(lib, val);
+        // also key bare ql-* if questionId is the library id
+        if (String(a.questionId || '').startsWith('ql-')) {
+            byLib.set(String(a.questionId), val);
+        }
+    }
+
+    const pick = (...libs) => {
+        for (const id of libs) {
+            const v = byLib.get(id);
+            if (v) return v;
+        }
+        return '';
+    };
+
+    const patch = {};
+    const street = pick('ql-site-address', 'gf_03_address', 'q_002_address');
+    if (street) {
+        // Single survey address field → address1 only; leave address2 alone
+        patch.address1 = street;
+        patch.address = street;
+    }
+    const sitePhone = pick('ql-site-phone', 'gf_04_phone', 'q_003_phone');
+    if (sitePhone) {
+        const ph = normalizePhone(sitePhone) || sitePhone;
+        patch.phone = ph;
+        patch.sitePhone = ph;
+        patch.mainPhone = ph;
+    }
+    const piPhone = pick('ql-pi-phone');
+    if (piPhone) patch.piPhone = normalizePhone(piPhone) || piPhone;
+    const coordPhone = pick('ql-coord-phone', 'gsf_009_primary-research-point-of-contact-phone-number');
+    if (coordPhone) patch.siteCoordinatorPhone = normalizePhone(coordPhone) || coordPhone;
+    const contractsPhone = pick(
+        'ql-contracts-phone',
+        'ql-gsf_092_contracting-budgeting-contact-phone-number'
+    );
+    if (contractsPhone) {
+        const ph = normalizePhone(contractsPhone) || contractsPhone;
+        patch.contractsPhone = ph;
+        patch.contractContactPhone = ph;
+    }
+
+    if (!Object.keys(patch).length) return null;
+
+    try {
+        const sitesC = getContainer('sites');
+        const { resource: site } = await sitesC.item(siteId, siteId).read();
+        if (!site) return null;
+        const next = {
+            ...site,
+            ...patch,
+            siteSubmittedFieldsAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+        };
+        const { resource } = await sitesC.items.upsert(next);
+        return resource;
+    } catch (err) {
+        console.warn('site write-back from survey failed', siteId, err?.message || err);
+        return null;
+    }
+}
+
+/**
  * Upsert a submitted (or draft) response bound to an assignment.
  * @returns {{ resource, resubmitted: boolean, created: boolean }}
  */
@@ -922,6 +1002,8 @@ async function writeSurveyResponse(deps, { assignment, answers, email, displayNa
         delete asgSubmitted.draftPageIndex;
         await asgC.items.upsert(asgSubmitted);
 
+        await applySiteSubmittedFieldsToSite(getContainer, body.siteId, mergedAnswers);
+
         return { resource: { ...resource, resubmitted: true }, resubmitted: true, created: false };
     }
 
@@ -946,6 +1028,8 @@ async function writeSurveyResponse(deps, { assignment, answers, email, displayNa
     delete asgFirst.draftSavedAt;
     delete asgFirst.draftPageIndex;
     await asgC.items.upsert(asgFirst);
+
+    await applySiteSubmittedFieldsToSite(getContainer, body.siteId, body.answers);
 
     return { resource, resubmitted: false, created: true };
 }
@@ -977,4 +1061,5 @@ module.exports = {
     normalizeGeneralFeasibilityVariant,
     isGeneralFeasibilitySurveyId,
     writeSurveyResponse,
+    applySiteSubmittedFieldsToSite,
 };

@@ -478,15 +478,6 @@ def address_parts(raw) -> dict:
 
     a1 = clean("G")
     a2 = clean("H")
-    # House number alone on G + street name on H → one street line (keep suite/unit on H)
-    if re.fullmatch(r"\d{1,6}[A-Za-z]?", a1 or "") and a2:
-        if not re.match(
-            r"^(suite|ste\.?|apt\.?|apartment|unit|#|bldg\.?|building|floor|fl\.?)\b",
-            a2,
-            re.I,
-        ):
-            a1 = f"{a1} {a2}".strip()
-            a2 = ""
 
     return {
         "address1": a1,

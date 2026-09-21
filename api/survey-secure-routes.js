@@ -649,21 +649,21 @@ function buildPublicPayload({
         coordinatorStaff,
         piStaff,
     });
-    // Cross-survey / Mike history first; live site record applied after so identity fields win.
+    // Cross-survey / prior site submissions first after seed; site record is the initial fill only.
     const crossPrefill = buildPrefillMapForQuestions(qList, siteRoleResponses || (prior ? [prior] : []), {
         preferRole: assignment?.targetRole,
     });
     // Prefill layers (later wins):
     // 1) survey defaults
-    // 2) cross-survey / Mike history (equipment, practice, non-identity)
-    // 3) same-survey prior submission
-    // 4) live site record for identity/contact (wins over poisoned pack values)
+    // 2) live site record (initial seed only)
+    // 3) cross-survey / prior submissions from the site (wins over our seed)
+    // 4) same-survey prior submission
     // 5) in-progress draft (respondent always wins)
     const prefill = {
         ...(definition?.defaultValues || {}),
+        ...sitePrefill,
         ...crossPrefill,
         ...answersToPrefillMap(prior?.answers),
-        ...sitePrefill,
         ...answersToPrefillMap(draftAnswers || assignment.draftAnswers),
     };
     const hasPrior =

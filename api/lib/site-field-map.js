@@ -7,8 +7,7 @@
  *
  * Contract:
  *   name / institution_name  → site label (never an address)
- *   address1                 → full street line (house # + street name)
- *   address2                 → unit / suite only (not the street name)
+ *   address1 / address2      → kept separate (line 2 = suite/unit as authored)
  *   city / state / zip       → locality parts
  *   address                  → legacy composite; fill gaps only, never over address1
  *   phones                   → NANP 555-555-5555 (optional " x ####")
@@ -186,12 +185,6 @@ function normalizeSiteFields(site) {
     const pi3Name = pi3Parsed.display;
     const pi3Email = trimStr(site.pi3Email || '');
 
-    // House # on line 1 + street name on line 2 → one street line (keep suite/unit on line 2)
-    if (looksLikeHouseNumberOnly(address1) && address2 && !looksLikeUnitLine(address2)) {
-        address1 = `${address1} ${address2}`.replace(/\s+/g, ' ').trim();
-        address2 = '';
-    }
-
     // City wrongly stored as address1 (e.g. "San Antonio")
     if (address1 && looksLikeCityOnly(address1) && !city) {
         city = address1;
@@ -201,6 +194,7 @@ function normalizeSiteFields(site) {
     }
 
     // Prefer real street; fall back to composite `address` only when address1 empty/useless
+    // (does NOT merge address2 into address1 — lines stay separate)
     if (!address1 || !looksLikeStreet(address1) || looksLikeHouseNumberOnly(address1)) {
         if (address && (looksLikeStreet(address) || address.includes(',')) && normKey(address) !== normKey(name)) {
             const parsed = parseCompositeAddress(address);
