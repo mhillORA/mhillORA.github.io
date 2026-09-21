@@ -139,6 +139,7 @@ function roleLabel(role) {
     const r = normalizeRole(role);
     if (r === 'pi') return 'PI';
     if (r === 'coordinator') return 'Primary contact';
+    if (r === 'site') return 'Site';
     return role || 'Staff';
 }
 
@@ -147,7 +148,56 @@ function roleSubjectLabel(role) {
     const r = normalizeRole(role);
     if (r === 'pi') return 'PI';
     if (r === 'coordinator') return 'SC';
+    if (r === 'site') return 'Site';
     return roleLabel(role);
+}
+
+/**
+ * Email addresses bound to THIS assignment's site only.
+ * Never resolves contacts for any other siteId.
+ */
+async function resolveAssignmentEmails(getContainer, assignment) {
+    const siteId = String(assignment?.siteId || '').trim();
+    if (!siteId) return [];
+
+    const fromRecipients = (Array.isArray(assignment.recipients) ? assignment.recipients : [])
+        .map((r) => String(r?.email || '').trim())
+        .filter((e) => e.includes('@'));
+    if (fromRecipients.length) {
+        return [...new Set(fromRecipients.map((e) => e.toLowerCase()))].map((lower) => {
+            return fromRecipients.find((e) => e.toLowerCase() === lower) || lower;
+        });
+    }
+
+    const fromTarget = String(assignment.targetEmail || '')
+        .split(/[,;]/)
+        .map((s) => s.trim())
+        .filter((e) => e.includes('@'));
+    if (fromTarget.length) {
+        return [...new Set(fromTarget.map((e) => e.toLowerCase()))].map(
+            (lower) => fromTarget.find((e) => e.toLowerCase() === lower) || lower
+        );
+    }
+
+    const role = normalizeRole(assignment.targetRole);
+    if (role === 'site') {
+        const roles = Array.isArray(assignment.notifyRoles) && assignment.notifyRoles.length
+            ? assignment.notifyRoles.map(normalizeRole).filter(Boolean)
+            : ['coordinator', 'pi'];
+        const out = [];
+        const seen = new Set();
+        for (const r of roles) {
+            const email = await resolveRecipientEmail(getContainer, siteId, r);
+            const key = String(email || '').trim().toLowerCase();
+            if (!key || !key.includes('@') || seen.has(key)) continue;
+            seen.add(key);
+            out.push(String(email).trim());
+        }
+        return out;
+    }
+
+    const email = await resolveRecipientEmail(getContainer, siteId, role);
+    return email ? [email] : [];
 }
 
 function assignmentRequiresPassword(assignment) {
@@ -1431,54 +1481,79 @@ function registerSurveySecureRoutes(app, deps) {
                 const attachmentNames = attachmentMeta.map((a) => a.fileName);
 
                 for (const siteId of siteIds) {
-                    const siteName = await resolveSiteName(getContainer, siteId);
-                    for (const targetRole of targetRoles) {
+                    // HARD RULE: one assignment + one invite token per site.
+                    // Recipients are resolved only for this siteId — never cross-wired.
+                    const boundSiteId = String(siteId);
+                    const siteName = await resolveSiteName(getContainer, boundSiteId);
+
+                    const recipients = [];
+                    for (const role of targetRoles) {
                         const email =
-                            (body?.emailOverrides && body.emailOverrides[`${siteId}:${targetRole}`]) ||
-                            (await resolveRecipientEmail(getContainer, siteId, targetRole));
-
-                        const assignment = {
-                            id: generateId(),
-                            surveyId,
-                            siteId,
-                            targetRole,
-                            targetEmail: email || undefined,
-                            status: 'sent',
-                            allowResubmit: true,
-                            generalFeasibilityVariant,
-                            attachmentIds: attachmentIds.length ? attachmentIds : undefined,
-                            attachments: attachmentMeta.length ? attachmentMeta : undefined,
-                            emailCc: ccEmails.length ? ccEmails : undefined,
-                            emailSubject: customSubject || undefined,
-                            emailBodyTemplate: emailBodyTemplate || undefined,
-                            studyCode: studyCode || undefined,
-                            studyTitle: studyTitle || undefined,
-                            // Same hash on every assignment in this send — one password unlocks all links.
-                            passwordHash: invitePasswordHash || undefined,
-                            createdAt: now,
-                            updatedAt: now,
-                            lastSentAt: now,
-                            sendCount: 1,
-                            sentBy: operator,
-                        };
-                        const { raw, inviteUrl } = attachInviteToken(assignment, {
-                            expiresInDays,
-                            baseUrl,
+                            (body?.emailOverrides && body.emailOverrides[`${boundSiteId}:${role}`]) ||
+                            (await resolveRecipientEmail(getContainer, boundSiteId, role));
+                        recipients.push({
+                            siteId: boundSiteId,
+                            role,
+                            email: email ? String(email).trim() : '',
                         });
-                        // Close date in email = calendar day of link expiry (today + days).
-                        const closeDateLabel = formatInviteCloseDate(assignment.expiresAt);
-                        assignment.emailDueDate = closeDateLabel || undefined;
-                        if (validateSurveyAssignmentsSchema) {
-                            validateSurveyAssignmentsSchema(assignment);
-                        }
-                        await asgC.items.create(assignment);
+                    }
 
-                        let emailResult = { ok: false, mode: 'manual', error: 'skipped' };
-                        if (sendEmail && email) {
+                    const uniqueEmails = [];
+                    const seenEmail = new Set();
+                    for (const rec of recipients) {
+                        const key = String(rec.email || '').trim().toLowerCase();
+                        if (!key || !key.includes('@') || seenEmail.has(key)) continue;
+                        seenEmail.add(key);
+                        uniqueEmails.push(String(rec.email).trim());
+                    }
+
+                    const assignment = {
+                        id: generateId(),
+                        surveyId,
+                        siteId: boundSiteId,
+                        // Shared site invite — people at this site share one link.
+                        targetRole: 'site',
+                        notifyRoles: targetRoles.slice(),
+                        recipients,
+                        targetEmail: uniqueEmails.length ? uniqueEmails.join(', ') : undefined,
+                        status: 'sent',
+                        allowResubmit: true,
+                        generalFeasibilityVariant,
+                        attachmentIds: attachmentIds.length ? attachmentIds : undefined,
+                        attachments: attachmentMeta.length ? attachmentMeta : undefined,
+                        emailCc: ccEmails.length ? ccEmails : undefined,
+                        emailSubject: customSubject || undefined,
+                        emailBodyTemplate: emailBodyTemplate || undefined,
+                        studyCode: studyCode || undefined,
+                        studyTitle: studyTitle || undefined,
+                        // Same hash on every assignment in this send — one password unlocks all links.
+                        passwordHash: invitePasswordHash || undefined,
+                        createdAt: now,
+                        updatedAt: now,
+                        lastSentAt: now,
+                        sendCount: 1,
+                        sentBy: operator,
+                    };
+                    const { inviteUrl } = attachInviteToken(assignment, {
+                        expiresInDays,
+                        baseUrl,
+                    });
+                    // Close date in email = calendar day of link expiry (today + days).
+                    const closeDateLabel = formatInviteCloseDate(assignment.expiresAt);
+                    assignment.emailDueDate = closeDateLabel || undefined;
+                    if (validateSurveyAssignmentsSchema) {
+                        validateSurveyAssignmentsSchema(assignment);
+                    }
+                    await asgC.items.create(assignment);
+
+                    // Same inviteUrl for every contact at THIS site only.
+                    const emailDeliveries = [];
+                    if (sendEmail && uniqueEmails.length) {
+                        for (const email of uniqueEmails) {
                             const copy = inviteEmailCopy({
                                 siteName,
-                                roleLabel: roleLabel(targetRole),
-                                roleSubjectLabel: roleSubjectLabel(targetRole),
+                                roleLabel: roleLabel('site'),
+                                roleSubjectLabel: roleSubjectLabel('site'),
                                 inviteUrl,
                                 expiresAt: assignment.expiresAt,
                                 attachmentNames,
@@ -1489,7 +1564,7 @@ function registerSurveySecureRoutes(app, deps) {
                                 subjectOverride: customSubject,
                                 bodyOverride: emailBodyTemplate,
                             });
-                            emailResult = await deliverSurveyEmail({
+                            const emailResult = await deliverSurveyEmail({
                                 to: email,
                                 cc: ccEmails,
                                 subject: copy.subject,
@@ -1498,42 +1573,58 @@ function registerSurveySecureRoutes(app, deps) {
                                 attachments: emailFiles,
                                 meta: {
                                     assignmentId: assignment.id,
-                                    siteId,
+                                    siteId: boundSiteId,
                                     surveyId,
-                                    targetRole,
+                                    targetRole: 'site',
                                 },
                             });
-                        } else if (!email) {
-                            emailResult = { ok: false, mode: 'manual', error: 'missing_recipient' };
+                            emailDeliveries.push({ to: email, ...emailResult });
                         }
-
-                        await writeNotification(deps, {
-                            kind: 'survey_sent',
-                            assignmentId: assignment.id,
-                            surveyId,
-                            siteId,
-                            siteName,
-                            surveyTitle: definition.title,
-                            targetRole,
-                            targetEmail: email || null,
-                            emailMode: emailResult.mode,
-                            emailOk: !!emailResult.ok,
-                            summary: `Sent · ${siteName} · ${roleLabel(targetRole)}`,
-                            operator,
+                    } else if (!uniqueEmails.length) {
+                        emailDeliveries.push({
+                            to: null,
+                            ok: false,
+                            mode: 'manual',
+                            error: 'missing_recipient',
                         });
-
-                        results.push({
-                            assignmentId: assignment.id,
-                            siteId,
-                            siteName,
-                            targetRole,
-                            targetEmail: email || null,
-                            inviteUrl,
-                            tokenPrefix: assignment.tokenPrefix,
-                            expiresAt: assignment.expiresAt,
-                            email: emailResult,
-                        });
+                    } else {
+                        emailDeliveries.push({ ok: false, mode: 'manual', error: 'skipped' });
                     }
+
+                    const anyOk = emailDeliveries.some((d) => d.ok);
+                    const primaryDelivery = emailDeliveries.find((d) => d.ok)
+                        || emailDeliveries[0]
+                        || { ok: false, mode: 'manual', error: 'skipped' };
+
+                    await writeNotification(deps, {
+                        kind: 'survey_sent',
+                        assignmentId: assignment.id,
+                        surveyId,
+                        siteId: boundSiteId,
+                        siteName,
+                        surveyTitle: definition.title,
+                        targetRole: 'site',
+                        targetEmail: uniqueEmails.join(', ') || null,
+                        emailMode: primaryDelivery.mode,
+                        emailOk: !!anyOk,
+                        summary: `Sent · ${siteName} · shared site link · ${uniqueEmails.length || 0} email(s)`,
+                        operator,
+                    });
+
+                    results.push({
+                        assignmentId: assignment.id,
+                        siteId: boundSiteId,
+                        siteName,
+                        targetRole: 'site',
+                        notifyRoles: targetRoles.slice(),
+                        recipients,
+                        targetEmail: uniqueEmails.join(', ') || null,
+                        inviteUrl,
+                        tokenPrefix: assignment.tokenPrefix,
+                        expiresAt: assignment.expiresAt,
+                        email: primaryDelivery,
+                        emailDeliveries,
+                    });
                 }
 
                 return {
@@ -1597,12 +1688,16 @@ function registerSurveySecureRoutes(app, deps) {
         await getContainer(ASSIGNMENTS).items.upsert(assignment);
 
         const siteName = await resolveSiteName(getContainer, assignment.siteId);
-        const email = assignment.targetEmail ||
-            (await resolveRecipientEmail(getContainer, assignment.siteId, assignment.targetRole));
+        // Contacts for THIS assignment.siteId only — never another site.
+        const emails = await resolveAssignmentEmails(getContainer, assignment);
 
-        let emailResult = { ok: false, mode: 'manual' };
-        if (body.sendEmail !== false && email) {
-            assignment.targetEmail = email;
+        let emailResult = {
+            ok: false,
+            mode: 'manual',
+            error: emails.length ? 'skipped' : 'missing_recipient',
+        };
+        if (body.sendEmail !== false && emails.length) {
+            assignment.targetEmail = emails.join(', ');
             const resendCc = parseCcList(body?.cc || assignment.emailCc || '');
             const resendSubject = String(
                 body?.subject || (reminder ? '' : assignment.emailSubject) || ''
@@ -1640,24 +1735,28 @@ function registerSurveySecureRoutes(app, deps) {
             const copy = reminder
                 ? reminderInviteCopy(copyOpts)
                 : inviteEmailCopy(copyOpts);
-            emailResult = await deliverSurveyEmail({
-                to: email,
-                cc: resendCc,
-                subject: copy.subject,
-                text: copy.text,
-                html: copy.html,
-                attachments: resendFiles,
-                meta: {
-                    assignmentId: assignment.id,
-                    resend: !reminder,
-                    reminder: !!reminder,
-                    statusKind,
-                },
-            });
-            await getContainer(ASSIGNMENTS).items.upsert({
-                ...assignment,
-                targetEmail: email,
-            });
+            const emailDeliveries = [];
+            for (const email of emails) {
+                const one = await deliverSurveyEmail({
+                    to: email,
+                    cc: resendCc,
+                    subject: copy.subject,
+                    text: copy.text,
+                    html: copy.html,
+                    attachments: resendFiles,
+                    meta: {
+                        assignmentId: assignment.id,
+                        siteId: assignment.siteId,
+                        resend: !reminder,
+                        reminder: !!reminder,
+                        statusKind,
+                    },
+                });
+                emailDeliveries.push({ to: email, ...one });
+            }
+            emailResult = emailDeliveries.find((d) => d.ok) || emailDeliveries[0] || emailResult;
+            emailResult.deliveries = emailDeliveries;
+            await getContainer(ASSIGNMENTS).items.upsert(assignment);
         }
 
         return {
@@ -1667,7 +1766,7 @@ function registerSurveySecureRoutes(app, deps) {
             statusKind,
             assignment: redactAssignment(assignment),
             inviteUrl,
-            targetEmail: email || null,
+            targetEmail: emails.join(', ') || null,
             email: emailResult,
         };
     };

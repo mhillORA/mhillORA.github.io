@@ -2523,6 +2523,7 @@
             const r = String(role || '').trim().toLowerCase();
             if (r === 'pi') return 'PI';
             if (r === 'coordinator') return 'Primary contact';
+            if (r === 'site') return 'Site (shared)';
             return String(role || '').trim() || 'role';
         };
 
@@ -9038,9 +9039,10 @@
                                     </div>
                                     <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
                                         <fieldset>
-                                            <legend class="text-sm font-medium text-gray-700 dark:text-gray-300">Roles</legend>
+                                            <legend class="text-sm font-medium text-gray-700 dark:text-gray-300">Who to email</legend>
                                             <label class="mt-2 flex items-center gap-2 text-sm"><input type="checkbox" name="role_coordinator" value="coordinator" checked /> Primary contact</label>
                                             <label class="mt-1 flex items-center gap-2 text-sm"><input type="checkbox" name="role_pi" value="pi" /> PI</label>
+                                            <p class="mt-2 text-[11px] text-gray-500 dark:text-gray-400">One unique link per site. Checked people at that site share the same link — never mixed across sites.</p>
                                         </fieldset>
                                         <div>
                                             <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Link expires (days)</label>
@@ -9383,7 +9385,7 @@
         };
 
         /**
-         * Pre-send confirmation: list every site × role with contact name + email.
+         * Pre-send confirmation: one unique link per site; list everyone who gets that site's link.
          * Overlay on top of the send form (form stays mounted). Returns true to proceed.
          */
         const confirmSurveySendRecipients = ({ surveyTitle, siteIds, targetRoles, sendEmail }) => {
@@ -9391,64 +9393,78 @@
                 ? buildUnifiedSitesCatalog()
                 : (allSites || []);
             const byId = new Map((catalog || []).filter(Boolean).map((s) => [s.id, s]));
-            const rows = [];
+            const siteBlocks = [];
+            let contactRows = 0;
+            let missing = 0;
             for (const siteId of siteIds) {
                 const site = byId.get(siteId) || (allSites || []).find((s) => s && s.id === siteId);
                 const siteName = site?.name || siteId;
+                const contacts = [];
+                const seenEmail = new Set();
                 for (const role of targetRoles) {
                     const { name, email } = surveySendContactForSite(site, role);
-                    rows.push({
-                        siteId,
-                        siteName,
+                    const key = String(email || '').trim().toLowerCase();
+                    if (key && seenEmail.has(key)) continue;
+                    if (key) seenEmail.add(key);
+                    contacts.push({
                         role,
                         roleLabel: formatSiteSurveyRoleLabel(role),
                         contactName: name || '—',
                         email: email || '',
                         ok: !!email,
                     });
+                    contactRows += 1;
+                    if (!email) missing += 1;
                 }
+                siteBlocks.push({ siteId, siteName, contacts });
             }
-            const missing = rows.filter((r) => !r.ok).length;
             const willEmail = !!sendEmail;
+            const linkCount = siteBlocks.length;
 
             return new Promise((resolve) => {
                 const overlay = document.createElement('div');
                 overlay.className = 'modal-backdrop';
                 overlay.setAttribute('data-survey-send-confirm', '1');
                 overlay.style.cssText = 'position:fixed;inset:0;z-index:10050;display:flex;align-items:center;justify-content:center;background:rgba(15,23,42,0.55);padding:16px;';
-                const tableRows = rows.map((r) => `
-                    <tr class="border-t border-gray-100 dark:border-gray-700 ${r.ok ? '' : 'bg-amber-50/80 dark:bg-amber-900/20'}">
-                        <td class="py-2 pr-3 text-sm font-medium text-gray-900 dark:text-gray-100">${escapeHtml(r.siteName)}</td>
-                        <td class="py-2 pr-3 text-sm text-gray-600 dark:text-gray-300">${escapeHtml(r.roleLabel)}</td>
-                        <td class="py-2 pr-3 text-sm text-gray-800 dark:text-gray-100">${escapeHtml(r.contactName)}</td>
-                        <td class="py-2 pr-3 text-sm ${r.ok ? 'text-gray-700 dark:text-gray-200' : 'text-amber-800 dark:text-amber-200 font-medium'}">${escapeHtml(r.email || 'No email on file')}</td>
-                    </tr>`).join('');
+                const tableRows = siteBlocks.map((block) => {
+                    const contactHtml = block.contacts.map((r) => `
+                        <div class="flex flex-wrap gap-x-3 gap-y-0.5 text-sm ${r.ok ? '' : 'text-amber-800 dark:text-amber-200'}">
+                            <span class="text-gray-500 dark:text-gray-400 w-28 shrink-0">${escapeHtml(r.roleLabel)}</span>
+                            <span class="text-gray-800 dark:text-gray-100">${escapeHtml(r.contactName)}</span>
+                            <span class="${r.ok ? 'text-gray-700 dark:text-gray-200' : 'font-medium'}">${escapeHtml(r.email || 'No email on file')}</span>
+                        </div>`).join('');
+                    return `
+                    <tr class="border-t border-gray-100 dark:border-gray-700 align-top">
+                        <td class="py-2.5 pr-3 text-sm font-medium text-gray-900 dark:text-gray-100">${escapeHtml(block.siteName)}</td>
+                        <td class="py-2.5 pr-3 space-y-1">${contactHtml || '<span class="text-sm text-gray-500">No contacts</span>'}</td>
+                        <td class="py-2.5 pr-3 text-xs font-semibold text-indigo-700 dark:text-indigo-300 whitespace-nowrap">1 unique link</td>
+                    </tr>`;
+                }).join('');
                 overlay.innerHTML = `
-                    <div class="modal-content dark:bg-gray-800 rounded-lg shadow-xl w-full" style="max-width: 40rem; max-height: min(90vh, 36rem); display:flex; flex-direction:column;">
+                    <div class="modal-content dark:bg-gray-800 rounded-lg shadow-xl w-full" style="max-width: 42rem; max-height: min(90vh, 36rem); display:flex; flex-direction:column;">
                         <div class="p-5 space-y-3 overflow-y-auto flex-1 min-h-0">
                             <div>
                                 <h2 class="text-lg font-bold text-gray-900 dark:text-gray-100">Confirm recipients</h2>
                                 <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">
-                                    About to ${willEmail ? 'email' : 'create links for'}
-                                    <strong>${rows.length}</strong> invite${rows.length === 1 ? '' : 's'} for
-                                    <strong>${escapeHtml(surveyTitle || 'this survey')}</strong>.
-                                    Review each site and contact before sending.
+                                    <strong>${linkCount}</strong> unique site link${linkCount === 1 ? '' : 's'} for
+                                    <strong>${escapeHtml(surveyTitle || 'this survey')}</strong>
+                                    ${willEmail ? ` · ${contactRows} email${contactRows === 1 ? '' : 's'}` : ''}.
+                                    People at the same site share that site’s link. Sites never share links.
                                 </p>
                                 ${missing
-                                    ? `<p class="mt-2 text-xs text-amber-800 dark:text-amber-200 rounded-md border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/30 px-3 py-2">${missing} missing email${missing === 1 ? '' : 's'} — ${willEmail ? 'those will get a link created but no email' : 'links still created; copy after send'}.</p>`
-                                    : `<p class="mt-2 text-xs text-emerald-700 dark:text-emerald-300">Every selected site has an email on file for the chosen role${targetRoles.length > 1 ? 's' : ''}.</p>`}
+                                    ? `<p class="mt-2 text-xs text-amber-800 dark:text-amber-200 rounded-md border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/30 px-3 py-2">${missing} missing email${missing === 1 ? '' : 's'} — site link still created; ${willEmail ? 'no email for those contacts' : 'copy after send'}.</p>`
+                                    : `<p class="mt-2 text-xs text-emerald-700 dark:text-emerald-300">Every listed contact has an email. One link per site — no cross-site wiring.</p>`}
                             </div>
                             <div class="overflow-x-auto rounded-md border border-gray-200 dark:border-gray-600">
                                 <table class="min-w-full text-left">
                                     <thead class="text-[10px] uppercase tracking-wide text-gray-500 bg-gray-50 dark:bg-gray-900/40">
                                         <tr>
                                             <th class="py-2 px-3">Site</th>
-                                            <th class="py-2 px-3">Role</th>
-                                            <th class="py-2 px-3">Contact</th>
-                                            <th class="py-2 px-3">Email</th>
+                                            <th class="py-2 px-3">Contacts (same link)</th>
+                                            <th class="py-2 px-3">Invite</th>
                                         </tr>
                                     </thead>
-                                    <tbody>${tableRows || '<tr><td class="py-3 px-3 text-sm text-gray-500" colspan="4">No recipients</td></tr>'}</tbody>
+                                    <tbody>${tableRows || '<tr><td class="py-3 px-3 text-sm text-gray-500" colspan="3">No recipients</td></tr>'}</tbody>
                                 </table>
                             </div>
                         </div>
@@ -9483,6 +9499,15 @@
                 || (provider.modes && provider.modes.length > 0)
                 || results.some((r) => r.email?.mode && r.email.mode !== 'manual' && r.email.mode !== 'none');
             const deliveryLabel = (r) => {
+                const deliveries = Array.isArray(r.emailDeliveries) ? r.emailDeliveries : null;
+                if (deliveries && deliveries.length) {
+                    const ok = deliveries.filter((d) => d.ok).length;
+                    if (ok) return `Sent ${ok}/${deliveries.length}`;
+                    const err = deliveries.find((d) => d.error)?.error;
+                    if (err === 'missing_recipient') return 'No email on site';
+                    if (err === 'no_email_provider') return 'Not configured — copy link';
+                    if (err) return err;
+                }
                 if (r.email?.ok) return `Sent (${r.email.mode})`;
                 if (r.email?.error === 'missing_recipient') return 'No email on site';
                 if (r.email?.error === 'no_email_provider') return 'Not configured — copy link';
@@ -9493,7 +9518,7 @@
                 <tr class="border-t border-gray-100 dark:border-gray-700">
                     <td class="py-2 pr-3 text-sm">${escapeHtml(r.siteName || r.siteId)}</td>
                     <td class="py-2 pr-3 text-sm">${escapeHtml(formatSiteSurveyRoleLabel(r.targetRole))}</td>
-                    <td class="py-2 pr-3 text-sm truncate max-w-[10rem]">${escapeHtml(r.targetEmail || '—')}</td>
+                    <td class="py-2 pr-3 text-sm truncate max-w-[14rem]" title="${escapeHtml(r.targetEmail || '')}">${escapeHtml(r.targetEmail || '—')}</td>
                     <td class="py-2 pr-3 text-xs">${escapeHtml(deliveryLabel(r))}</td>
                     <td class="py-2">
                         <button type="button" class="copy-site-survey-link-btn text-indigo-600 dark:text-indigo-400 text-sm hover:underline" data-url="${escapeHtml(r.inviteUrl || '')}">Copy link</button>
