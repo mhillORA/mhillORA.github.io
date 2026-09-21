@@ -7,9 +7,11 @@
  *
  * Contract:
  *   name / institution_name  → site label (never an address)
- *   address1                 → street line only
+ *   address1                 → full street line (house # + street name)
+ *   address2                 → unit / suite only (not the street name)
  *   city / state / zip       → locality parts
  *   address                  → legacy composite; fill gaps only, never over address1
+ *   phones                   → NANP 555-555-5555 (optional " x ####")
  */
 
 function trimStr(v) {
@@ -20,19 +22,59 @@ function normKey(v) {
     return trimStr(v).toLowerCase().replace(/[^a-z0-9]+/g, '');
 }
 
+/** Bare house number mistakenly stored alone in address1 (e.g. "2780", "1201"). */
+function looksLikeHouseNumberOnly(v) {
+    return /^\d{1,6}[A-Za-z]?$/.test(trimStr(v));
+}
+
+/** Unit / suite line that belongs on address2. */
+function looksLikeUnitLine(v) {
+    return /^(suite|ste\.?|apt\.?|apartment|unit|#|bldg\.?|building|floor|fl\.?)\b/i.test(trimStr(v));
+}
+
 function looksLikeStreet(v) {
     const s = trimStr(v);
     if (!s) return false;
+    // House number alone is incomplete — not a usable street line
+    if (looksLikeHouseNumberOnly(s)) return false;
     if (/\d/.test(s)) return true;
     return /\b(st|street|ave|avenue|rd|road|blvd|drive|dr|ln|lane|way|ct|court|suite|ste|hwy|highway|pkwy|parkway)\b/i.test(
         s
     );
 }
 
+/**
+ * Normalize US-ish phone to 555-555-5555. Keeps extension as " x 1234".
+ * Non-10-digit values are cleaned of Excel junk but otherwise left alone.
+ */
+function normalizePhone(raw) {
+    let s = trimStr(raw);
+    if (!s) return '';
+    s = s.replace(/_x000[dD]_/g, '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!s) return '';
+
+    let ext = '';
+    const extM = s.match(/(?:ext\.?|extension|x)\s*[:.]?\s*(\d{1,8})\s*$/i);
+    if (extM) {
+        ext = extM[1];
+        s = s.slice(0, extM.index).trim().replace(/[,\s;/-]+$/, '');
+    }
+
+    const digits = s.replace(/\D/g, '');
+    let d = digits;
+    if (d.length === 11 && d.startsWith('1')) d = d.slice(1);
+    if (d.length !== 10) {
+        const cleaned = trimStr(raw).replace(/_x000[dD]_/gi, '').replace(/\s+/g, ' ').trim();
+        return ext && !/\bx\s*\d/i.test(cleaned) ? `${cleaned} x ${ext}` : cleaned;
+    }
+    const formatted = `${d.slice(0, 3)}-${d.slice(3, 6)}-${d.slice(6)}`;
+    return ext ? `${formatted} x ${ext}` : formatted;
+}
+
 /** City-only or non-street placeholder wrongly stored in address1. */
 function looksLikeCityOnly(v) {
     const s = trimStr(v);
-    if (!s || looksLikeStreet(s)) return false;
+    if (!s || looksLikeStreet(s) || looksLikeHouseNumberOnly(s)) return false;
     if (s.includes('@')) return false;
     // single/multi-word place name, no digits
     if (/\d/.test(s)) return false;
@@ -65,9 +107,20 @@ function parseCompositeAddress(blob) {
         }
     } else if (raw.includes(',')) {
         const parts = raw.split(',').map((p) => p.trim()).filter(Boolean);
-        if (parts.length >= 2 && !looksLikeStreet(parts[parts.length - 1])) {
+        if (
+            parts.length >= 2
+            && !looksLikeStreet(parts[parts.length - 1])
+            && !looksLikeHouseNumberOnly(parts[parts.length - 1])
+        ) {
             city = parts[parts.length - 1];
             street = parts.slice(0, -1).join(', ');
+        }
+    }
+    // "1201, Summit Ave" → join house + street when first part is house-number-only
+    if (street.includes(',')) {
+        const bits = street.split(',').map((p) => p.trim()).filter(Boolean);
+        if (bits.length >= 2 && looksLikeHouseNumberOnly(bits[0]) && !looksLikeUnitLine(bits[1])) {
+            street = `${bits[0]} ${bits.slice(1).join(', ')}`.replace(/\s+/g, ' ').trim();
         }
     }
     return { street: trimStr(street), city: trimStr(city), state, zip };
@@ -82,11 +135,16 @@ function normalizeSiteFields(site) {
         return {
             name: '',
             address1: '',
+            address2: '',
             address: '',
             city: '',
             state: '',
             zip: '',
             zipCode: '',
+            phone: '',
+            piPhone: '',
+            siteCoordinatorPhone: '',
+            contractsPhone: '',
             pi: '',
             piFirstName: '',
             piLastName: '',
@@ -102,6 +160,7 @@ function normalizeSiteFields(site) {
 
     let name = trimStr(site.name || site.institution_name || site.siteName || site.practice_name || '');
     let address1 = trimStr(site.address1 || site.streetAddress || site.street || site.address_street || '');
+    let address2 = trimStr(site.address2 || site.streetAddress2 || site.address_line_2 || '');
     let address = trimStr(site.address || site.address_raw || site.mailingAddress || '');
     let city = trimStr(site.city || site.address_city || '');
     let state = trimStr(site.state || site.address_state || '');
@@ -127,6 +186,12 @@ function normalizeSiteFields(site) {
     const pi3Name = pi3Parsed.display;
     const pi3Email = trimStr(site.pi3Email || '');
 
+    // House # on line 1 + street name on line 2 → one street line (keep suite/unit on line 2)
+    if (looksLikeHouseNumberOnly(address1) && address2 && !looksLikeUnitLine(address2)) {
+        address1 = `${address1} ${address2}`.replace(/\s+/g, ' ').trim();
+        address2 = '';
+    }
+
     // City wrongly stored as address1 (e.g. "San Antonio")
     if (address1 && looksLikeCityOnly(address1) && !city) {
         city = address1;
@@ -136,10 +201,10 @@ function normalizeSiteFields(site) {
     }
 
     // Prefer real street; fall back to composite `address` only when address1 empty/useless
-    if (!address1 || !looksLikeStreet(address1)) {
-        if (address && looksLikeStreet(address) && normKey(address) !== normKey(name)) {
+    if (!address1 || !looksLikeStreet(address1) || looksLikeHouseNumberOnly(address1)) {
+        if (address && (looksLikeStreet(address) || address.includes(',')) && normKey(address) !== normKey(name)) {
             const parsed = parseCompositeAddress(address);
-            if (parsed.street) address1 = parsed.street;
+            if (parsed.street && looksLikeStreet(parsed.street)) address1 = parsed.street;
             if (!city && parsed.city) city = parsed.city;
             if (!state && parsed.state) state = parsed.state;
             if (!zip && parsed.zip) zip = parsed.zip;
@@ -167,9 +232,16 @@ function normalizeSiteFields(site) {
             if (!state && parsed.state) state = parsed.state;
             if (!zip && parsed.zip) zip = parsed.zip;
         } else {
-            // "800 SW 39th Street Sun City" — last capitalized multi-word without digits as city
+            // "800 SW 39th Street Sun City" — last capitalized multi-word without digits as city.
+            // Do NOT treat street-type words or directional street remnants as city.
             const m = address1.match(/^(.*\d.*)\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)$/);
-            if (m && looksLikeStreet(m[1]) && !looksLikeStreet(m[2])) {
+            if (
+                m
+                && looksLikeStreet(m[1])
+                && !looksLikeStreet(m[2])
+                && !looksLikeHouseNumberOnly(m[1])
+                && !/^(N|S|E|W|NE|NW|SE|SW)$/i.test(String(m[2]).split(/\s+/)[0] || '')
+            ) {
                 address1 = trimStr(m[1]);
                 city = trimStr(m[2]);
             }
@@ -197,11 +269,20 @@ function normalizeSiteFields(site) {
     return {
         name: name || trimStr(site.id || ''),
         address1,
+        address2,
         address,
         city,
         state,
         zip,
         zipCode: zip,
+        phone: normalizePhone(site.phone || site.sitePhone || site.mainPhone || ''),
+        piPhone: normalizePhone(site.piPhone || site.pi_phone || ''),
+        siteCoordinatorPhone: normalizePhone(
+            site.siteCoordinatorPhone || site.coordinatorPhone || ''
+        ),
+        contractsPhone: normalizePhone(
+            site.contractsPhone || site.contractContactPhone || site.budgetContactPhone || ''
+        ),
         pi,
         piFirstName,
         piLastName,
@@ -332,7 +413,10 @@ function personNameMatchesEmail(displayName, email) {
 
 module.exports = {
     looksLikeStreet,
+    looksLikeHouseNumberOnly,
+    looksLikeUnitLine,
     looksLikeCityOnly,
+    normalizePhone,
     parseCompositeAddress,
     normalizeSiteFields,
     resolveStreetAddress,

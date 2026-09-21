@@ -129,28 +129,32 @@ function buildSiteRecordPrefill(questions, site, { coordinatorStaff = null, piSt
     if (!site || typeof site !== 'object') return map;
     const coord = coordinatorStaff && typeof coordinatorStaff === 'object' ? coordinatorStaff : {};
     const pi = piStaff && typeof piStaff === 'object' ? piStaff : {};
-    const { siteAddressPrefill, siteNamePrefill, normalizeSiteFields, formatPersonNameFirstLast, personNameMatchesEmail } = require('./site-field-map');
+    const { siteAddressPrefill, siteNamePrefill, normalizeSiteFields, formatPersonNameFirstLast, personNameMatchesEmail, normalizePhone } = require('./site-field-map');
     const normalized = normalizeSiteFields(site);
 
     const byLib = {
         'ql-coord-name': formatPersonNameFirstLast(normalized.siteCoordinator || coord.name || ''),
         'ql-coord-email': normalized.siteCoordinatorEmail || coord.email || '',
-        'ql-coord-phone': site.siteCoordinatorPhone || coord.phone || coord.phoneNumber || '',
+        'ql-coord-phone': normalized.siteCoordinatorPhone
+            || normalizePhone(coord.phone || coord.phoneNumber || ''),
         'ql-coord-title': coord.title || 'Study Coordinator',
         'ql-primary-contact-role': coord.title || 'Study Coordinator',
         'ql-site-name': siteNamePrefill(site) || '',
         'ql-site-address': siteAddressPrefill(site) || '',
-        'ql-site-phone': site.phone || site.sitePhone || site.mainPhone || '',
+        'ql-site-phone': normalized.phone || '',
         'ql-pi-name': formatPersonNameFirstLast(normalized.pi || pi.name || '', {
             firstName: normalized.piFirstName || pi.firstName || '',
             lastName: normalized.piLastName || pi.lastName || '',
         }),
         'ql-pi-email': normalized.piEmail || pi.email || '',
-        'ql-pi-phone': site.piPhone || site.pi_phone || pi.phone || pi.phoneNumber || site.phone || '',
+        'ql-pi-phone': normalized.piPhone
+            || normalizePhone(pi.phone || pi.phoneNumber || '')
+            || normalized.phone
+            || '',
         'ql-contracts-name': formatPersonNameFirstLast(site.contractsName || site.contractContactName || site.budgetContactName || ''),
         'ql-contracts-email': site.contractsEmail || site.contractContactEmail || site.budgetContactEmail || '',
-        'ql-contracts-phone': site.contractsPhone || site.contractContactPhone || site.budgetContactPhone || '',
-        'ql-gsf_092_contracting-budgeting-contact-phone-number': site.contractsPhone || site.contractContactPhone || site.budgetContactPhone || '',
+        'ql-contracts-phone': normalized.contractsPhone || '',
+        'ql-gsf_092_contracting-budgeting-contact-phone-number': normalized.contractsPhone || '',
         'ql-gf-00-name': '', // respondent — leave blank
     };
 
