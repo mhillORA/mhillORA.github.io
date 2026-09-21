@@ -31,6 +31,38 @@ function looksLikeUnitLine(v) {
     return /^(suite|ste\.?|apt\.?|apartment|unit|#|bldg\.?|building|floor|fl\.?)\b/i.test(trimStr(v));
 }
 
+/**
+ * Detect suite/unit token at a word boundary so "Ste"≠"Stetson", "Fl"≠"Flagler".
+ * Group 1 = street remnant, group 2 = unit line.
+ */
+const EMBEDDED_UNIT_RE =
+    /^(.*?)\s*[, ]+\s*((?:suite|ste\.?|apt\.?|apartment|unit|bldg\.?|building|floor|fl\.?|#)\b\s*.+)$/i;
+
+/**
+ * If line 1 embeds a suite/unit and line 2 is empty, peel it onto address2.
+ * Leaves address1/address2 alone when line 2 is already set.
+ */
+function splitStreetAndUnit(line1, line2 = '') {
+    let a1 = trimStr(line1);
+    let a2 = trimStr(line2);
+    if (!a1 || a2) return { address1: a1, address2: a2 };
+    const m = a1.match(EMBEDDED_UNIT_RE);
+    if (m) {
+        const street = trimStr(m[1]).replace(/[,\s-]+$/, '');
+        const unit = trimStr(m[2]);
+        // Need a real street remnant (digits + more than house# + direction alone)
+        if (
+            street &&
+            unit &&
+            looksLikeStreet(street) &&
+            !/^\d{1,6}[A-Za-z]?\s+[NSEW]$/i.test(street)
+        ) {
+            return { address1: street, address2: unit };
+        }
+    }
+    return { address1: a1, address2: a2 };
+}
+
 function looksLikeStreet(v) {
     const s = trimStr(v);
     if (!s) return false;
@@ -160,6 +192,8 @@ function normalizeSiteFields(site) {
     let name = trimStr(site.name || site.institution_name || site.siteName || site.practice_name || '');
     let address1 = trimStr(site.address1 || site.streetAddress || site.street || site.address_street || '');
     let address2 = trimStr(site.address2 || site.streetAddress2 || site.address_line_2 || '');
+    // One-time style cleanup: "9001 Wilshire Blvd, Suite 301" → line1 + line2
+    ({ address1, address2 } = splitStreetAndUnit(address1, address2));
     let address = trimStr(site.address || site.address_raw || site.mailingAddress || '');
     let city = trimStr(site.city || site.address_city || '');
     let state = trimStr(site.state || site.address_state || '');
@@ -325,9 +359,10 @@ function uniqueInvestigatorNames(site) {
     return out;
 }
 
-/** Prefill for ql-site-address: street only (not city/state blob, not institution). */
+/** Prefill for ql-site-address: street + suite (joined) for the single survey field. */
 function siteAddressPrefill(site) {
-    return resolveStreetAddress(site);
+    const n = normalizeSiteFields(site);
+    return [n.address1, n.address2].filter(Boolean).join(', ');
 }
 
 function siteNamePrefill(site) {
@@ -411,6 +446,7 @@ module.exports = {
     looksLikeUnitLine,
     looksLikeCityOnly,
     normalizePhone,
+    splitStreetAndUnit,
     parseCompositeAddress,
     normalizeSiteFields,
     resolveStreetAddress,

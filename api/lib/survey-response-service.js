@@ -824,7 +824,7 @@ async function resolvePublicSurveyQuestions(getContainer, definition, opts = {})
  */
 async function applySiteSubmittedFieldsToSite(getContainer, siteId, answers) {
     if (!siteId || !Array.isArray(answers) || !answers.length) return null;
-    const { normalizePhone } = require('./site-field-map');
+    const { normalizePhone, splitStreetAndUnit } = require('./site-field-map');
 
     const byLib = new Map();
     for (const a of answers) {
@@ -852,9 +852,10 @@ async function applySiteSubmittedFieldsToSite(getContainer, siteId, answers) {
     const patch = {};
     const street = pick('ql-site-address', 'gf_03_address', 'q_002_address');
     if (street) {
-        // Single survey address field → address1 only; leave address2 alone
-        patch.address1 = street;
-        patch.address = street;
+        const parts = splitStreetAndUnit(street, '');
+        patch.address1 = parts.address1;
+        if (parts.address2) patch.address2 = parts.address2;
+        patch.address = parts.address1;
     }
     const sitePhone = pick('ql-site-phone', 'gf_04_phone', 'q_003_phone');
     if (sitePhone) {
