@@ -1208,6 +1208,36 @@
                 });
             }
 
+            /** Soft-merge absorb into primary live site (never hard-deletes). */
+            async mergeSites(payload = {}) {
+                let operator = 'unknown';
+                try {
+                    const raw = sessionStorage.getItem('artemis.session.user');
+                    const u = raw ? JSON.parse(raw) : null;
+                    if (u?.username) operator = u.username;
+                } catch (_) {}
+                return this.request('/sites/merge', {
+                    method: 'POST',
+                    headers: this.privacyHeaders(),
+                    body: JSON.stringify({ ...payload, operator })
+                });
+            }
+
+            /** Graduate unlinked master-list rows into live sites (link or create stub). */
+            async graduateLegacySites(payload = {}) {
+                let operator = 'unknown';
+                try {
+                    const raw = sessionStorage.getItem('artemis.session.user');
+                    const u = raw ? JSON.parse(raw) : null;
+                    if (u?.username) operator = u.username;
+                } catch (_) {}
+                return this.request('/sites/graduate-legacy', {
+                    method: 'POST',
+                    headers: this.privacyHeaders(),
+                    body: JSON.stringify({ ...payload, operator })
+                });
+            }
+
             async getSiteSurveyNotifications({ unreadOnly = false } = {}) {
                 const q = unreadOnly ? '?unread=1' : '';
                 return this.request(`/site-survey-notifications${q}`);
@@ -1267,6 +1297,39 @@
                     updated += 1;
                 }
                 return { ok: true, updated };
+            }
+
+            /**
+             * Recalculate score from current template + stored answers.
+             * Server only writes score fields — never answers / survey / assignment.
+             */
+            async rescoreSiteSurveyResponse(responseId) {
+                let operator = 'unknown';
+                try {
+                    const raw = sessionStorage.getItem('artemis.session.user');
+                    const u = raw ? JSON.parse(raw) : null;
+                    if (u?.username) operator = u.username;
+                } catch (_) {}
+                return this.request(`/site-survey-responses/${encodeURIComponent(responseId)}/rescore`, {
+                    method: 'POST',
+                    headers: this.privacyHeaders(),
+                    body: JSON.stringify({ operator })
+                });
+            }
+
+            /** Rescore every live response for a survey definition (answers untouched). */
+            async rescoreSiteSurveyDefinitionResponses(surveyId, { dryRun = false } = {}) {
+                let operator = 'unknown';
+                try {
+                    const raw = sessionStorage.getItem('artemis.session.user');
+                    const u = raw ? JSON.parse(raw) : null;
+                    if (u?.username) operator = u.username;
+                } catch (_) {}
+                return this.request(`/site-survey-definitions/${encodeURIComponent(surveyId)}/rescore-responses`, {
+                    method: 'POST',
+                    headers: this.privacyHeaders(),
+                    body: JSON.stringify({ operator, dryRun })
+                });
             }
 
             privacyHeaders() {
@@ -2547,77 +2610,119 @@
         };
 
         /**
-         * Auto Site Identifier from site name (+ optional city).
-         * Matches Ora style: acronym from org words, location in parentheses when present
-         * (e.g. "North East Eye Research Associates - Woburn" → "NEERA (Woburn)").
-         * Always unique vs existing identifiers.
+         * Auto Site Identifier — human-readable; never overwrite an existing stored code.
+         * Style: "{Short name}, {City} {Street}" e.g. "Andover Eye, Andover Brickstone"
+         * Uniqueness: Street → City → ST/ZIP → short random (never bare -2/-3).
          */
-        const suggestSiteIdentifier = (name, { city = '', excludeSiteId = '' } = {}) => {
-            const LEGAL = new Set([
+        const suggestSiteIdentifier = (name, {
+            city = '',
+            state = '',
+            zip = '',
+            address1 = '',
+            excludeSiteId = '',
+        } = {}) => {
+            const STOP = new Set([
                 'a', 'an', 'and', 'at', 'for', 'in', 'of', 'on', 'the', 'to',
                 'llc', 'llp', 'inc', 'incorporated', 'ltd', 'limited', 'pllc', 'pc', 'pa', 'dba',
+                'associates', 'assoc', 'association', 'group', 'partners',
             ]);
+            const STREET_SKIP = new Set([
+                'n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw', 'north', 'south', 'east', 'west',
+                'st', 'street', 'ave', 'avenue', 'rd', 'road', 'dr', 'drive', 'blvd', 'boulevard',
+                'ln', 'lane', 'ct', 'court', 'pl', 'place', 'way', 'pkwy', 'parkway', 'hwy', 'highway',
+                'sq', 'square', 'cir', 'circle', 'ter', 'terrace', 'trl', 'trail', 'ste', 'suite',
+                'unit', 'apt', 'apartment', 'fl', 'floor', 'bldg', 'building',
+            ]);
+
+            const titleCase = (s) => String(s || '')
+                .split(/\s+/)
+                .filter(Boolean)
+                .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+                .join(' ');
+
             const raw = String(name || '').trim();
             if (!raw) return '';
 
-            // "Org Name - City" → keep location out of the acronym
             let primary = raw;
-            let locFromName = '';
             const dashSplit = raw.split(/\s+[-–—]\s+/);
             if (dashSplit.length >= 2) {
                 primary = dashSplit.slice(0, -1).join(' - ').trim();
-                locFromName = dashSplit[dashSplit.length - 1].trim();
             }
 
             const words = primary
                 .replace(/[()[\],./\\]+/g, ' ')
                 .split(/\s+/)
                 .map((w) => w.trim())
-                .filter(Boolean);
-            const orgWords = words.filter((w) => !LEGAL.has(w.toLowerCase()) && !/^\d+$/.test(w));
-            const pool = orgWords.length ? orgWords : words;
-
-            let acronym = pool
-                .map((w) => w.replace(/[^A-Za-z0-9]/g, '').slice(0, 1).toUpperCase())
-                .join('');
-            // Drop ultra-short noise acronyms
-            if (acronym.length < 3 && pool.length === 1) {
-                acronym = pool[0].replace(/[^A-Za-z0-9]/g, '').slice(0, 12);
-            } else if (acronym.length < 3) {
-                acronym = pool
-                    .map((w) => w.replace(/[^A-Za-z0-9]/g, ''))
-                    .filter(Boolean)
-                    .join('')
-                    .slice(0, 12);
-            }
-            acronym = String(acronym || raw.replace(/[^A-Za-z0-9]/g, '')).slice(0, 16);
-            if (!acronym) return '';
-
-            const cityBit = String(city || locFromName || '')
-                .replace(/[^A-Za-z0-9\s]/g, '')
-                .trim()
-                .split(/\s+/)
                 .filter(Boolean)
-                .slice(0, 2)
-                .join(' ');
+                .filter((w) => !/^\d+$/.test(w));
+
+            const shortWords = [];
+            for (const w of words) {
+                if (shortWords.length >= 3) break;
+                if (STOP.has(w.toLowerCase())) continue;
+                shortWords.push(w);
+            }
+            const shortName = titleCase((shortWords.length ? shortWords : words).slice(0, 3).join(' '))
+                .slice(0, 28);
+            if (!shortName) return '';
+
+            const cityBit = titleCase(
+                String(city || '')
+                    .replace(/[^A-Za-z0-9\s]/g, '')
+                    .trim()
+                    .split(/\s+/)
+                    .filter(Boolean)
+                    .slice(0, 2)
+                    .join(' ')
+            );
+
+            let streetBit = '';
+            const addr = String(address1 || '').trim();
+            if (addr) {
+                const parts = addr
+                    .replace(/[#,]/g, ' ')
+                    .split(/\s+/)
+                    .map((w) => w.trim())
+                    .filter(Boolean);
+                for (const w of parts) {
+                    const low = w.toLowerCase().replace(/\./g, '');
+                    if (/^\d+[a-z]?$/i.test(w)) continue;
+                    if (STREET_SKIP.has(low)) continue;
+                    if (/^(ste|suite|unit|apt|fl|floor)\d*/i.test(low)) continue;
+                    streetBit = titleCase(w.replace(/[^A-Za-z0-9]/g, ''));
+                    if (streetBit) break;
+                }
+            }
+
+            const stateBit = String(state || '')
+                .replace(/[^A-Za-z]/g, '')
+                .trim()
+                .toUpperCase()
+                .slice(0, 2);
+            const zipBit = String(zip || '').replace(/\D/g, '').slice(0, 5);
 
             const taken = existingSiteIdentifierSet(excludeSiteId);
             const candidates = [];
-            // Prefer location form when we know the city (multi-site orgs)
+            if (cityBit && streetBit) candidates.push(`${shortName}, ${cityBit} ${streetBit}`);
             if (cityBit) {
-                candidates.push(`${acronym} (${cityBit})`.slice(0, 40));
+                candidates.push(`${shortName}, ${cityBit}`);
+                if (stateBit) candidates.push(`${shortName}, ${cityBit} ${stateBit}`);
+                if (stateBit && zipBit) candidates.push(`${shortName}, ${cityBit} ${stateBit} ${zipBit}`);
+                else if (zipBit) candidates.push(`${shortName}, ${cityBit} ${zipBit}`);
+            } else if (streetBit) {
+                candidates.push(`${shortName}, ${streetBit}`);
+            } else if (stateBit) {
+                candidates.push(`${shortName}, ${stateBit}`);
             }
-            candidates.push(acronym);
-            if (cityBit) {
-                candidates.push(`${acronym}-${cityBit.replace(/\s+/g, '')}`.slice(0, 40));
-            }
-            for (let n = 2; n <= 40; n += 1) {
-                candidates.push(`${acronym}-${n}`.slice(0, 40));
-            }
+            candidates.push(shortName);
+            const rand = Date.now().toString(36).slice(-4).toUpperCase();
+            candidates.push(`${shortName}, ${rand}`);
+
             for (const c of candidates) {
-                if (c && !taken.has(c.toLowerCase())) return c;
+                const label = String(c || '').trim().slice(0, 48);
+                if (label && !taken.has(label.toLowerCase())) return label;
             }
-            return `${acronym}-${Date.now().toString(36).slice(-4)}`;
+            return `${shortName}, ${rand}${Math.random().toString(36).slice(2, 4).toUpperCase()}`.slice(0, 48);
         };
 
         const getArtemisSiteLegacyStats = (siteId) => {
@@ -3251,7 +3356,9 @@
             legacy.forEach((s) => {
                 if (s?.linkedArtemisSiteId && s.id) linkedLegacyIds.add(s.id);
             });
-            const rows = live.map((s) => {
+            const rows = live
+                .filter((s) => String(s?.status || '').toLowerCase() !== 'merged')
+                .map((s) => {
                 const linkedIds = legacyIdsByLiveId.get(s.id) || [];
                 const linked = linkedIds.map((id) => idx.legacyById.get(id)).filter(Boolean);
                 return {
@@ -3264,6 +3371,7 @@
             });
             legacy.forEach((leg) => {
                 if (!leg?.id || linkedLegacyIds.has(leg.id)) return;
+                if (String(leg.promoteStatus || '').toLowerCase() === 'merged') return;
                 if (idx.liveIdByAnyId.has(leg.id) && liveById.has(idx.liveIdByAnyId.get(leg.id))) return;
                 rows.push({
                     id: leg.id,
@@ -4341,7 +4449,7 @@
             const borderTh = report.def?.borderlineThreshold ?? report.def?.scoring?.borderlineThreshold ?? 50;
             const scoringNote = report.hasScoring
                 ? `Recommend ≥ ${passTh}% · Needs review ≥ ${borderTh}% · Do not recommend below that, or any auto-fail`
-                : 'This survey template has no scoring rules yet — outcomes show as Unscored until you add points / auto-fails and sites resubmit.';
+                : 'This survey template has no scoring rules yet — outcomes show as Unscored until you add points / auto-fails, then use Recalculate scoring (answers stay as submitted).';
 
             const rows = report.siteRows.map((row) => {
                 const when = row.when ? new Date(row.when).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : '—';
@@ -4371,7 +4479,10 @@
                             <div class="font-semibold">Site Ops ranking</div>
                             <div class="text-xs text-white/75 mt-0.5">${escapeHtml(scoringNote)}</div>
                         </div>
-                        <button type="button" id="feasibility-ops-html-btn" class="px-3 py-1.5 rounded-md bg-white/15 hover:bg-white/25 text-sm font-medium">Export Site Ops HTML</button>
+                        <div class="flex flex-wrap items-center gap-2">
+                            <button type="button" class="rescore-survey-all-btn px-3 py-1.5 rounded-md bg-emerald-500/90 hover:bg-emerald-500 text-sm font-medium" data-definition-id="${escapeHtml(report.def?.id || '')}" title="Recalculate scores for all responses to this survey. Answers are not changed.">Recalculate scoring</button>
+                            <button type="button" id="feasibility-ops-html-btn" class="px-3 py-1.5 rounded-md bg-white/15 hover:bg-white/25 text-sm font-medium">Export Site Ops HTML</button>
+                        </div>
                     </div>
                     <div class="grid grid-cols-2 sm:grid-cols-5 gap-0 divide-x divide-gray-200 dark:divide-gray-700 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900/40">
                         <div class="p-3 text-center"><div class="text-[10px] uppercase text-gray-500">Recommend</div><div class="text-lg font-bold text-emerald-700 dark:text-emerald-300">${passN}</div></div>
@@ -5479,6 +5590,7 @@
                                     </div>
                                     <div class="flex items-center gap-3 shrink-0">
                                         ${surveyScoreRingHtml(response)}
+                                        <button type="button" class="rescore-one-response-btn px-3 py-1.5 rounded-lg bg-white/15 hover:bg-white/25 text-sm text-white" data-response-id="${escapeHtml(response.id)}" title="Recompute Pass/Fail/% from the current template. Does not change answers.">Recalculate scoring</button>
                                         <button type="button" data-action="cancel" class="px-3 py-1.5 rounded-lg bg-white/15 hover:bg-white/25 text-sm text-white">Close</button>
                                     </div>
                                 </div>
@@ -6098,27 +6210,40 @@
             return true;
         };
 
+        /** Soft-hidden templates (status=archived). Data stays in Cosmos — never hard-deleted. */
+        const isSurveyDefArchived = (d) => String(d?.status || '').toLowerCase() === 'archived';
+        const visibleSurveyDefinitions = (list = allSiteSurveyDefinitions, { includeArchived = false } = {}) =>
+            asSurveyList(list)
+                .filter(isSurveyDefinitionDoc)
+                .filter((d) => includeArchived || !isSurveyDefArchived(d));
+
         const asSurveyDefinitionList = (list) => asSurveyList(list).filter(isSurveyDefinitionDoc);
 
         const surveyDefRowHtml = (d, { predefined = false } = {}) => {
             const ind = d.indication || d.therapeuticArea || '';
             const scoring = surveyDefinitionScoringSummary(d);
+            const archived = isSurveyDefArchived(d);
             const scoreChip = scoring.hasScoring
                 ? `<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-200" title="${escapeHtml(scoring.detail)}">Scored</span>`
                 : `<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-gray-100 text-gray-500 dark:bg-gray-700 dark:text-gray-400" title="${escapeHtml(scoring.detail)}">No score</span>`;
             return `
-                <div class="comms-row flex items-center gap-2 px-2.5 py-2 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700/40 border border-transparent hover:border-gray-200 dark:hover:border-gray-600" data-search="${escapeHtml(`${d.title || ''} ${ind} ${d.id || ''}`.toLowerCase())}">
+                <div class="comms-row flex items-center gap-2 px-2.5 py-2 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700/40 border border-transparent hover:border-gray-200 dark:hover:border-gray-600 ${archived ? 'opacity-70' : ''}" data-search="${escapeHtml(`${d.title || ''} ${ind} ${d.id || ''}`.toLowerCase())}">
                     <div class="min-w-0 flex-1">
                         <div class="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">
                             ${escapeHtml(d.title || '(untitled)')}
                             ${predefined ? '<span class="ml-1 text-[10px] font-semibold text-indigo-600 dark:text-indigo-300">LIB</span>' : ''}
+                            ${archived ? '<span class="ml-1 text-[10px] font-semibold text-amber-700 dark:text-amber-300">HIDDEN</span>' : ''}
                             <span class="ml-1 align-middle">${scoreChip}</span>
                         </div>
                     </div>
                     <div class="flex items-center gap-1 shrink-0">
-                        <button type="button" class="send-predefined-survey-btn px-2 py-1 rounded text-xs bg-gray-800 text-white" data-definition-id="${escapeHtml(d.id)}">Send</button>
-                        <button type="button" class="clone-site-survey-definition-btn px-2 py-1 rounded text-xs bg-indigo-600 text-white" data-definition-id="${escapeHtml(d.id)}">Clone</button>
-                        <button type="button" class="edit-site-survey-definition-btn px-2 py-1 rounded text-xs bg-gray-100 dark:bg-gray-700" data-definition-id="${escapeHtml(d.id)}">Edit</button>
+                        ${archived
+                            ? ''
+                            : `<button type="button" class="send-predefined-survey-btn px-2 py-1 rounded text-xs bg-gray-800 text-white" data-definition-id="${escapeHtml(d.id)}">Send</button>
+                               <button type="button" class="clone-site-survey-definition-btn px-2 py-1 rounded text-xs bg-indigo-600 text-white" data-definition-id="${escapeHtml(d.id)}">Clone</button>
+                               <button type="button" class="edit-site-survey-definition-btn px-2 py-1 rounded text-xs bg-gray-100 dark:bg-gray-700" data-definition-id="${escapeHtml(d.id)}">Edit</button>
+                               <button type="button" class="rescore-survey-all-btn px-2 py-1 rounded text-xs border border-emerald-600 text-emerald-800 dark:text-emerald-300 dark:border-emerald-700" data-definition-id="${escapeHtml(d.id)}" title="Recalculate scores for all submitted responses. Answers are not changed.">Rescore all</button>`}
+                        <button type="button" class="archive-site-survey-definition-btn px-2 py-1 rounded text-xs border border-gray-300 dark:border-gray-600" data-definition-id="${escapeHtml(d.id)}" data-archive="${archived ? '0' : '1'}" title="${archived ? 'Restore to Feasibility + reports (does not delete data)' : 'Hide from Feasibility tab and reports (keeps all responses)'}">${archived ? 'Restore' : 'Hide'}</button>
                     </div>
                 </div>`;
         };
@@ -6216,16 +6341,23 @@
             const empty = (msg) => `<div class="text-sm text-gray-500 dark:text-gray-400 px-2 py-6 text-center">${msg}</div>`;
 
             if (commsPanel === 'templates') {
+                const activeCustom = custom.filter((d) => !isSurveyDefArchived(d));
+                const archivedCustom = custom.filter((d) => isSurveyDefArchived(d));
+                const activePre = predefined.filter((d) => !isSurveyDefArchived(d));
+                const archivedPre = predefined.filter((d) => isSurveyDefArchived(d));
+                const archivedAll = [...archivedCustom, ...archivedPre];
                 if (!custom.length && !predefined.length) {
                     body.innerHTML = empty('No survey templates yet. Create one or clone from ingest.');
                 } else {
                     body.innerHTML = `
-                        ${custom.length ? `<div class="px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-gray-400 sticky top-0 bg-white dark:bg-gray-800 z-[1]">Custom (${custom.length})</div>${custom.map(d => surveyDefRowHtml(d, { predefined: false })).join('')}` : ''}
-                        ${predefined.length ? `<div class="px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-gray-400 sticky top-0 bg-white dark:bg-gray-800 z-[1] ${custom.length ? 'mt-1' : ''}">Library (${predefined.length})</div>${predefined.map(d => surveyDefRowHtml(d, { predefined: true })).join('')}` : ''}
+                        ${activeCustom.length ? `<div class="px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-gray-400 sticky top-0 bg-white dark:bg-gray-800 z-[1]">Custom (${activeCustom.length})</div>${activeCustom.map(d => surveyDefRowHtml(d, { predefined: false })).join('')}` : ''}
+                        ${activePre.length ? `<div class="px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-gray-400 sticky top-0 bg-white dark:bg-gray-800 z-[1] ${activeCustom.length ? 'mt-1' : ''}">Library (${activePre.length})</div>${activePre.map(d => surveyDefRowHtml(d, { predefined: true })).join('')}` : ''}
+                        ${archivedAll.length ? `<div class="px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-amber-600 dark:text-amber-400 sticky top-0 bg-white dark:bg-gray-800 z-[1] ${(activeCustom.length || activePre.length) ? 'mt-1' : ''}">Hidden from Feasibility / reports (${archivedAll.length}) — data kept</div>${archivedAll.map(d => surveyDefRowHtml(d, { predefined: predefined.includes(d) })).join('')}` : ''}
                     `;
                 }
                 const total = custom.length + predefined.length;
-                if (footerEl) footerEl.textContent = `${total} template${total === 1 ? '' : 's'} · use Filter to jump`;
+                const visible = activeCustom.length + activePre.length;
+                if (footerEl) footerEl.textContent = `${visible} visible · ${archivedAll.length} hidden · ${total} total (Hide never deletes responses)`;
             } else if (commsPanel === 'questions') {
                 const lib = asSurveyList(allSiteSurveyQuestionLibrary)
                     .slice()
@@ -8824,7 +8956,9 @@
         };
 
         const createSiteSurveyAssignmentModal = (prefill = {}) => {
-            const allDefs = (allSiteSurveyDefinitions || []).slice().sort((a, b) => (a.title || '').localeCompare(b.title || ''));
+            const allDefs = visibleSurveyDefinitions(allSiteSurveyDefinitions)
+                .slice()
+                .sort((a, b) => (a.title || '').localeCompare(b.title || ''));
             const predefined = allDefs.filter(isPredefinedSurveyDef);
             const custom = allDefs.filter(d => !isPredefinedSurveyDef(d));
             const sites = buildUnifiedSitesCatalog();
@@ -9901,6 +10035,12 @@
                               <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 3a1 1 0 011 1v5h5a1 1 0 110 2h-5v5a1 1 0 11-2 0v-5H4a1 1 0 110-2h5V4a1 1 0 011-1z" clip-rule="evenodd" /></svg>
                               Add New Site
                           </button>
+                          <button id="merge-sites-btn" type="button" class="inline-flex items-center px-4 py-2 border border-gray-300 dark:border-gray-600 text-sm font-medium rounded-md shadow-sm text-gray-800 dark:text-gray-100 bg-white dark:bg-gray-700 hover:bg-gray-50 dark:hover:bg-gray-600" title="Combine duplicate sites without deleting history">
+                              Merge duplicates
+                          </button>
+                          <button id="graduate-legacy-sites-btn" type="button" class="inline-flex items-center px-4 py-2 border border-violet-300 dark:border-violet-700 text-sm font-medium rounded-md shadow-sm text-violet-800 dark:text-violet-200 bg-violet-50 dark:bg-violet-900/30 hover:bg-violet-100 dark:hover:bg-violet-900/50" title="Link or create live stubs for unlinked master-list rows (never deletes)">
+                              Graduate master-list
+                          </button>
                       </div>
                  </div>
                  <div class="mb-4 space-y-4">
@@ -10061,28 +10201,22 @@
 
 
 
-            const preferredReportSurveyId = feasibilityReportSurveyId
-                || ((allSiteSurveyDefinitions || []).some(d => d && d.id === 'survey-rebuild-mytx272am-201')
-                    ? 'survey-rebuild-mytx272am-201'
-                    : null)
-                || ((allSiteSurveyDefinitions || []).some(d => d && d.id === 'survey-general-feasibility')
-                    ? 'survey-general-feasibility'
-                    : null)
-                || (allSiteSurveyDefinitions || [])[0]?.id
-                || '';
+            const visibleDefsForReport = visibleSurveyDefinitions(allSiteSurveyDefinitions);
+            const preferredReportSurveyId = (() => {
+                const ids = new Set(visibleDefsForReport.map((d) => d.id));
+                if (feasibilityReportSurveyId && ids.has(feasibilityReportSurveyId)) return feasibilityReportSurveyId;
+                if (ids.has('survey-rebuild-mytx272am-201')) return 'survey-rebuild-mytx272am-201';
+                if (ids.has('survey-general-feasibility')) return 'survey-general-feasibility';
+                return visibleDefsForReport[0]?.id || '';
+            })();
 
-            const surveyOptions = (allSiteSurveyDefinitions || []).slice()
-
+            const surveyOptions = visibleDefsForReport
+                .slice()
                 .sort((a, b) => String(a.title || '').localeCompare(String(b.title || '')))
-
                 .map(d => {
-
                     const selected = (d.id === preferredReportSurveyId) ? ' selected' : '';
-
                     const label = d.title ? escapeHtml(d.title) : escapeHtml(d.id);
-
                     return `<option value="${escapeHtml(d.id)}"${selected}>${label}</option>`;
-
                 }).join('') || '<option value="">No surveys loaded yet</option>';
 
 
@@ -10913,7 +11047,7 @@
                 const ident = siteIdentifier(site);
                 return `
                     <tr>
-                        <td class="px-6 py-4 whitespace-nowrap"><input type="checkbox" data-id="${site.id}" class="h-4 w-4 rounded border-gray-300 text-indigo-600 site-checkbox" ${isLegacyOnly ? 'disabled title="Master-list rows are not bulk-deleted here"' : ''}></td>
+                        <td class="px-6 py-4 whitespace-nowrap"><input type="checkbox" data-id="${site.id}" class="h-4 w-4 rounded border-gray-300 text-indigo-600 site-checkbox" ${isLegacyOnly ? 'data-catalog="legacy" title="Select for Graduate master-list"' : 'data-catalog="live"'}></td>
                         <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">${escapeHtml(site.status || 'N/A')}</td>
                         <td class="px-6 py-4 whitespace-nowrap text-sm font-mono ${ident ? 'text-gray-800 dark:text-gray-100' : 'text-gray-400 dark:text-gray-500'}">${ident ? escapeHtml(ident) : '—'}</td>
                         <td class="px-6 py-4 whitespace-nowrap font-medium text-gray-900 dark:text-gray-100">
@@ -10944,11 +11078,14 @@
                                 <button type="button" class="view-site-details-btn text-left text-indigo-600 hover:text-indigo-800 dark:text-indigo-400 dark:hover:text-indigo-300 text-xs font-semibold" data-site-id="${escapeHtml(site.id)}" data-site-tab="surveys" ${isLegacyOnly ? 'data-site-source="legacy"' : ''}>View surveys →</button>
                             </div>
                         </td>
-                        <td class="sticky right-0 z-10 bg-white dark:bg-gray-800 px-6 py-4 whitespace-nowrap text-sm font-medium space-x-4 shadow-[-4px_0_6px_-4px_rgba(0,0,0,0.1)]">
+                        <td class="sticky right-0 z-10 bg-white dark:bg-gray-800 px-6 py-4 whitespace-nowrap text-sm font-medium space-x-3 shadow-[-4px_0_6px_-4px_rgba(0,0,0,0.1)]">
                             ${isLegacyOnly
                                 ? `<button type="button" class="send-site-survey-btn text-teal-700 hover:text-teal-900 dark:text-teal-300" data-site-id="${escapeHtml(site.id)}">Send survey</button>
+                                   <button type="button" class="merge-into-site-btn text-amber-700 hover:text-amber-900 dark:text-amber-300" data-absorb-id="${escapeHtml(site.id)}" data-absorb-source="legacy" title="Combine into a live site (keeps survey history)">Merge into…</button>
+                                   <button type="button" class="graduate-one-legacy-btn text-violet-700 hover:text-violet-900 dark:text-violet-300" data-legacy-id="${escapeHtml(site.id)}" title="Link or create a live stub (never deletes)">Graduate</button>
                                    <button type="button" class="view-site-details-btn text-indigo-600 hover:text-indigo-900 dark:text-indigo-400" data-site-id="${escapeHtml(site.id)}" data-site-source="legacy">Open</button>`
                                 : `<button type="button" data-action="edit-site" data-id="${site.id}" class="text-indigo-600 hover:text-indigo-900 dark:text-indigo-400 dark:hover:text-indigo-300">Edit</button>
+                                   <button type="button" class="merge-into-site-btn text-amber-700 hover:text-amber-900 dark:text-amber-300" data-absorb-id="${escapeHtml(site.id)}" data-absorb-source="live" title="Absorb another duplicate into this site">Merge…</button>
                                    <button type="button" data-action="delete-site" data-id="${site.id}" class="text-red-600 hover:text-red-900 dark:text-red-400 dark:hover:text-red-300">Delete</button>`}
                         </td>
                     </tr>
@@ -13048,6 +13185,219 @@
             }
         }
 
+        /**
+         * Merge wizard: absorb duplicate into a live Primary.
+         * Soft-merge only — never hard-deletes sites or survey rows.
+         */
+        const openSiteMergeWizard = (opts = {}) => {
+            const catalog = buildUnifiedSitesCatalog();
+            const liveOnly = catalog.filter((s) => s._source === 'live' && String(s.status || '').toLowerCase() !== 'merged');
+            const absorbPrefill = opts.absorbSiteId || '';
+            const absorbSourcePrefill = opts.absorbSource || '';
+            const primaryPrefill = opts.primarySiteId || '';
+
+            const liveOpts = liveOnly.map((s) => {
+                const ident = siteIdentifier(s);
+                const label = `${s.name || s.id}${ident ? ` · ${ident}` : ''}`;
+                return `<option value="${escapeHtml(s.id)}">${escapeHtml(label)}</option>`;
+            }).join('');
+
+            const absorbOpts = catalog.map((s) => {
+                const ident = siteIdentifier(s);
+                const tag = s._catalog === 'legacy' ? ' [master]' : (s._catalog === 'linked' ? ' [linked]' : '');
+                const label = `${s.name || s.id}${ident ? ` · ${ident}` : ''}${tag}`;
+                return `<option value="${escapeHtml(s.id)}" data-source="${escapeHtml(s._source || 'live')}">${escapeHtml(label)}</option>`;
+            }).join('');
+
+            showModal(`
+                <div class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40">
+                    <div class="bg-white dark:bg-gray-800 rounded-xl shadow-xl max-w-2xl w-full max-h-[90vh] overflow-y-auto border border-gray-200 dark:border-gray-700">
+                        <div class="px-5 py-4 border-b border-gray-200 dark:border-gray-700 flex items-start justify-between gap-3">
+                            <div>
+                                <h3 class="text-lg font-semibold text-gray-900 dark:text-gray-100">Merge duplicate sites</h3>
+                                <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Absorb keeps history under Primary. Nothing is hard-deleted — absorb is marked Merged and hidden from the catalog.</p>
+                            </div>
+                            <button type="button" data-action="cancel" class="text-gray-400 hover:text-gray-600 text-xl leading-none">&times;</button>
+                        </div>
+                        <form id="site-merge-form" class="px-5 py-4 space-y-4">
+                            <div>
+                                <label class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Primary (live site that remains)</label>
+                                <select name="primarySiteId" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-sm">
+                                    <option value="">Select primary…</option>
+                                    ${liveOpts}
+                                </select>
+                            </div>
+                            <div>
+                                <label class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Absorb (duplicate to fold in)</label>
+                                <select name="absorbSiteId" required class="w-full p-2 border dark:border-gray-600 rounded-md bg-white dark:bg-gray-700 dark:text-white text-sm">
+                                    <option value="">Select absorb…</option>
+                                    ${absorbOpts}
+                                </select>
+                            </div>
+                            <div id="site-merge-preview" class="hidden text-sm rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-900/20 px-3 py-2 text-amber-900 dark:text-amber-100"></div>
+                            <div id="site-merge-conflicts" class="hidden space-y-2"></div>
+                            <p id="site-merge-error" class="hidden text-sm text-red-600 dark:text-red-400"></p>
+                            <div class="flex flex-wrap justify-end gap-2 pt-2 border-t border-gray-200 dark:border-gray-700">
+                                <button type="button" data-action="cancel" class="px-3 py-2 rounded-md border border-gray-300 dark:border-gray-600 text-sm">Cancel</button>
+                                <button type="button" id="site-merge-dry-run-btn" class="px-3 py-2 rounded-md border border-indigo-300 dark:border-indigo-700 text-indigo-700 dark:text-indigo-300 text-sm">Preview (dry run)</button>
+                                <button type="submit" id="site-merge-confirm-btn" class="px-3 py-2 rounded-md bg-[#1B2A4A] text-white text-sm hover:opacity-90" disabled>Merge (keep all data)</button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            `);
+
+            const form = document.getElementById('site-merge-form');
+            const previewEl = document.getElementById('site-merge-preview');
+            const conflictsEl = document.getElementById('site-merge-conflicts');
+            const errEl = document.getElementById('site-merge-error');
+            const confirmBtn = document.getElementById('site-merge-confirm-btn');
+            let lastDryRun = null;
+
+            if (primaryPrefill && form?.primarySiteId) form.primarySiteId.value = primaryPrefill;
+            if (absorbPrefill && form?.absorbSiteId) {
+                form.absorbSiteId.value = absorbPrefill;
+                if (absorbSourcePrefill) {
+                    const opt = form.absorbSiteId.selectedOptions?.[0];
+                    if (opt) opt.dataset.source = absorbSourcePrefill;
+                }
+            }
+
+            const collectFieldChoices = () => {
+                const choices = {};
+                conflictsEl?.querySelectorAll('select[data-merge-field]')?.forEach((sel) => {
+                    const f = sel.getAttribute('data-merge-field');
+                    if (f) choices[f] = sel.value;
+                });
+                return choices;
+            };
+
+            const renderDryRun = (summary) => {
+                lastDryRun = summary;
+                if (!previewEl) return;
+                previewEl.classList.remove('hidden');
+                previewEl.innerHTML = `
+                    <div class="font-medium mb-1">Preview — no writes yet</div>
+                    <div>Primary: <strong>${escapeHtml(summary.primaryName || summary.primarySiteId)}</strong></div>
+                    <div>Absorb: <strong>${escapeHtml(summary.absorbName || summary.absorbSiteId)}</strong> (${escapeHtml(summary.absorbSource || '?')})</div>
+                    <div class="mt-1">${Number(summary.surveyAssignmentsToMove || 0)} assignment(s) · ${Number(summary.surveyResponsesToMove || 0)} response(s) will re-point to Primary (rows kept).</div>
+                    <div>${Number(summary.conflictingFields || 0)} field conflict(s) to choose below (default keeps Primary when set).</div>
+                `;
+                if (conflictsEl) {
+                    const diffs = Array.isArray(summary.fieldDiff) ? summary.fieldDiff : [];
+                    if (!diffs.length) {
+                        conflictsEl.classList.add('hidden');
+                        conflictsEl.innerHTML = '';
+                    } else {
+                        conflictsEl.classList.remove('hidden');
+                        conflictsEl.innerHTML = `<div class="text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">Field choices</div>` + diffs.map((d) => `
+                            <label class="block text-xs text-gray-600 dark:text-gray-300">
+                                <span class="font-medium text-gray-800 dark:text-gray-100">${escapeHtml(d.field)}</span>
+                                <select data-merge-field="${escapeHtml(d.field)}" class="mt-1 w-full p-1.5 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white text-xs">
+                                    <option value="primary">Keep primary: ${escapeHtml(String(d.primary ?? ''))}</option>
+                                    <option value="absorb">Use absorb: ${escapeHtml(String(d.absorb ?? ''))}</option>
+                                </select>
+                            </label>
+                        `).join('');
+                    }
+                }
+                if (confirmBtn) confirmBtn.disabled = false;
+            };
+
+            const runDry = async () => {
+                if (errEl) { errEl.classList.add('hidden'); errEl.textContent = ''; }
+                const primarySiteId = String(form?.primarySiteId?.value || '').trim();
+                const absorbSiteId = String(form?.absorbSiteId?.value || '').trim();
+                if (!primarySiteId || !absorbSiteId) {
+                    if (errEl) { errEl.textContent = 'Pick both Primary and Absorb.'; errEl.classList.remove('hidden'); }
+                    return;
+                }
+                if (primarySiteId === absorbSiteId) {
+                    if (errEl) { errEl.textContent = 'Primary and Absorb must be different.'; errEl.classList.remove('hidden'); }
+                    return;
+                }
+                const absorbOpt = form.absorbSiteId.selectedOptions?.[0];
+                const absorbSource = absorbOpt?.dataset?.source || 'live';
+                try {
+                    confirmBtn && (confirmBtn.disabled = true);
+                    const summary = await apiService.mergeSites({
+                        primarySiteId,
+                        absorbSiteId,
+                        absorbSource,
+                        dryRun: true,
+                        fieldChoices: collectFieldChoices(),
+                    });
+                    renderDryRun(summary);
+                } catch (err) {
+                    if (errEl) {
+                        errEl.textContent = err.message || 'Dry run failed';
+                        errEl.classList.remove('hidden');
+                    }
+                }
+            };
+
+            document.getElementById('site-merge-dry-run-btn')?.addEventListener('click', () => { void runDry(); });
+            form?.absorbSiteId?.addEventListener('change', () => {
+                lastDryRun = null;
+                if (confirmBtn) confirmBtn.disabled = true;
+                previewEl?.classList.add('hidden');
+            });
+            form?.primarySiteId?.addEventListener('change', () => {
+                lastDryRun = null;
+                if (confirmBtn) confirmBtn.disabled = true;
+                previewEl?.classList.add('hidden');
+            });
+
+            form?.addEventListener('submit', async (e) => {
+                e.preventDefault();
+                if (!lastDryRun) {
+                    await runDry();
+                    if (!lastDryRun) return;
+                }
+                const primarySiteId = String(form?.primarySiteId?.value || '').trim();
+                const absorbSiteId = String(form?.absorbSiteId?.value || '').trim();
+                const absorbOpt = form.absorbSiteId.selectedOptions?.[0];
+                const absorbSource = absorbOpt?.dataset?.source || lastDryRun.absorbSource || 'live';
+                if (!confirm(`Merge "${lastDryRun.absorbName || absorbSiteId}" into "${lastDryRun.primaryName || primarySiteId}"?\n\nSurvey history moves to Primary. Absorb is soft-hidden as Merged — nothing is deleted.`)) {
+                    return;
+                }
+                try {
+                    confirmBtn.disabled = true;
+                    const result = await apiService.mergeSites({
+                        primarySiteId,
+                        absorbSiteId,
+                        absorbSource,
+                        dryRun: false,
+                        fieldChoices: collectFieldChoices(),
+                    });
+                    invalidateSiteLinkIndex();
+                    allSites = await apiService.getSites().catch(() => allSites);
+                    if (typeof window.refreshLegacySitesCatalog === 'function') {
+                        await window.refreshLegacySitesCatalog().catch(() => null);
+                    } else if (window.ArtemisLegacy?.refreshArtemisLegacyIndex) {
+                        await window.ArtemisLegacy.refreshArtemisLegacyIndex(allSites).catch(() => null);
+                    }
+                    showNotification(`Merged into ${result.primaryName || primarySiteId} · ${result.surveyResponsesToMove || 0} responses kept`, 'success');
+                    closeModal();
+                    if (activeTab === 'sites') render();
+                    else renderAllSites();
+                } catch (err) {
+                    if (errEl) {
+                        errEl.textContent = err.message || 'Merge failed';
+                        errEl.classList.remove('hidden');
+                    }
+                    confirmBtn.disabled = false;
+                }
+            });
+        };
+
+        const runGraduateLegacy = async ({ legacySiteIds = null, dryRun = false } = {}) => {
+            const payload = { dryRun };
+            if (Array.isArray(legacySiteIds) && legacySiteIds.length) payload.legacySiteIds = legacySiteIds;
+            const result = await apiService.graduateLegacySites(payload);
+            return result;
+        };
+
         function closeModal() {
             // Clean up edit site map if it exists
             if (editSiteMap) {
@@ -13540,8 +13890,10 @@
             const title = isEdit ? 'Edit Site' : 'Add New Site';
             const buttonText = isEdit ? 'Save Changes' : 'Create Site';
             const lockedSiteCode = String(site?.siteCode || '').trim();
-            const existingIdentifier = lockedSiteCode || String(site?.siteNameAbbreviation || '').trim();
-            const siteCodeReadonly = isEdit && !!lockedSiteCode;
+            const existingAbbr = String(site?.siteNameAbbreviation || '').trim();
+            const existingIdentifier = lockedSiteCode || existingAbbr;
+            // Never auto-overwrite: any stored identifier locks Auto on edit.
+            const siteCodeReadonly = isEdit && !!existingIdentifier;
             const exampleIds = (typeof buildUnifiedSitesCatalog === 'function'
                 ? buildUnifiedSitesCatalog()
                 : (allSites || []))
@@ -13551,7 +13903,7 @@
                 .slice(0, 8);
             const exampleHint = exampleIds.length
                 ? `Examples in use: ${exampleIds.join(', ')}`
-                : 'Short unique label (e.g. CORE, NEERA, CPR).';
+                : 'e.g. Andover Eye, Andover Brickstone';
             const mailingLooksSame = !!(site && (
                 String(site.mailingAddress1 || '') === String(site.address1 || '')
                 && String(site.mailingAddress2 || '') === String(site.address2 || '')
@@ -13576,14 +13928,14 @@
                                      <div>
                                         <label for="siteCode" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Site Identifier</label>
                                         <div class="mt-1 flex gap-2">
-                                            <input type="text" name="siteCode" id="siteCode" value="${escapeHtml(existingIdentifier)}" placeholder="Auto-fills from site name" ${siteCodeReadonly ? 'readonly' : ''} class="block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm bg-white dark:bg-gray-700 dark:text-gray-200 font-mono ${siteCodeReadonly ? 'opacity-80 cursor-not-allowed' : ''}" />
-                                            ${!siteCodeReadonly ? `<button type="button" id="regen-site-identifier-btn" class="shrink-0 px-2.5 py-2 text-xs font-medium rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700" title="Generate from site name">Auto</button>` : ''}
+                                            <input type="text" name="siteCode" id="siteCode" value="${escapeHtml(existingIdentifier)}" placeholder="e.g. Andover Eye, Andover Brickstone" ${siteCodeReadonly ? 'readonly' : ''} class="block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm bg-white dark:bg-gray-700 dark:text-gray-200 font-mono ${siteCodeReadonly ? 'opacity-80 cursor-not-allowed' : ''}" />
+                                            ${!siteCodeReadonly ? `<button type="button" id="regen-site-identifier-btn" class="shrink-0 px-2.5 py-2 text-xs font-medium rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700" title="Generate from name + city + street">Auto</button>` : ''}
                                         </div>
                                         <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">${siteCodeReadonly
-                                            ? 'Site Identifier is immutable once set.'
+                                            ? 'Existing Site Identifier is kept as-is (never auto-overwritten).'
                                             : (isEdit
-                                                ? `Short unique label. ${escapeHtml(exampleHint)}`
-                                                : `Auto-generated from the site name (unique). Edit anytime. ${escapeHtml(exampleHint)}`)}</p>
+                                                ? `Blank only — Auto builds “Short name, City Street”. ${escapeHtml(exampleHint)}`
+                                                : `Auto: “Short name, City Street” (e.g. Andover Eye, Andover Brickstone). Edit anytime before save. ${escapeHtml(exampleHint)}`)}</p>
                                     </div>
                                     <div>
                                         <label for="status" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Status</label>
@@ -13776,29 +14128,44 @@
                     });
                 });
 
-                // Auto Site Identifier from name (new sites, or edits with no locked code).
+                // Auto Site Identifier — new sites only, or edits with no stored identifier.
+                // Never overwrites an existing siteCode / siteNameAbbreviation.
                 if (!siteCodeReadonly) {
                     const nameEl = siteForm.querySelector('[name="name"]');
                     const cityEl = siteForm.querySelector('[name="city"]');
+                    const stateEl = siteForm.querySelector('[name="state"]');
+                    const zipEl = siteForm.querySelector('[name="zipCode"]');
+                    const addrEl = siteForm.querySelector('[name="address1"]');
                     const codeEl = siteForm.querySelector('[name="siteCode"]');
                     let identTouched = !!String(existingIdentifier || '').trim() && isEdit;
                     const refreshIdent = (force = false) => {
                         if (!codeEl || (!force && identTouched)) return;
+                        // Hard guard: never clobber a non-empty field unless user cleared it first.
+                        if (!force && String(codeEl.value || '').trim()) return;
+                        if (force && String(codeEl.value || '').trim()) {
+                            showNotification('Clear the Site Identifier field first — existing values are never overwritten.', 'error');
+                            return;
+                        }
                         const next = suggestSiteIdentifier(nameEl?.value || '', {
                             city: cityEl?.value || '',
+                            state: stateEl?.value || '',
+                            zip: zipEl?.value || '',
+                            address1: addrEl?.value || '',
                             excludeSiteId: isEdit ? site?.id : '',
                         });
                         if (next) codeEl.value = next;
                     };
                     nameEl?.addEventListener('input', () => refreshIdent(false));
                     cityEl?.addEventListener('input', () => refreshIdent(false));
+                    stateEl?.addEventListener('input', () => refreshIdent(false));
+                    zipEl?.addEventListener('input', () => refreshIdent(false));
+                    addrEl?.addEventListener('input', () => refreshIdent(false));
                     codeEl?.addEventListener('input', () => {
                         identTouched = true;
                     });
                     document.getElementById('regen-site-identifier-btn')?.addEventListener('click', () => {
-                        identTouched = false;
                         refreshIdent(true);
-                        identTouched = true;
+                        if (String(codeEl?.value || '').trim()) identTouched = true;
                     });
                     if (!isEdit) refreshIdent(true);
                 }
@@ -14022,13 +14389,19 @@
             };
 
             const existingSite = siteId ? (allSites || []).find(s => s && s.id === siteId) : null;
+            const storedIdent = String(
+                existingSite?.siteCode || existingSite?.siteNameAbbreviation || ''
+            ).trim();
             let siteCode = String(getValue('siteCode') || '').trim();
-            if (existingSite?.siteCode) {
-                siteCode = String(existingSite.siteCode).trim();
-            }
-            if (!siteCode) {
+            // Never overwrite a stored identifier — humans keep what they have.
+            if (storedIdent) {
+                siteCode = String(existingSite?.siteCode || storedIdent).trim();
+            } else if (!siteCode) {
                 siteCode = suggestSiteIdentifier(getValue('name'), {
                     city: getValue('city'),
+                    state: getValue('state'),
+                    zip: getValue('zipCode'),
+                    address1: getValue('address1'),
                     excludeSiteId: siteId || '',
                 });
             }
@@ -14036,9 +14409,10 @@
                 showNotification('Site Identifier could not be generated — enter a site name.', 'error');
                 return;
             }
-            // Keep abbreviation in sync so list/import fields stay filled.
-            const siteNameAbbreviation = siteCode
-                || String(existingSite?.siteNameAbbreviation || '').trim();
+            // Keep abbreviation in sync only when assigning a brand-new identifier.
+            const siteNameAbbreviation = storedIdent
+                ? String(existingSite?.siteNameAbbreviation || existingSite?.siteCode || storedIdent).trim()
+                : (siteCode || String(existingSite?.siteNameAbbreviation || '').trim());
 
             const mailingSame = !!form.querySelector('#mailing-same-as-site')?.checked;
             const mailingAddress1 = mailingSame ? getValue('address1') : getValue('mailingAddress1');
@@ -15112,6 +15486,44 @@
             if (e.target.dataset.action === 'cancel') {
                 closeModal();
             }
+            const rescoreOneBtn = e.target.closest('.rescore-one-response-btn');
+            if (rescoreOneBtn) {
+                const rid = rescoreOneBtn.getAttribute('data-response-id');
+                if (!rid) return;
+                if (!confirm('Recalculate scoring for this response from the current survey template?\n\nAnswers are NOT changed — only Pass/Fail/% is recomputed.')) return;
+                rescoreOneBtn.disabled = true;
+                void (async () => {
+                    try {
+                        const result = await apiService.rescoreSiteSurveyResponse(rid);
+                        const idx = (allSiteSurveyResponses || []).findIndex((r) => r && r.id === rid);
+                        if (idx >= 0) {
+                            allSiteSurveyResponses[idx] = {
+                                ...allSiteSurveyResponses[idx],
+                                score: result.score,
+                                siteDisposition: result.outcome === 'fail' || result.outcome === 'not_interested'
+                                    ? result.outcome
+                                    : null,
+                                rescoredAt: new Date().toISOString(),
+                            };
+                        } else {
+                            allSiteSurveyResponses = await apiService.getSiteSurveyResponses().catch(() => allSiteSurveyResponses);
+                        }
+                        showNotification(
+                            result?.outcome === 'unscored' && result?.pct == null
+                                ? 'Recalculated — still Unscored (template may have no scoring rules)'
+                                : `Recalculated · ${result.outcome || 'done'}${result.pct != null ? ` · ${result.pct}%` : ''}`,
+                            'success'
+                        );
+                        const updated = (allSiteSurveyResponses || []).find((r) => r && r.id === rid);
+                        if (updated) createSiteSurveyResponseModal(updated);
+                    } catch (err) {
+                        showNotification(err.message || 'Rescore failed', 'error');
+                    } finally {
+                        rescoreOneBtn.disabled = false;
+                    }
+                })();
+                return;
+            }
             const editSiteButton = e.target.closest('[data-action="edit-site"]');
             if (editSiteButton) {
                 const siteId = editSiteButton.dataset.id;
@@ -15979,6 +16391,87 @@
             if (e.target.id === 'add-site-btn') {
                 createSiteModal();
             }
+            if (e.target.id === 'merge-sites-btn') {
+                openSiteMergeWizard();
+                return;
+            }
+            const mergeIntoBtn = e.target.closest('.merge-into-site-btn');
+            if (mergeIntoBtn) {
+                const absorbId = mergeIntoBtn.getAttribute('data-absorb-id');
+                const absorbSource = mergeIntoBtn.getAttribute('data-absorb-source') || 'live';
+                if (absorbSource === 'legacy') {
+                    openSiteMergeWizard({ absorbSiteId: absorbId, absorbSource: 'legacy' });
+                } else {
+                    openSiteMergeWizard({ primarySiteId: absorbId });
+                }
+                return;
+            }
+            if (e.target.id === 'graduate-legacy-sites-btn') {
+                const selected = Array.from(document.querySelectorAll('.site-checkbox:checked'))
+                    .map((cb) => cb.dataset.id)
+                    .filter(Boolean);
+                const legacyIds = selected.filter((id) => {
+                    const row = buildUnifiedSitesCatalog().find((s) => s.id === id);
+                    return row && row._catalog === 'legacy';
+                });
+                const scopeNote = legacyIds.length
+                    ? `${legacyIds.length} selected master-list row(s)`
+                    : 'ALL unlinked master-list rows';
+                if (!confirm(`Graduate ${scopeNote}?\n\nDry-run first, then apply. Links or creates live stubs — never deletes master-list or survey data.`)) {
+                    return;
+                }
+                void (async () => {
+                    try {
+                        const dry = await runGraduateLegacy({
+                            legacySiteIds: legacyIds.length ? legacyIds : null,
+                            dryRun: true,
+                        });
+                        const msg = `Dry run: link ${dry.linked || 0}, create ${dry.created || 0}, skip ${dry.skipped || 0}. Proceed?`;
+                        if (!confirm(msg)) return;
+                        const result = await runGraduateLegacy({
+                            legacySiteIds: legacyIds.length ? legacyIds : null,
+                            dryRun: false,
+                        });
+                        invalidateSiteLinkIndex();
+                        allSites = await apiService.getSites().catch(() => allSites);
+                        if (window.ArtemisLegacy?.refreshArtemisLegacyIndex) {
+                            await window.ArtemisLegacy.refreshArtemisLegacyIndex(allSites).catch(() => null);
+                        }
+                        showNotification(`Graduated · linked ${result.linked || 0} · created ${result.created || 0}`, 'success');
+                        if (activeTab === 'sites') render();
+                        else renderAllSites();
+                    } catch (err) {
+                        showNotification(err.message || 'Graduate failed', 'error');
+                    }
+                })();
+                return;
+            }
+            const graduateOneBtn = e.target.closest('.graduate-one-legacy-btn');
+            if (graduateOneBtn) {
+                const legacyId = graduateOneBtn.getAttribute('data-legacy-id');
+                if (!legacyId) return;
+                if (!confirm('Graduate this master-list row into a live site (link or create stub)? Nothing is deleted.')) return;
+                void (async () => {
+                    try {
+                        const dry = await runGraduateLegacy({ legacySiteIds: [legacyId], dryRun: true });
+                        const first = (dry.results || [])[0];
+                        if (!confirm(`Dry run: ${first?.action || 'unknown'}${first?.liveSiteId ? ` → ${first.liveSiteId}` : ''}. Proceed?`)) return;
+                        const result = await runGraduateLegacy({ legacySiteIds: [legacyId], dryRun: false });
+                        invalidateSiteLinkIndex();
+                        allSites = await apiService.getSites().catch(() => allSites);
+                        if (window.ArtemisLegacy?.refreshArtemisLegacyIndex) {
+                            await window.ArtemisLegacy.refreshArtemisLegacyIndex(allSites).catch(() => null);
+                        }
+                        const r0 = (result.results || [])[0];
+                        showNotification(`Graduated · ${r0?.action || 'done'}`, 'success');
+                        if (activeTab === 'sites') render();
+                        else renderAllSites();
+                    } catch (err) {
+                        showNotification(err.message || 'Graduate failed', 'error');
+                    }
+                })();
+                return;
+            }
             
             const editSiteButton = e.target.closest('[data-action="edit-site"]');
             if (editSiteButton) {
@@ -15994,9 +16487,13 @@
             }
 
             if (e.target.id === 'bulk-delete-site-btn') {
-                const selectedIds = Array.from(document.querySelectorAll('.site-checkbox:checked')).map(cb => cb.dataset.id);
+                const selectedIds = Array.from(document.querySelectorAll('.site-checkbox:checked'))
+                    .filter((cb) => cb.getAttribute('data-catalog') !== 'legacy')
+                    .map(cb => cb.dataset.id);
                 if (selectedIds.length > 0) {
                     createConfirmModal(selectedIds, 'site');
+                } else {
+                    showNotification('Select live sites to delete (master-list rows use Graduate, not Delete).', 'error');
                 }
             }
 
@@ -16123,6 +16620,102 @@
                     })
                     .catch(err => showNotification(err.message || 'Update failed', 'error'))
                     .finally(() => { archiveLibBtn.disabled = false; });
+                return;
+            }
+            const archiveSurveyDefBtn = e.target.closest('.archive-site-survey-definition-btn');
+            if (archiveSurveyDefBtn) {
+                const id = archiveSurveyDefBtn.getAttribute('data-definition-id');
+                const def = (allSiteSurveyDefinitions || []).find(x => x && x.id === id);
+                if (!def) return;
+                const archive = archiveSurveyDefBtn.getAttribute('data-archive') === '1';
+                if (archive && !confirm(`Hide "${def.title || id}" from the Feasibility tab and reports?\n\nThis does NOT delete the survey or any site responses — you can Restore anytime.`)) {
+                    return;
+                }
+                archiveSurveyDefBtn.disabled = true;
+                const nextStatus = archive ? 'archived' : 'active';
+                apiService.updateSiteSurveyDefinition(id, { ...def, status: nextStatus, updatedAt: new Date().toISOString() })
+                    .then(async () => {
+                        const idx = (allSiteSurveyDefinitions || []).findIndex(x => x && x.id === id);
+                        if (idx >= 0) allSiteSurveyDefinitions[idx] = { ...allSiteSurveyDefinitions[idx], status: nextStatus };
+                        else allSiteSurveyDefinitions = await apiService.getSiteSurveyDefinitions().catch(() => allSiteSurveyDefinitions);
+                        allSiteSurveyDefinitions = asSurveyDefinitionList(allSiteSurveyDefinitions);
+                        showNotification(archive ? 'Hidden from Feasibility / reports (data kept)' : 'Restored to Feasibility / reports', 'success');
+                        if (activeTab === 'feasibility' || activeTab === 'reporting') render();
+                    })
+                    .catch(err => showNotification(err.message || 'Update failed', 'error'))
+                    .finally(() => { archiveSurveyDefBtn.disabled = false; });
+                return;
+            }
+            const rescoreOneBtn = e.target.closest('.rescore-one-response-btn');
+            if (rescoreOneBtn) {
+                const rid = rescoreOneBtn.getAttribute('data-response-id');
+                if (!rid) return;
+                if (!confirm('Recalculate scoring for this response from the current survey template?\n\nAnswers are NOT changed — only Pass/Fail/% is recomputed.')) return;
+                rescoreOneBtn.disabled = true;
+                void (async () => {
+                    try {
+                        const result = await apiService.rescoreSiteSurveyResponse(rid);
+                        const idx = (allSiteSurveyResponses || []).findIndex((r) => r && r.id === rid);
+                        if (idx >= 0 && result?.score !== undefined) {
+                            allSiteSurveyResponses[idx] = {
+                                ...allSiteSurveyResponses[idx],
+                                score: result.score,
+                                siteDisposition: result.outcome === 'fail' || result.outcome === 'not_interested'
+                                    ? result.outcome
+                                    : null,
+                                rescoredAt: new Date().toISOString(),
+                            };
+                        } else {
+                            allSiteSurveyResponses = await apiService.getSiteSurveyResponses().catch(() => allSiteSurveyResponses);
+                        }
+                        showNotification(
+                            result?.outcome === 'unscored' && result?.pct == null
+                                ? 'Recalculated — still Unscored (template may have no scoring rules)'
+                                : `Recalculated · ${result.outcome || 'done'}${result.pct != null ? ` · ${result.pct}%` : ''}`,
+                            'success'
+                        );
+                        const updated = (allSiteSurveyResponses || []).find((r) => r && r.id === rid);
+                        if (updated) createSiteSurveyResponseModal(updated);
+                        else if (activeTab === 'feasibility' || activeTab === 'reporting') render();
+                    } catch (err) {
+                        showNotification(err.message || 'Rescore failed', 'error');
+                    } finally {
+                        rescoreOneBtn.disabled = false;
+                    }
+                })();
+                return;
+            }
+            const rescoreAllBtn = e.target.closest('.rescore-survey-all-btn');
+            if (rescoreAllBtn) {
+                const surveyId = rescoreAllBtn.getAttribute('data-definition-id');
+                if (!surveyId) return;
+                const def = (allSiteSurveyDefinitions || []).find((d) => d && d.id === surveyId);
+                const title = def?.title || surveyId;
+                void (async () => {
+                    rescoreAllBtn.disabled = true;
+                    try {
+                        const dry = await apiService.rescoreSiteSurveyDefinitionResponses(surveyId, { dryRun: true });
+                        const n = Number(dry?.wouldRescore || 0);
+                        if (!n) {
+                            showNotification('No live responses to rescore for this survey.', 'info');
+                            return;
+                        }
+                        if (!confirm(`Recalculate scoring for ${n} response(s) on "${title}"?\n\nAnswers are NOT changed. Only stored Pass/Fail/% is updated from the current template.`)) {
+                            return;
+                        }
+                        const result = await apiService.rescoreSiteSurveyDefinitionResponses(surveyId, { dryRun: false });
+                        allSiteSurveyResponses = await apiService.getSiteSurveyResponses().catch(() => allSiteSurveyResponses);
+                        showNotification(
+                            `Rescored ${result.updated || 0} of ${result.scanned || n}${result.failed ? ` · ${result.failed} failed` : ''}`,
+                            result.failed ? 'error' : 'success'
+                        );
+                        if (activeTab === 'feasibility' || activeTab === 'reporting') render();
+                    } catch (err) {
+                        showNotification(err.message || 'Rescore all failed', 'error');
+                    } finally {
+                        rescoreAllBtn.disabled = false;
+                    }
+                })();
                 return;
             }
             const commsPanelBtn = e.target.closest('.comms-panel-btn');

@@ -3064,6 +3064,19 @@ registerPromoteLegacyRoutes(app, {
     generateId,
 });
 
+const { registerSiteMergeRoutes } = require('./site-merge-routes');
+registerSiteMergeRoutes(app, {
+    getContainer,
+    handleError,
+    generateId,
+});
+
+const { registerSurveyRescoreRoutes } = require('./survey-rescore-routes');
+registerSurveyRescoreRoutes(app, {
+    getContainer,
+    handleError,
+});
+
 // =================================================================================
 // PRIVACY / GDPR ops (ARTEMIS only) — survey export, erase, retention; no Chaos/NASA
 // =================================================================================
