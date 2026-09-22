@@ -1407,6 +1407,9 @@ function registerSurveySecureRoutes(app, deps) {
                     .trim()
                     .slice(0, 12000);
 
+                // One batch for this Send click (assignments + optional attachments).
+                const sendBatchId = generateId();
+
                 let attachmentMeta = [];
                 let emailFiles = [];
                 try {
@@ -1417,7 +1420,7 @@ function registerSurveySecureRoutes(app, deps) {
                             getCosmosClient,
                             generateId,
                             incoming,
-                            { surveyId, operator, batchId: generateId() }
+                            { surveyId, operator, batchId: sendBatchId }
                         );
                         const docs = await loadAttachmentDocs(
                             getContainer,
@@ -1528,6 +1531,10 @@ function registerSurveySecureRoutes(app, deps) {
                         studyTitle: studyTitle || undefined,
                         // Same hash on every assignment in this send — one password unlocks all links.
                         passwordHash: invitePasswordHash || undefined,
+                        // Cohort: all sites in this Send share one batchId.
+                        batchId: sendBatchId,
+                        batchSentAt: now,
+                        batchSize: siteIds.length,
                         createdAt: now,
                         updatedAt: now,
                         lastSentAt: now,
@@ -1634,6 +1641,7 @@ function registerSurveySecureRoutes(app, deps) {
                         count: results.length,
                         surveyId,
                         surveyTitle: definition.title,
+                        batchId: sendBatchId,
                         emailProvider: emailProviderStatus(),
                         cc: ccEmails,
                         subject: customSubject || null,

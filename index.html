@@ -1516,7 +1516,9 @@
         let commsStatusFilter = 'all'; // all | completed | in_progress | not_started | stale
         let commsStatusSurveyId = null; // null = template overview; else drill into one survey
         let commsResponsesSurveyId = null; // null = responses by survey; else drill into one survey
-        let commsResponsesFilter = 'all'; // all | new | reviewed
+        let commsResponsesBatchId = null; // null = batches for survey; else one send cohort
+        let commsResponsesFilter = 'all'; // all | submitted | pending | new | reviewed
+        let feasibilityReportCohort = 'invited'; // invited = send cohort only; all = any answers on file
         const COMMS_LIST_CAP = 25;
 
         const isSurveyResponseReviewed = (r) => !!(r && (r.reviewedAt || r.reviewed === true));
@@ -4286,7 +4288,6 @@
             const total = asSurveyList(questions).length;
 
             // Role match: exact role, OR shared site invite, OR empty role.
-            // Completion is site-level — a submitted shared link still counts as done.
             const roleOk = (role) => {
                 if (!roleFilter || roleFilter === 'all') return true;
                 const r = String(role || '').toLowerCase();
@@ -4294,36 +4295,43 @@
                 return r === roleFilter;
             };
 
-            const sameSurveyResponses = (allSiteSurveyResponses || [])
-                .filter((r) => {
-                    if (!r || r._archived || !ids.has(r.siteId)) return false;
-                    if (String(r.surveyId || '') !== String(surveyId || '')) return false;
-                    return roleOk(r.targetRole);
-                })
-                .slice()
-                .sort((a, b) => String(b.submittedAt || b.createdAt || '')
-                    .localeCompare(String(a.submittedAt || a.createdAt || '')));
+            const realAssignments = (allSiteSurveyAssignments || []).filter((a) => {
+                if (!a || !a.id || !ids.has(a.siteId)) return false;
+                if (String(a.surveyId || '') !== String(surveyId || '')) return false;
+                return roleOk(a.targetRole);
+            });
 
-            const submitted = sameSurveyResponses[0] || null;
-            if (submitted) {
+            // 100% ONLY when a real Artemis invite was submitted — not ingested/historical
+            // responses that carry synthetic assignmentIds (asg-gf-*, asg-feas-*, etc.).
+            const submittedAsg = realAssignments.find(
+                (a) => String(a.status || '').toLowerCase() === 'submitted'
+            );
+            if (submittedAsg) {
+                const linkedRsp = (allSiteSurveyResponses || []).find((r) => {
+                    if (!r || r._archived) return false;
+                    if (String(r.surveyId || '') !== String(surveyId || '')) return false;
+                    if (!ids.has(r.siteId) && r.assignmentId !== submittedAsg.id) return false;
+                    return r.assignmentId === submittedAsg.id || ids.has(r.siteId);
+                });
                 return {
                     status: 'submitted',
                     completePct: 100,
                     filled: total,
                     total,
-                    responseId: submitted.id,
-                    when: submitted.submittedAt || submitted.createdAt || '',
+                    responseId: linkedRsp?.id || '',
+                    when: linkedRsp?.submittedAt || linkedRsp?.createdAt
+                        || submittedAsg.submittedAt || submittedAsg.updatedAt || submittedAsg.createdAt || '',
                 };
             }
+
+            // Response tied to a real (non-submitted) assignment still isn't 100% —
+            // fall through to fill %. Ingest-only responses have no real assignment → partial.
 
             // Draft progress on open assignments for this survey
             let draftFilled = 0;
             let draftWhen = '';
-            (allSiteSurveyAssignments || []).forEach((a) => {
-                if (!a || !ids.has(a.siteId)) return;
-                if (String(a.surveyId || '') !== String(surveyId || '')) return;
+            realAssignments.forEach((a) => {
                 if (String(a.status || '').toLowerCase() === 'submitted') return;
-                if (!roleOk(a.targetRole)) return;
                 if (!Array.isArray(a.draftAnswers) || !a.draftAnswers.length) return;
                 const { filled } = countFilledAnswersAgainstQuestions(a.draftAnswers, questions);
                 if (filled > draftFilled) {
@@ -4332,17 +4340,14 @@
                 }
             });
 
-            // Answers already on file for this template (prior Long/Short/etc. mapped in)
+            // Answers already on file for this template (prior Long/Short/ingest mapped in)
             const coverage = Number.isFinite(Number(coverageFilled))
                 ? Math.max(0, Number(coverageFilled))
                 : 0;
             const filled = Math.max(draftFilled, coverage);
-            const invited = (allSiteSurveyAssignments || []).some((a) => {
-                if (!a || !ids.has(a.siteId)) return false;
-                if (String(a.surveyId || '') !== String(surveyId || '')) return false;
-                if (!roleOk(a.targetRole)) return false;
-                return String(a.status || '').toLowerCase() !== 'submitted';
-            });
+            const invited = realAssignments.some(
+                (a) => String(a.status || '').toLowerCase() !== 'submitted'
+            );
 
             if (filled > 0 && total > 0) {
                 const raw = Math.round((filled / total) * 100);
@@ -4366,6 +4371,10 @@
 
         const buildFeasibilityQuestionReport = (surveyId, targetRole = 'all', opts = {}) => {
             const includeEmptySites = opts.includeEmptySites === true;
+            // Default: only sites we actually invited (send cohort). Pass invitedOnly:false for prior/mapped everyone.
+            const invitedOnly = opts.invitedOnly !== undefined
+                ? opts.invitedOnly === true
+                : (feasibilityReportCohort !== 'all');
             const def = (allSiteSurveyDefinitions || []).find(d => d && d.id === surveyId) || null;
             const questions = asSurveyList(def?.questions);
             const questionTotal = questions.length;
@@ -4382,25 +4391,30 @@
             if (includeEmptySites) {
                 buildUnifiedSitesCatalog().forEach((s) => { if (s?.id) canonicalSites.add(s.id); });
             }
-            (allSiteSurveyResponses || []).forEach((r) => {
-                if (!r || r._archived || !r.siteId) return;
-                if (roleFilter && roleFilter !== 'all'
-                    && String(r.targetRole || '').toLowerCase() !== roleFilter) return;
-                // Prefer same-survey sites always; also take any response so prior GF/Long
-                // can show coverage against Mighty / study templates.
-                if (!(crossSurvey || isGf || r.surveyId === surveyId)) return;
-                const cid = canonicalSiteIdForReporting(r.siteId);
-                if (cid) canonicalSites.add(cid);
-            });
             // Always include invited sites for this survey (shows 0% / in-progress)
+            const invitedCanonical = new Set();
             (allSiteSurveyAssignments || []).forEach((a) => {
                 if (!a?.siteId || a.surveyId !== surveyId) return;
                 if (roleFilter && roleFilter !== 'all'
                     && String(a.targetRole || '').toLowerCase() !== roleFilter) return;
                 const cid = canonicalSiteIdForReporting(a.siteId);
-                if (cid) canonicalSites.add(cid);
+                if (cid) {
+                    invitedCanonical.add(cid);
+                    canonicalSites.add(cid);
+                }
             });
-
+            if (!invitedOnly) {
+                (allSiteSurveyResponses || []).forEach((r) => {
+                    if (!r || r._archived || !r.siteId) return;
+                    if (roleFilter && roleFilter !== 'all'
+                        && String(r.targetRole || '').toLowerCase() !== roleFilter) return;
+                    // Prefer same-survey sites always; also take any response so prior GF/Long
+                    // can show coverage against Mighty / study templates.
+                    if (!(crossSurvey || isGf || r.surveyId === surveyId)) return;
+                    const cid = canonicalSiteIdForReporting(r.siteId);
+                    if (cid) canonicalSites.add(cid);
+                });
+            }
             const siteRows = [];
             canonicalSites.forEach((siteId) => {
                 const merged = buildMergedFeasibilityAnswersForSite(siteId, questions, {
@@ -4508,7 +4522,16 @@
                 return { question: q, answered, skipped, distribution, samples, isLongText };
             });
 
-            return { def, questions, siteRows, questionStats, hasScoring: surveyDefinitionHasScoring(def), questionTotal };
+            return {
+                def,
+                questions,
+                siteRows,
+                questionStats,
+                hasScoring: surveyDefinitionHasScoring(def),
+                questionTotal,
+                invitedOnly,
+                invitedCount: invitedCanonical.size,
+            };
         };
 
         const answeredPctBadgeHtml = (pct, status = '') => {
@@ -4565,6 +4588,9 @@
                         <div>
                             <div class="font-semibold">Survey completion</div>
                             <div class="text-xs text-white/80 mt-0.5">
+                                ${report.invitedOnly
+                                    ? `Send cohort only (${report.invitedCount || report.siteRows.length} invited) · `
+                                    : 'All answers on file · '}
                                 100% = submitted this survey. Below that = questions already on file (prior answers + drafts) ÷ total — capped at 99% until they submit.
                             </div>
                         </div>
@@ -4746,7 +4772,9 @@
                 return `<div class="text-sm text-gray-500 dark:text-gray-400 py-6 text-center">This survey has no questions.</div>`;
             }
             if (!report.siteRows.length) {
-                return `<div class="text-sm text-gray-500 dark:text-gray-400 py-6 text-center">No answered feasibility fields on file yet${feasibilityReportRole !== 'all' ? ` (${escapeHtml(formatSiteSurveyRoleLabel(feasibilityReportRole))})` : ''}.</div>`;
+                return `<div class="text-sm text-gray-500 dark:text-gray-400 py-6 text-center">${report.invitedOnly
+                    ? 'No invites sent for this survey yet (or nothing in the send cohort). Switch Cohort to “All answers on file” to see prior/mapped sites.'
+                    : `No answered feasibility fields on file yet${feasibilityReportRole !== 'all' ? ` (${escapeHtml(formatSiteSurveyRoleLabel(feasibilityReportRole))})` : ''}.`}</div>`;
             }
 
                 const distHtml = report.questionStats.map((stat, idx) => {
@@ -4867,7 +4895,11 @@
                 const report = buildFeasibilityQuestionReport(
                     sid,
                     targetRole || feasibilityReportRole,
-                    { includeEmptySites: wantEveryone }
+                    {
+                        includeEmptySites: wantEveryone,
+                        // Full catalog export ignores cohort; selected CSV follows the UI toggle.
+                        invitedOnly: wantEveryone ? false : (feasibilityReportCohort !== 'all'),
+                    }
                 );
                 if (!report.def) {
                     showNotification('Survey definition not found.', 'error');
@@ -5574,7 +5606,7 @@
                 || (allSiteSurveyDefinitions || [])[0]?.id
                 || null;
             feasibilityReportSurveyId = surveyId;
-            const token = `${surveyId || ''}::${feasibilityReportRole || 'all'}::${__siteLinkRevision}`;
+            const token = `${surveyId || ''}::${feasibilityReportRole || 'all'}::${feasibilityReportCohort || 'invited'}::${__siteLinkRevision}`;
             root.dataset.reportToken = token;
             root.innerHTML = `
                 <div class="rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 px-4 py-8 text-center">
@@ -5584,7 +5616,10 @@
             const run = () => {
                 if (root.dataset.reportToken !== token) return;
                 const report = surveyId
-                    ? buildFeasibilityQuestionReport(surveyId, feasibilityReportRole, { includeEmptySites: false })
+                    ? buildFeasibilityQuestionReport(surveyId, feasibilityReportRole, {
+                        includeEmptySites: false,
+                        invitedOnly: feasibilityReportCohort !== 'all',
+                    })
                     : null;
                 if (root.dataset.reportToken !== token) return;
                 root.innerHTML = renderFeasibilityReportBodyHtml(report);
@@ -5627,6 +5662,17 @@
                     roleSel.dataset.bound = '1';
                     roleSel.addEventListener('change', () => {
                         feasibilityReportRole = roleSel.value || 'all';
+                        refreshFeasibilityReportRoot();
+                    });
+                }
+            }
+            const cohortSel = document.getElementById('feasibility-cohort-select');
+            if (cohortSel) {
+                cohortSel.value = feasibilityReportCohort || 'invited';
+                if (!cohortSel.dataset.bound) {
+                    cohortSel.dataset.bound = '1';
+                    cohortSel.addEventListener('change', () => {
+                        feasibilityReportCohort = cohortSel.value === 'all' ? 'all' : 'invited';
                         refreshFeasibilityReportRoot();
                     });
                 }
@@ -6432,6 +6478,27 @@
             stale: { label: 'Expired / revoked', chip: 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-200' },
         }[kind] || { label: kind || 'Unknown', chip: 'bg-gray-100 text-gray-600' });
 
+        /** Group key for one Send click. New invites stamp batchId; older ones fall back to day + sender. */
+        const surveySendBatchKey = (a) => {
+            if (!a) return 'unknown';
+            if (a.batchId) return String(a.batchId);
+            const when = a.batchSentAt || a.lastSentAt || a.createdAt || '';
+            const day = when ? String(when).slice(0, 10) : 'unknown';
+            const by = String(a.sentBy || a.createdBy || 'unknown').trim().toLowerCase() || 'unknown';
+            return `legacy:${a.surveyId || ''}:${day}:${by}`;
+        };
+
+        const surveySendBatchLabel = (batch) => {
+            if (!batch) return 'Send batch';
+            const when = batch.sentAt ? new Date(batch.sentAt) : null;
+            const dateStr = when && !Number.isNaN(when.getTime())
+                ? when.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
+                : 'Unknown date';
+            const by = batch.sentBy ? ` · by ${batch.sentBy}` : '';
+            const legacy = String(batch.id || '').startsWith('legacy:') ? ' · grouped by send day' : '';
+            return `Sent ${dateStr}${by}${legacy}`;
+        };
+
         const renderFeasibility = () => {
             const body = document.getElementById('comms-panel-body');
             const titleEl = document.getElementById('comms-panel-title');
@@ -6469,9 +6536,12 @@
             if (titleEl) titleEl.textContent = titles[commsPanel] || 'Feasibility';
             if (actionsEl) {
                 if (commsPanel === 'responses') {
+                    const backLabel = commsResponsesBatchId
+                        ? '← Batches'
+                        : (commsResponsesSurveyId ? '← All surveys' : '');
                     actionsEl.innerHTML = `
-                        ${commsResponsesSurveyId
-                            ? `<button type="button" id="comms-responses-back-btn" class="text-xs font-medium px-2 py-1 rounded border border-gray-300 dark:border-gray-600">← All surveys</button>`
+                        ${backLabel
+                            ? `<button type="button" id="comms-responses-back-btn" class="text-xs font-medium px-2 py-1 rounded border border-gray-300 dark:border-gray-600">${backLabel}</button>`
                             : ''}
                         <button type="button" id="comms-responses-mark-read-btn" class="text-xs font-medium px-2 py-1 rounded border border-gray-300 dark:border-gray-600">Mark ${commsResponsesSurveyId ? 'survey' : 'all'} read</button>
                         <button type="button" id="jump-survey-reporting-btn" class="text-xs font-medium text-indigo-600 dark:text-indigo-400 hover:underline">Question report →</button>
@@ -6816,36 +6886,116 @@
             } else if (commsPanel === 'responses') {
                 const siteNameById = new Map((allSites || []).map((s) => [s.id, s.name || s.id]));
                 const surveyTitleById = new Map(allDefs.map((d) => [d.id, d.title || d.id]));
-                const enriched = responses.map((r) => {
-                    const siteName = siteNameById.get(r.siteId) || r.siteId || '—';
-                    const surveyId = r.surveyId || '_unknown';
-                    const surveyTitle = surveyTitleById.get(surveyId) || surveyId || '(untitled survey)';
-                    const reviewed = isSurveyResponseReviewed(r);
-                    const when = r.submittedAt || r.createdAt || '';
-                    return { r, siteName, surveyId, surveyTitle, reviewed, when };
+                const responseByAsg = new Map();
+                responses.forEach((r) => {
+                    if (r?.assignmentId) responseByAsg.set(String(r.assignmentId), r);
                 });
+
+                // Build invite rows (assignments) — includes pending who have not submitted yet
+                const inviteItems = assignments.map((a) => {
+                    const kind = classifySurveyInviteStatus(a);
+                    const siteName = siteNameById.get(a.siteId) || a.siteId || '—';
+                    const surveyId = a.surveyId || '_unknown';
+                    const surveyTitle = surveyTitleById.get(surveyId) || surveyId || '(untitled survey)';
+                    const resp = responseByAsg.get(String(a.id)) || null;
+                    const reviewed = resp ? isSurveyResponseReviewed(resp) : false;
+                    const when = (resp && (resp.submittedAt || resp.createdAt))
+                        || a.submittedAt || a.draftSavedAt || a.openedAt || a.lastSentAt || a.createdAt || '';
+                    const batchKey = surveySendBatchKey(a);
+                    return {
+                        a,
+                        kind,
+                        siteName,
+                        surveyId,
+                        surveyTitle,
+                        resp,
+                        reviewed,
+                        when,
+                        batchKey,
+                        hasResponse: Boolean(resp),
+                    };
+                });
+
+                // Orphan responses (ingest / no live assignment) — only for survey drill lists
+                const assignedIds = new Set(assignments.map((a) => a.id).filter(Boolean));
+                const orphanResponses = responses.filter((r) => {
+                    if (!r) return false;
+                    if (r.assignmentId && assignedIds.has(r.assignmentId)) return false;
+                    // Prefer linking by assignmentId when assignment still exists outside site filter
+                    if (r.assignmentId && (allSiteSurveyAssignments || []).some((a) => a && a.id === r.assignmentId)) {
+                        return false;
+                    }
+                    return true;
+                });
+
                 const bySurvey = new Map();
-                enriched.forEach((item) => {
-                    if (!bySurvey.has(item.surveyId)) {
-                        bySurvey.set(item.surveyId, {
+                const ensureSurvey = (surveyId, surveyTitle) => {
+                    if (!bySurvey.has(surveyId)) {
+                        bySurvey.set(surveyId, {
+                            surveyId,
+                            surveyTitle: surveyTitle || surveyTitleById.get(surveyId) || surveyId,
+                            invites: [],
+                            batches: new Map(),
+                            submitted: 0,
+                            pending: 0,
+                            newCount: 0,
+                            orphanCount: 0,
+                        });
+                    }
+                    return bySurvey.get(surveyId);
+                };
+
+                inviteItems.forEach((item) => {
+                    const g = ensureSurvey(item.surveyId, item.surveyTitle);
+                    g.invites.push(item);
+                    if (item.kind === 'completed') g.submitted += 1;
+                    else g.pending += 1;
+                    if (item.resp && !item.reviewed) g.newCount += 1;
+
+                    if (!g.batches.has(item.batchKey)) {
+                        g.batches.set(item.batchKey, {
+                            id: item.batchKey,
                             surveyId: item.surveyId,
-                            surveyTitle: item.surveyTitle,
+                            sentAt: item.a.batchSentAt || item.a.lastSentAt || item.a.createdAt || '',
+                            sentBy: item.a.sentBy || item.a.createdBy || '',
                             items: [],
-                            total: 0,
+                            submitted: 0,
+                            pending: 0,
                             newCount: 0,
                         });
                     }
-                    const g = bySurvey.get(item.surveyId);
-                    g.items.push(item);
-                    g.total += 1;
-                    if (!item.reviewed) g.newCount += 1;
+                    const b = g.batches.get(item.batchKey);
+                    b.items.push(item);
+                    if (item.kind === 'completed') b.submitted += 1;
+                    else b.pending += 1;
+                    if (item.resp && !item.reviewed) b.newCount += 1;
+                    // Prefer earliest stamped batch time
+                    const t = item.a.batchSentAt || item.a.lastSentAt || item.a.createdAt || '';
+                    if (t && (!b.sentAt || String(t) < String(b.sentAt))) b.sentAt = t;
+                    if (!b.sentBy && (item.a.sentBy || item.a.createdBy)) {
+                        b.sentBy = item.a.sentBy || item.a.createdBy;
+                    }
                 });
-                const surveyGroups = [...bySurvey.values()].sort((a, b) => {
-                    if (b.newCount !== a.newCount) return b.newCount - a.newCount;
+
+                orphanResponses.forEach((r) => {
+                    const surveyId = r.surveyId || '_unknown';
+                    const g = ensureSurvey(surveyId, surveyTitleById.get(surveyId));
+                    g.orphanCount += 1;
+                    if (!isSurveyResponseReviewed(r)) g.newCount += 1;
+                });
+
+                const surveyGroups = [...bySurvey.values()].map((g) => {
+                    const batchList = [...g.batches.values()].sort((a, b) =>
+                        String(b.sentAt || '').localeCompare(String(a.sentAt || ''))
+                    );
+                    return { ...g, batchList };
+                }).sort((a, b) => {
+                    if (b.pending !== a.pending) return b.pending - a.pending;
+                    if (b.submitted !== a.submitted) return b.submitted - a.submitted;
                     return String(a.surveyTitle).localeCompare(String(b.surveyTitle));
                 });
 
-                const filter = ['all', 'new', 'reviewed'].includes(commsResponsesFilter)
+                const filter = ['all', 'submitted', 'pending', 'new', 'reviewed'].includes(commsResponsesFilter)
                     ? commsResponsesFilter
                     : 'all';
                 const chipBtn = (id, label, count) => {
@@ -6855,94 +7005,169 @@
                         : 'bg-white dark:bg-gray-900 text-gray-700 dark:text-gray-200 border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-800'}" data-responses-filter="${id}">${label} <span class="opacity-80">${count}</span></button>`;
                 };
 
-                const focused = commsResponsesSurveyId
+                const focusedSurvey = commsResponsesSurveyId
                     ? surveyGroups.find((g) => g.surveyId === commsResponsesSurveyId) || null
                     : null;
+                const focusedBatch = focusedSurvey && commsResponsesBatchId
+                    ? focusedSurvey.batchList.find((b) => b.id === commsResponsesBatchId) || null
+                    : null;
 
-                if (!commsResponsesSurveyId || !focused) {
+                const inviteRow = (item) => {
+                    const meta = surveyInviteStatusMeta(item.kind);
+                    const whenLabel = item.when ? new Date(item.when).toLocaleString() : '—';
+                    const role = formatSiteSurveyRoleLabel(item.a.targetRole);
+                    const def = allDefs.find((d) => d.id === item.surveyId);
+                    const answerCount = item.resp
+                        ? asSurveyList(item.resp.answers).filter((a) => a && String(a.value ?? '').trim() !== '').length
+                        : 0;
+                    const search = `${item.siteName} ${item.surveyTitle} ${item.a.targetEmail || ''} ${role} ${meta.label}`.toLowerCase();
+                    return `
+                        <div class="comms-row flex items-center gap-2 px-2.5 py-2 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700/40 ${item.resp && !item.reviewed ? 'bg-emerald-50/50 dark:bg-emerald-950/20' : ''}" data-search="${escapeHtml(search)}">
+                            <div class="min-w-0 flex-1">
+                                <div class="flex items-center gap-2 min-w-0 flex-wrap">
+                                    <div class="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">${escapeHtml(item.siteName)}</div>
+                                    <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold ${meta.chip}">${escapeHtml(meta.label)}</span>
+                                    ${item.resp && !item.reviewed
+                                        ? '<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-100 text-emerald-800 dark:bg-emerald-900/50 dark:text-emerald-200">New</span>'
+                                        : ''}
+                                    ${item.resp ? surveyOutcomeBadgeHtml(item.resp, def) : ''}
+                                </div>
+                                <div class="text-xs text-gray-500 dark:text-gray-400 truncate">
+                                    ${escapeHtml(role)}${item.a.targetEmail ? ` · ${escapeHtml(item.a.targetEmail)}` : ''}${item.resp ? ` · ${answerCount} ans` : ''} · ${escapeHtml(whenLabel)}
+                                </div>
+                            </div>
+                            <div class="flex items-center gap-1 shrink-0">
+                                ${item.resp && !item.reviewed
+                                    ? `<button type="button" class="mark-one-response-read-btn px-2 py-1 rounded text-xs border border-gray-300 dark:border-gray-600" data-response-id="${escapeHtml(item.resp.id)}">Mark read</button>`
+                                    : ''}
+                                ${item.resp
+                                    ? `<button type="button" class="view-site-survey-response-btn px-2 py-1 rounded text-xs bg-gray-100 dark:bg-gray-700" data-response-id="${escapeHtml(item.resp.id)}">View</button>`
+                                    : `<button type="button" class="remind-site-survey-btn px-2 py-1 rounded text-xs bg-amber-600 text-white" data-assignment-id="${escapeHtml(item.a.id)}" data-status-kind="${escapeHtml(item.kind)}" data-needs-password="${item.a.passwordHash ? '1' : '0'}" data-site-name="${escapeHtml(item.siteName)}" data-email="${escapeHtml(item.a.targetEmail || '')}">Remind</button>`}
+                            </div>
+                        </div>`;
+                };
+
+                if (!commsResponsesSurveyId || !focusedSurvey) {
                     if (titleEl) titleEl.textContent = 'Responses by survey';
                     body.innerHTML = surveyGroups.length === 0
-                        ? empty('No responses yet.')
+                        ? empty('No invites or responses yet. Hit Send survey.')
                         : `
                             <div class="px-1 mb-2 text-xs text-gray-500 dark:text-gray-400">
-                                ${surveyGroups.length} survey${surveyGroups.length === 1 ? '' : 's'} · ${enriched.filter((x) => !x.reviewed).length} new · open a survey to review · View marks as read
+                                Open a survey to see send batches — who was invited together, who submitted, who’s still pending.
                             </div>
                             ${surveyGroups.map((g) => {
                                 const search = `${g.surveyTitle} ${g.surveyId}`.toLowerCase();
+                                const total = g.invites.length;
                                 return `
                                     <div class="comms-row mb-2 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden" data-search="${escapeHtml(search)}">
                                         <div class="px-3 py-2.5 flex flex-wrap items-center gap-2 bg-gray-50/80 dark:bg-gray-900/30">
                                             <div class="min-w-0 flex-1">
                                                 <div class="text-sm font-semibold text-gray-900 dark:text-gray-100 truncate">${escapeHtml(g.surveyTitle)}</div>
                                                 <div class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
-                                                    ${g.total} response${g.total === 1 ? '' : 's'}${g.newCount ? ` · ${g.newCount} new` : ' · all reviewed'}
+                                                    ${total} invited · ${g.submitted} submitted · ${g.pending} pending · ${g.batchList.length} batch${g.batchList.length === 1 ? '' : 'es'}${g.newCount ? ` · ${g.newCount} new` : ''}${g.orphanCount ? ` · ${g.orphanCount} historical` : ''}
                                                 </div>
                                             </div>
-                                            <div class="flex items-center gap-1.5 shrink-0">
-                                                ${g.newCount
-                                                    ? `<button type="button" class="mark-survey-responses-read-btn px-2 py-1 rounded text-xs border border-gray-300 dark:border-gray-600" data-survey-id="${escapeHtml(g.surveyId)}">Mark read (${g.newCount})</button>`
-                                                    : ''}
-                                                <button type="button" class="comms-responses-open-survey-btn px-2 py-1 rounded text-xs bg-indigo-600 text-white" data-survey-id="${escapeHtml(g.surveyId)}">View responses</button>
-                                            </div>
+                                            <button type="button" class="comms-responses-open-survey-btn px-2 py-1 rounded text-xs bg-indigo-600 text-white shrink-0" data-survey-id="${escapeHtml(g.surveyId)}">View batches</button>
                                         </div>
                                     </div>`;
                             }).join('')}`;
                     if (footerEl) {
-                        footerEl.textContent = `${enriched.length} response${enriched.length === 1 ? '' : 's'} across ${surveyGroups.length} survey${surveyGroups.length === 1 ? '' : 's'}`;
+                        const inv = inviteItems.length;
+                        footerEl.textContent = `${inv} invite${inv === 1 ? '' : 's'} · ${surveyGroups.length} survey${surveyGroups.length === 1 ? '' : 's'}`;
+                    }
+                } else if (!commsResponsesBatchId || !focusedBatch) {
+                    if (titleEl) titleEl.textContent = focusedSurvey.surveyTitle;
+                    const orphans = orphanResponses.filter((r) => (r.surveyId || '_unknown') === focusedSurvey.surveyId);
+                    body.innerHTML = `
+                        <div class="px-1 mb-2 text-xs text-gray-500 dark:text-gray-400">
+                            ${focusedSurvey.submitted} submitted · ${focusedSurvey.pending} pending · ${focusedSurvey.batchList.length} send batch${focusedSurvey.batchList.length === 1 ? '' : 'es'}
+                            — each batch is one Send click (sites invited together).
+                        </div>
+                        ${focusedSurvey.batchList.length === 0 && !orphans.length
+                            ? empty('No sends for this survey yet.')
+                            : focusedSurvey.batchList.map((b) => {
+                                const search = `${surveySendBatchLabel(b)} ${b.sentBy || ''}`.toLowerCase();
+                                return `
+                                    <div class="comms-row mb-2 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden" data-search="${escapeHtml(search)}">
+                                        <div class="px-3 py-2.5 flex flex-wrap items-center gap-2 bg-gray-50/80 dark:bg-gray-900/30">
+                                            <div class="min-w-0 flex-1">
+                                                <div class="text-sm font-semibold text-gray-900 dark:text-gray-100 truncate">${escapeHtml(surveySendBatchLabel(b))}</div>
+                                                <div class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                                                    ${b.items.length} site${b.items.length === 1 ? '' : 's'} · ${b.submitted} submitted · ${b.pending} pending${b.newCount ? ` · ${b.newCount} new` : ''}
+                                                </div>
+                                            </div>
+                                            <button type="button" class="comms-responses-open-batch-btn px-2 py-1 rounded text-xs bg-indigo-600 text-white shrink-0" data-batch-id="${escapeHtml(b.id)}">Open batch</button>
+                                        </div>
+                                    </div>`;
+                            }).join('')}
+                        ${orphans.length ? `
+                            <div class="mt-3 px-1">
+                                <div class="text-[10px] font-semibold uppercase tracking-wide text-gray-400 mb-1">Historical / no live invite (${orphans.length})</div>
+                                ${orphans.slice(0, cap).map((r) => {
+                                    const siteName = siteNameById.get(r.siteId) || r.siteId || '—';
+                                    const reviewed = isSurveyResponseReviewed(r);
+                                    const whenLabel = (r.submittedAt || r.createdAt)
+                                        ? new Date(r.submittedAt || r.createdAt).toLocaleString()
+                                        : '—';
+                                    const search = `${siteName} ${r.email || ''}`.toLowerCase();
+                                    return `
+                                        <div class="comms-row flex items-center gap-2 px-2.5 py-2 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700/40 ${reviewed ? '' : 'bg-emerald-50/50 dark:bg-emerald-950/20'}" data-search="${escapeHtml(search)}">
+                                            <div class="min-w-0 flex-1">
+                                                <div class="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">${escapeHtml(siteName)}</div>
+                                                <div class="text-xs text-gray-500 dark:text-gray-400 truncate">${escapeHtml(formatSiteSurveyRoleLabel(r.targetRole))} · ${escapeHtml(whenLabel)}</div>
+                                            </div>
+                                            <button type="button" class="view-site-survey-response-btn px-2 py-1 rounded text-xs bg-gray-100 dark:bg-gray-700" data-response-id="${escapeHtml(r.id)}">View</button>
+                                        </div>`;
+                                }).join('')}
+                            </div>` : ''}
+                    `;
+                    if (footerEl) {
+                        footerEl.textContent = `${focusedSurvey.invites.length} invited · ${focusedSurvey.batchList.length} batch${focusedSurvey.batchList.length === 1 ? '' : 'es'} · ${focusedSurvey.surveyTitle}`;
                     }
                 } else {
-                    if (titleEl) titleEl.textContent = focused.surveyTitle;
+                    if (titleEl) titleEl.textContent = surveySendBatchLabel(focusedBatch);
                     const counts = {
-                        all: focused.total,
-                        new: focused.newCount,
-                        reviewed: focused.total - focused.newCount,
+                        all: focusedBatch.items.length,
+                        submitted: focusedBatch.submitted,
+                        pending: focusedBatch.pending,
+                        new: focusedBatch.newCount,
+                        reviewed: focusedBatch.items.filter((x) => x.resp && x.reviewed).length,
                     };
-                    const filtered = focused.items
+                    const filtered = focusedBatch.items
                         .filter((x) => {
-                            if (filter === 'new') return !x.reviewed;
-                            if (filter === 'reviewed') return x.reviewed;
+                            if (filter === 'submitted') return x.kind === 'completed';
+                            if (filter === 'pending') return x.kind !== 'completed';
+                            if (filter === 'new') return x.resp && !x.reviewed;
+                            if (filter === 'reviewed') return x.resp && x.reviewed;
                             return true;
                         })
-                        .sort((a, b) => String(b.when || '').localeCompare(String(a.when || '')));
+                        .sort((a, b) => {
+                            const rank = { not_started: 0, in_progress: 1, stale: 2, completed: 3 };
+                            const rd = (rank[a.kind] ?? 9) - (rank[b.kind] ?? 9);
+                            if (rd !== 0) return rd;
+                            return String(b.when || '').localeCompare(String(a.when || ''));
+                        });
                     const shown = filtered.slice(0, cap);
                     body.innerHTML = `
                         <div class="flex flex-wrap gap-1.5 mb-3 px-1">
                             ${chipBtn('all', 'All', counts.all)}
+                            ${chipBtn('submitted', 'Submitted', counts.submitted)}
+                            ${chipBtn('pending', 'Pending', counts.pending)}
                             ${chipBtn('new', 'New', counts.new)}
                             ${chipBtn('reviewed', 'Reviewed', counts.reviewed)}
                         </div>
+                        <div class="px-1 mb-2 text-xs text-gray-500 dark:text-gray-400">
+                            ${focusedBatch.submitted} of ${focusedBatch.items.length} submitted
+                            ${filter !== 'all' ? ` · showing ${filter}` : ''}
+                        </div>
                         ${filtered.length === 0
                             ? empty('Nothing in this filter.')
-                            : shown.map((item) => {
-                                const def = allDefs.find((d) => d.id === item.surveyId);
-                                const answerCount = asSurveyList(item.r.answers).filter((a) => a && String(a.value ?? '').trim() !== '').length;
-                                const whenLabel = item.when ? new Date(item.when).toLocaleString() : '—';
-                                const search = `${item.siteName} ${item.surveyTitle} ${item.r.targetRole || ''} ${item.r.email || ''}`.toLowerCase();
-                                return `
-                                    <div class="comms-row flex items-center gap-2 px-2.5 py-2 rounded-md hover:bg-gray-50 dark:hover:bg-gray-700/40 ${item.reviewed ? '' : 'bg-emerald-50/50 dark:bg-emerald-950/20'}" data-search="${escapeHtml(search)}">
-                                        <div class="min-w-0 flex-1">
-                                            <div class="flex items-center gap-2 min-w-0 flex-wrap">
-                                                <div class="text-sm font-medium text-gray-900 dark:text-gray-100 truncate">${escapeHtml(item.siteName)}</div>
-                                                ${item.reviewed
-                                                    ? ''
-                                                    : '<span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-100 text-emerald-800 dark:bg-emerald-900/50 dark:text-emerald-200">New</span>'}
-                                                ${surveyOutcomeBadgeHtml(item.r, def)}
-                                            </div>
-                                            <div class="text-xs text-gray-500 dark:text-gray-400 truncate">${escapeHtml(formatSiteSurveyRoleLabel(item.r.targetRole))} · ${answerCount} ans · ${escapeHtml(whenLabel)}</div>
-                                        </div>
-                                        <div class="flex items-center gap-1 shrink-0">
-                                            ${item.reviewed
-                                                ? ''
-                                                : `<button type="button" class="mark-one-response-read-btn px-2 py-1 rounded text-xs border border-gray-300 dark:border-gray-600" data-response-id="${escapeHtml(item.r.id)}">Mark read</button>`}
-                                            <button type="button" class="view-site-survey-response-btn px-2 py-1 rounded text-xs bg-gray-100 dark:bg-gray-700" data-response-id="${escapeHtml(item.r.id)}">View</button>
-                                        </div>
-                                    </div>`;
-                            }).join('')}
+                            : shown.map(inviteRow).join('')}
                     `;
                     if (footerEl) {
                         footerEl.textContent = filtered.length > cap
-                            ? `Showing latest ${cap} of ${filtered.length} · ${focused.surveyTitle}`
-                            : `${filtered.length} response${filtered.length === 1 ? '' : 's'} · ${focused.surveyTitle}`;
+                            ? `Showing ${cap} of ${filtered.length} · ${focusedSurvey.surveyTitle}`
+                            : `${filtered.length} site${filtered.length === 1 ? '' : 's'} · ${focusedSurvey.surveyTitle}`;
                     }
                 }
 
@@ -6955,6 +7180,14 @@
                 body.querySelectorAll('.comms-responses-open-survey-btn').forEach((btn) => {
                     btn.addEventListener('click', () => {
                         commsResponsesSurveyId = btn.getAttribute('data-survey-id') || null;
+                        commsResponsesBatchId = null;
+                        commsResponsesFilter = 'all';
+                        renderFeasibility();
+                    });
+                });
+                body.querySelectorAll('.comms-responses-open-batch-btn').forEach((btn) => {
+                    btn.addEventListener('click', () => {
+                        commsResponsesBatchId = btn.getAttribute('data-batch-id') || null;
                         commsResponsesFilter = 'all';
                         renderFeasibility();
                     });
@@ -6964,8 +7197,14 @@
                 if (backBtn && !backBtn.dataset.bound) {
                     backBtn.dataset.bound = '1';
                     backBtn.addEventListener('click', () => {
-                        commsResponsesSurveyId = null;
-                        commsResponsesFilter = 'all';
+                        if (commsResponsesBatchId) {
+                            commsResponsesBatchId = null;
+                            commsResponsesFilter = 'all';
+                        } else {
+                            commsResponsesSurveyId = null;
+                            commsResponsesBatchId = null;
+                            commsResponsesFilter = 'all';
+                        }
                         renderFeasibility();
                     });
                 }
@@ -6974,10 +7213,16 @@
                 if (markAllBtn && !markAllBtn.dataset.bound) {
                     markAllBtn.dataset.bound = '1';
                     markAllBtn.addEventListener('click', async () => {
-                        const scope = enriched.filter((x) =>
-                            !x.reviewed && (!commsResponsesSurveyId || x.surveyId === commsResponsesSurveyId)
-                        );
-                        const ids = scope.map((x) => x.r.id).filter(Boolean);
+                        const scope = responses.filter((r) => {
+                            if (!r || isSurveyResponseReviewed(r)) return false;
+                            if (commsResponsesSurveyId && r.surveyId !== commsResponsesSurveyId) return false;
+                            if (commsResponsesBatchId) {
+                                const asg = (allSiteSurveyAssignments || []).find((a) => a && a.id === r.assignmentId);
+                                if (!asg || surveySendBatchKey(asg) !== commsResponsesBatchId) return false;
+                            }
+                            return true;
+                        });
+                        const ids = scope.map((x) => x.id).filter(Boolean);
                         if (!ids.length) {
                             showNotification('Nothing new to mark', 'success');
                             return;
@@ -10446,7 +10691,7 @@
 
                                     <h3 class="text-lg font-semibold text-gray-800 dark:text-gray-200">Sponsor feasibility pack</h3>
 
-                                    <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Pick a survey (e.g. ReBUILD / Mighty) to see completion % per site (100% = submitted), score ranking, and the answer matrix. Prior Long/Short answers still map into the matrix when labels/library ids match.</p>
+                                    <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Pick a survey (e.g. ReBUILD / Mighty) to see completion % per site (100% = submitted), score ranking, and the answer matrix. Default cohort is sites you invited — switch to “All answers on file” for prior Long/Short mapped sites.</p>
 
                                 </div>
 
@@ -10471,6 +10716,18 @@
                                             <option value="pi">PI</option>
 
                                             <option value="coordinator">Coordinator</option>
+
+                                        </select>
+
+                                    </label>
+
+                                    <label class="block text-xs text-gray-500 dark:text-gray-400">Cohort
+
+                                        <select id="feasibility-cohort-select" class="mt-1 block w-full min-w-[12rem] p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white text-sm">
+
+                                            <option value="invited">Sent invites only</option>
+
+                                            <option value="all">All answers on file</option>
 
                                         </select>
 

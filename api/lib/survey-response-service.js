@@ -916,6 +916,8 @@ async function writeSurveyResponse(deps, { assignment, answers, email, displayNa
         answers: Array.isArray(answers) ? answers : [],
         email: email || assignment.targetEmail || undefined,
         displayName: displayName || undefined,
+        batchId: assignment.batchId || undefined,
+        batchSentAt: assignment.batchSentAt || undefined,
         updatedAt: now,
     };
 
