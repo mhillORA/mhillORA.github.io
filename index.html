@@ -2533,6 +2533,76 @@
             return String(site.siteCode || site.siteNameAbbreviation || '').trim();
         };
 
+        const existingSiteIdentifierSet = (excludeSiteId = '') => {
+            const catalog = typeof buildUnifiedSitesCatalog === 'function'
+                ? buildUnifiedSitesCatalog()
+                : (allSites || []);
+            const taken = new Set();
+            (catalog || []).forEach((s) => {
+                if (!s || (excludeSiteId && s.id === excludeSiteId)) return;
+                const id = siteIdentifier(s).toLowerCase();
+                if (id) taken.add(id);
+            });
+            return taken;
+        };
+
+        /**
+         * Auto Site Identifier from site name (+ optional city for disambiguation).
+         * Keeps it short/unique against existing identifiers.
+         */
+        const suggestSiteIdentifier = (name, { city = '', excludeSiteId = '' } = {}) => {
+            const STOP = new Set([
+                'a', 'an', 'and', 'at', 'for', 'in', 'of', 'on', 'the', 'to',
+                'llc', 'llp', 'inc', 'incorporated', 'ltd', 'limited', 'pllc', 'pc', 'pa',
+                'clinic', 'clinics', 'center', 'centre', 'institute', 'associates',
+                'association', 'research', 'eye', 'eyes', 'vision', 'ophthalmology',
+                'medical', 'group', 'hospital', 'university', 'health', 'care',
+            ]);
+            const raw = String(name || '').trim();
+            if (!raw) return '';
+            const words = raw
+                .replace(/[()[\],./\\]+/g, ' ')
+                .split(/\s+/)
+                .map((w) => w.trim())
+                .filter(Boolean);
+            const meaningful = words.filter((w) => !STOP.has(w.toLowerCase()) && !/^\d+$/.test(w));
+            const pool = meaningful.length ? meaningful : words;
+
+            let base = '';
+            if (pool.length === 1) {
+                base = pool[0].replace(/[^A-Za-z0-9]/g, '').slice(0, 12);
+            } else if (pool.length <= 3) {
+                base = pool.map((w) => w.replace(/[^A-Za-z0-9]/g, '').slice(0, 1).toUpperCase()).join('');
+                // Prefer a readable short form when acronym is tiny
+                if (base.length < 3) {
+                    base = pool.map((w) => w.replace(/[^A-Za-z0-9]/g, '')).join(' ').trim().slice(0, 24);
+                }
+            } else {
+                base = pool.slice(0, 4).map((w) => w.replace(/[^A-Za-z0-9]/g, '').slice(0, 1).toUpperCase()).join('');
+            }
+            base = String(base || raw).replace(/\s+/g, ' ').trim().slice(0, 28);
+            if (!base) return '';
+
+            const cityBit = String(city || '')
+                .replace(/[^A-Za-z0-9\s]/g, '')
+                .trim()
+                .split(/\s+/)
+                .filter(Boolean)[0] || '';
+
+            const taken = existingSiteIdentifierSet(excludeSiteId);
+            const candidates = [base];
+            if (cityBit && !base.toLowerCase().includes(cityBit.toLowerCase())) {
+                candidates.push(`${base} (${cityBit})`.slice(0, 36));
+            }
+            for (let n = 2; n <= 40; n += 1) {
+                candidates.push(`${base}-${n}`.slice(0, 36));
+            }
+            for (const c of candidates) {
+                if (c && !taken.has(c.toLowerCase())) return c;
+            }
+            return `${base}-${Date.now().toString(36).slice(-4)}`;
+        };
+
         const getArtemisSiteLegacyStats = (siteId) => {
             if (window.ArtemisLegacy && typeof window.ArtemisLegacy.getLegacyForArtemisSite === 'function') {
                 return window.ArtemisLegacy.getLegacyForArtemisSite(siteId);
@@ -13488,8 +13558,15 @@
                                     </div>
                                      <div>
                                         <label for="siteCode" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Site Identifier</label>
-                                        <input type="text" name="siteCode" id="siteCode" value="${escapeHtml(existingIdentifier)}" placeholder="e.g. CORE, NEERA (Woburn)" ${siteCodeReadonly ? 'readonly' : ''} ${!isEdit ? 'required' : ''} class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm bg-white dark:bg-gray-700 dark:text-gray-200 font-mono ${siteCodeReadonly ? 'opacity-80 cursor-not-allowed' : ''}" />
-                                        <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">${siteCodeReadonly ? 'Site Identifier is immutable once set.' : `Required short unique label for this site. ${escapeHtml(exampleHint)}`}</p>
+                                        <div class="mt-1 flex gap-2">
+                                            <input type="text" name="siteCode" id="siteCode" value="${escapeHtml(existingIdentifier)}" placeholder="Auto-fills from site name" ${siteCodeReadonly ? 'readonly' : ''} class="block w-full rounded-md border-gray-300 dark:border-gray-600 shadow-sm bg-white dark:bg-gray-700 dark:text-gray-200 font-mono ${siteCodeReadonly ? 'opacity-80 cursor-not-allowed' : ''}" />
+                                            ${!siteCodeReadonly ? `<button type="button" id="regen-site-identifier-btn" class="shrink-0 px-2.5 py-2 text-xs font-medium rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700" title="Generate from site name">Auto</button>` : ''}
+                                        </div>
+                                        <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">${siteCodeReadonly
+                                            ? 'Site Identifier is immutable once set.'
+                                            : (isEdit
+                                                ? `Short unique label. ${escapeHtml(exampleHint)}`
+                                                : `Auto-generated from the site name (unique). Edit anytime. ${escapeHtml(exampleHint)}`)}</p>
                                     </div>
                                     <div>
                                         <label for="status" class="block text-sm font-medium text-gray-700 dark:text-gray-300">Status</label>
@@ -13681,6 +13758,33 @@
                         if (document.getElementById('mailing-same-as-site')?.checked) syncMailingFromSite();
                     });
                 });
+
+                // Auto Site Identifier from name (new sites, or edits with no locked code).
+                if (!siteCodeReadonly) {
+                    const nameEl = siteForm.querySelector('[name="name"]');
+                    const cityEl = siteForm.querySelector('[name="city"]');
+                    const codeEl = siteForm.querySelector('[name="siteCode"]');
+                    let identTouched = !!String(existingIdentifier || '').trim() && isEdit;
+                    const refreshIdent = (force = false) => {
+                        if (!codeEl || (!force && identTouched)) return;
+                        const next = suggestSiteIdentifier(nameEl?.value || '', {
+                            city: cityEl?.value || '',
+                            excludeSiteId: isEdit ? site?.id : '',
+                        });
+                        if (next) codeEl.value = next;
+                    };
+                    nameEl?.addEventListener('input', () => refreshIdent(false));
+                    cityEl?.addEventListener('input', () => refreshIdent(false));
+                    codeEl?.addEventListener('input', () => {
+                        identTouched = true;
+                    });
+                    document.getElementById('regen-site-identifier-btn')?.addEventListener('click', () => {
+                        identTouched = false;
+                        refreshIdent(true);
+                        identTouched = true;
+                    });
+                    if (!isEdit) refreshIdent(true);
+                }
             }
             
             // Initialize map after modal is shown - wait a bit longer for DOM to be ready
@@ -13905,8 +14009,14 @@
             if (existingSite?.siteCode) {
                 siteCode = String(existingSite.siteCode).trim();
             }
+            if (!siteCode) {
+                siteCode = suggestSiteIdentifier(getValue('name'), {
+                    city: getValue('city'),
+                    excludeSiteId: siteId || '',
+                });
+            }
             if (!siteId && !siteCode) {
-                showNotification('Site Identifier is required.', 'error');
+                showNotification('Site Identifier could not be generated — enter a site name.', 'error');
                 return;
             }
             // Keep abbreviation in sync so list/import fields stay filled.
@@ -14735,10 +14845,12 @@
                             }
 
                             const existing = allSites.find(s => s && String(s.name || '').trim().toLowerCase() === siteName.toLowerCase());
+                            const abbr = String(row['Site Name Abbreviation'] || row['Site Identifier'] || row.siteCode || '').trim();
                             const siteData = {
                                 status: String(row.Status || existing?.status || 'Active').trim(),
                                 name: siteName,
-                                siteNameAbbreviation: String(row['Site Name Abbreviation'] || '').trim(),
+                                siteNameAbbreviation: abbr || existing?.siteNameAbbreviation || '',
+                                siteCode: String(existing?.siteCode || abbr || '').trim(),
                                 address1: String(row['Address line 1'] || row.address1 || '').trim(),
                                 address2: String(row['Address Line 2'] || row.address2 || '').trim(),
                                 city: String(row.City || row.city || '').trim(),
