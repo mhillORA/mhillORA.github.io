@@ -1518,7 +1518,10 @@
         let commsResponsesSurveyId = null; // null = responses by survey; else drill into one survey
         let commsResponsesBatchId = null; // null = batches for survey; else one send cohort
         let commsResponsesFilter = 'all'; // all | submitted | pending | new | reviewed
+        // Sent-date window: latest = most recent Send per survey (your ~30); 7d/30d/90d/all
+        let commsResponsesSentWithin = 'latest';
         let feasibilityReportCohort = 'invited'; // invited = send cohort only; all = any answers on file
+        let feasibilityReportSentWithin = 'latest'; // same windows as Responses when cohort = invited
         const COMMS_LIST_CAP = 25;
 
         const isSurveyResponseReviewed = (r) => !!(r && (r.reviewedAt || r.reviewed === true));
@@ -4393,8 +4396,17 @@
             }
             // Always include invited sites for this survey (shows 0% / in-progress)
             const invitedCanonical = new Set();
-            (allSiteSurveyAssignments || []).forEach((a) => {
-                if (!a?.siteId || a.surveyId !== surveyId) return;
+            const sentWindow = opts.sentWithin !== undefined
+                ? opts.sentWithin
+                : (feasibilityReportSentWithin || 'latest');
+            const invitePool = invitedOnly
+                ? filterAssignmentsBySentWithin(
+                    (allSiteSurveyAssignments || []).filter((a) => a && a.surveyId === surveyId),
+                    sentWindow
+                )
+                : (allSiteSurveyAssignments || []).filter((a) => a && a.surveyId === surveyId);
+            invitePool.forEach((a) => {
+                if (!a?.siteId) return;
                 if (roleFilter && roleFilter !== 'all'
                     && String(a.targetRole || '').toLowerCase() !== roleFilter) return;
                 const cid = canonicalSiteIdForReporting(a.siteId);
@@ -4531,6 +4543,7 @@
                 questionTotal,
                 invitedOnly,
                 invitedCount: invitedCanonical.size,
+                sentWithin: sentWindow,
             };
         };
 
@@ -4589,7 +4602,7 @@
                             <div class="font-semibold">Survey completion</div>
                             <div class="text-xs text-white/80 mt-0.5">
                                 ${report.invitedOnly
-                                    ? `Send cohort only (${report.invitedCount || report.siteRows.length} invited) · `
+                                    ? `Send cohort (${report.invitedCount || report.siteRows.length} invited · ${escapeHtml(sentWithinLabel(report.sentWithin || 'latest'))}) · `
                                     : 'All answers on file · '}
                                 100% = submitted this survey. Below that = questions already on file (prior answers + drafts) ÷ total — capped at 99% until they submit.
                             </div>
@@ -4773,7 +4786,7 @@
             }
             if (!report.siteRows.length) {
                 return `<div class="text-sm text-gray-500 dark:text-gray-400 py-6 text-center">${report.invitedOnly
-                    ? 'No invites sent for this survey yet (or nothing in the send cohort). Switch Cohort to “All answers on file” to see prior/mapped sites.'
+                    ? `No invites in ${escapeHtml(sentWithinLabel(report.sentWithin || 'latest')).toLowerCase()} for this survey. Widen “Sent within” or switch Cohort to “All answers on file”.`
                     : `No answered feasibility fields on file yet${feasibilityReportRole !== 'all' ? ` (${escapeHtml(formatSiteSurveyRoleLabel(feasibilityReportRole))})` : ''}.`}</div>`;
             }
 
@@ -4899,6 +4912,7 @@
                         includeEmptySites: wantEveryone,
                         // Full catalog export ignores cohort; selected CSV follows the UI toggle.
                         invitedOnly: wantEveryone ? false : (feasibilityReportCohort !== 'all'),
+                        sentWithin: wantEveryone ? 'all' : (feasibilityReportSentWithin || 'latest'),
                     }
                 );
                 if (!report.def) {
@@ -5606,7 +5620,7 @@
                 || (allSiteSurveyDefinitions || [])[0]?.id
                 || null;
             feasibilityReportSurveyId = surveyId;
-            const token = `${surveyId || ''}::${feasibilityReportRole || 'all'}::${feasibilityReportCohort || 'invited'}::${__siteLinkRevision}`;
+            const token = `${surveyId || ''}::${feasibilityReportRole || 'all'}::${feasibilityReportCohort || 'invited'}::${feasibilityReportSentWithin || 'latest'}::${__siteLinkRevision}`;
             root.dataset.reportToken = token;
             root.innerHTML = `
                 <div class="rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 px-4 py-8 text-center">
@@ -5619,6 +5633,7 @@
                     ? buildFeasibilityQuestionReport(surveyId, feasibilityReportRole, {
                         includeEmptySites: false,
                         invitedOnly: feasibilityReportCohort !== 'all',
+                        sentWithin: feasibilityReportSentWithin || 'latest',
                     })
                     : null;
                 if (root.dataset.reportToken !== token) return;
@@ -5673,6 +5688,18 @@
                     cohortSel.dataset.bound = '1';
                     cohortSel.addEventListener('change', () => {
                         feasibilityReportCohort = cohortSel.value === 'all' ? 'all' : 'invited';
+                        refreshFeasibilityReportRoot();
+                    });
+                }
+            }
+            const sentSel = document.getElementById('feasibility-sent-within-select');
+            if (sentSel) {
+                sentSel.value = feasibilityReportSentWithin || 'latest';
+                if (!sentSel.dataset.bound) {
+                    sentSel.dataset.bound = '1';
+                    sentSel.addEventListener('change', () => {
+                        const v = sentSel.value || 'latest';
+                        feasibilityReportSentWithin = SENT_WITHIN_OPTIONS.some((o) => o.id === v) ? v : 'latest';
                         refreshFeasibilityReportRoot();
                     });
                 }
@@ -6488,6 +6515,59 @@
             return `legacy:${a.surveyId || ''}:${day}:${by}`;
         };
 
+        const assignmentSentAtIso = (a) =>
+            String(a?.batchSentAt || a?.lastSentAt || a?.createdAt || '');
+
+        const SENT_WITHIN_OPTIONS = [
+            { id: 'latest', label: 'Latest send' },
+            { id: '7d', label: 'Last 7 days' },
+            { id: '30d', label: 'Last 30 days' },
+            { id: '90d', label: 'Last 90 days' },
+            { id: 'all', label: 'All time' },
+        ];
+
+        /**
+         * Filter invites by when they were sent.
+         * latest = most recent Send batch per survey (so a 30-site blast isn't buried under older hundreds).
+         */
+        const filterAssignmentsBySentWithin = (list, windowId) => {
+            const rows = Array.isArray(list) ? list.filter(Boolean) : [];
+            const w = String(windowId || 'all');
+            if (w === 'all') return rows;
+            if (w === 'latest') {
+                const bestBySurvey = new Map();
+                rows.forEach((a) => {
+                    const sid = a.surveyId || '_unknown';
+                    const t = assignmentSentAtIso(a);
+                    const prev = bestBySurvey.get(sid);
+                    if (!prev || t > prev.at) {
+                        bestBySurvey.set(sid, { at: t, key: surveySendBatchKey(a) });
+                    }
+                });
+                return rows.filter((a) => {
+                    const best = bestBySurvey.get(a.surveyId || '_unknown');
+                    return best && surveySendBatchKey(a) === best.key;
+                });
+            }
+            const days = w === '7d' ? 7 : w === '30d' ? 30 : w === '90d' ? 90 : 0;
+            if (!days) return rows;
+            const cutoff = Date.now() - days * 86400000;
+            return rows.filter((a) => {
+                const ms = Date.parse(assignmentSentAtIso(a));
+                return Number.isFinite(ms) && ms >= cutoff;
+            });
+        };
+
+        const sentWithinLabel = (windowId) =>
+            (SENT_WITHIN_OPTIONS.find((o) => o.id === windowId) || SENT_WITHIN_OPTIONS[SENT_WITHIN_OPTIONS.length - 1]).label;
+
+        const sentWithinChipsHtml = (activeId, btnClass) => SENT_WITHIN_OPTIONS.map((o) => {
+            const on = activeId === o.id;
+            return `<button type="button" class="${btnClass} px-2.5 py-1 rounded-md text-xs font-medium border ${on
+                ? 'bg-indigo-600 text-white border-indigo-600'
+                : 'bg-white dark:bg-gray-900 text-gray-700 dark:text-gray-200 border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-800'}" data-sent-within="${o.id}">${o.label}</button>`;
+        }).join('');
+
         const surveySendBatchLabel = (batch) => {
             if (!batch) return 'Send batch';
             const when = batch.sentAt ? new Date(batch.sentAt) : null;
@@ -6891,8 +6971,24 @@
                     if (r?.assignmentId) responseByAsg.set(String(r.assignmentId), r);
                 });
 
+                const sentWindow = SENT_WITHIN_OPTIONS.some((o) => o.id === commsResponsesSentWithin)
+                    ? commsResponsesSentWithin
+                    : 'latest';
+                const scopedAssignments = filterAssignmentsBySentWithin(assignments, sentWindow);
+                const dateBar = `
+                    <div class="flex flex-wrap items-center gap-1.5 mb-3 px-1">
+                        <span class="text-[10px] font-semibold uppercase tracking-wide text-gray-400 mr-1">Sent</span>
+                        ${sentWithinChipsHtml(sentWindow, 'comms-responses-sent-btn')}
+                    </div>
+                    <div class="px-1 mb-2 text-xs text-gray-500 dark:text-gray-400">
+                        Showing <span class="font-medium text-gray-700 dark:text-gray-200">${escapeHtml(sentWithinLabel(sentWindow))}</span>
+                        · ${scopedAssignments.length} invite${scopedAssignments.length === 1 ? '' : 's'}
+                        ${sentWindow !== 'all' ? ` (of ${assignments.length} all-time)` : ''}
+                        · does not change stored answers
+                    </div>`;
+
                 // Build invite rows (assignments) — includes pending who have not submitted yet
-                const inviteItems = assignments.map((a) => {
+                const inviteItems = scopedAssignments.map((a) => {
                     const kind = classifySurveyInviteStatus(a);
                     const siteName = siteNameById.get(a.siteId) || a.siteId || '—';
                     const surveyId = a.surveyId || '_unknown';
@@ -6916,17 +7012,18 @@
                     };
                 });
 
-                // Orphan responses (ingest / no live assignment) — only for survey drill lists
+                // Orphan responses (ingest / no live assignment) — only when viewing all-time
                 const assignedIds = new Set(assignments.map((a) => a.id).filter(Boolean));
-                const orphanResponses = responses.filter((r) => {
-                    if (!r) return false;
-                    if (r.assignmentId && assignedIds.has(r.assignmentId)) return false;
-                    // Prefer linking by assignmentId when assignment still exists outside site filter
-                    if (r.assignmentId && (allSiteSurveyAssignments || []).some((a) => a && a.id === r.assignmentId)) {
-                        return false;
-                    }
-                    return true;
-                });
+                const orphanResponses = sentWindow === 'all'
+                    ? responses.filter((r) => {
+                        if (!r) return false;
+                        if (r.assignmentId && assignedIds.has(r.assignmentId)) return false;
+                        if (r.assignmentId && (allSiteSurveyAssignments || []).some((a) => a && a.id === r.assignmentId)) {
+                            return false;
+                        }
+                        return true;
+                    })
+                    : [];
 
                 const bySurvey = new Map();
                 const ensureSurvey = (surveyId, surveyTitle) => {
@@ -7049,9 +7146,13 @@
 
                 if (!commsResponsesSurveyId || !focusedSurvey) {
                     if (titleEl) titleEl.textContent = 'Responses by survey';
-                    body.innerHTML = surveyGroups.length === 0
-                        ? empty('No invites or responses yet. Hit Send survey.')
-                        : `
+                    body.innerHTML = `
+                        ${dateBar}
+                        ${surveyGroups.length === 0
+                            ? empty(sentWindow === 'all'
+                                ? 'No invites or responses yet. Hit Send survey.'
+                                : `Nothing in ${sentWithinLabel(sentWindow).toLowerCase()}. Try Last 30 days or All time.`)
+                            : `
                             <div class="px-1 mb-2 text-xs text-gray-500 dark:text-gray-400">
                                 Open a survey to see send batches — who was invited together, who submitted, who’s still pending.
                             </div>
@@ -7070,21 +7171,22 @@
                                             <button type="button" class="comms-responses-open-survey-btn px-2 py-1 rounded text-xs bg-indigo-600 text-white shrink-0" data-survey-id="${escapeHtml(g.surveyId)}">View batches</button>
                                         </div>
                                     </div>`;
-                            }).join('')}`;
+                            }).join('')}`}`;
                     if (footerEl) {
                         const inv = inviteItems.length;
-                        footerEl.textContent = `${inv} invite${inv === 1 ? '' : 's'} · ${surveyGroups.length} survey${surveyGroups.length === 1 ? '' : 's'}`;
+                        footerEl.textContent = `${inv} invite${inv === 1 ? '' : 's'} · ${sentWithinLabel(sentWindow)} · ${surveyGroups.length} survey${surveyGroups.length === 1 ? '' : 's'}`;
                     }
                 } else if (!commsResponsesBatchId || !focusedBatch) {
                     if (titleEl) titleEl.textContent = focusedSurvey.surveyTitle;
                     const orphans = orphanResponses.filter((r) => (r.surveyId || '_unknown') === focusedSurvey.surveyId);
                     body.innerHTML = `
+                        ${dateBar}
                         <div class="px-1 mb-2 text-xs text-gray-500 dark:text-gray-400">
                             ${focusedSurvey.submitted} submitted · ${focusedSurvey.pending} pending · ${focusedSurvey.batchList.length} send batch${focusedSurvey.batchList.length === 1 ? '' : 'es'}
                             — each batch is one Send click (sites invited together).
                         </div>
                         ${focusedSurvey.batchList.length === 0 && !orphans.length
-                            ? empty('No sends for this survey yet.')
+                            ? empty(`Nothing in ${sentWithinLabel(sentWindow).toLowerCase()} for this survey.`)
                             : focusedSurvey.batchList.map((b) => {
                                 const search = `${surveySendBatchLabel(b)} ${b.sentBy || ''}`.toLowerCase();
                                 return `
@@ -7122,7 +7224,7 @@
                             </div>` : ''}
                     `;
                     if (footerEl) {
-                        footerEl.textContent = `${focusedSurvey.invites.length} invited · ${focusedSurvey.batchList.length} batch${focusedSurvey.batchList.length === 1 ? '' : 'es'} · ${focusedSurvey.surveyTitle}`;
+                        footerEl.textContent = `${focusedSurvey.invites.length} invited · ${sentWithinLabel(sentWindow)} · ${focusedSurvey.surveyTitle}`;
                     }
                 } else {
                     if (titleEl) titleEl.textContent = surveySendBatchLabel(focusedBatch);
@@ -7149,6 +7251,7 @@
                         });
                     const shown = filtered.slice(0, cap);
                     body.innerHTML = `
+                        ${dateBar}
                         <div class="flex flex-wrap gap-1.5 mb-3 px-1">
                             ${chipBtn('all', 'All', counts.all)}
                             ${chipBtn('submitted', 'Submitted', counts.submitted)}
@@ -7167,10 +7270,21 @@
                     if (footerEl) {
                         footerEl.textContent = filtered.length > cap
                             ? `Showing ${cap} of ${filtered.length} · ${focusedSurvey.surveyTitle}`
-                            : `${filtered.length} site${filtered.length === 1 ? '' : 's'} · ${focusedSurvey.surveyTitle}`;
+                            : `${filtered.length} site${filtered.length === 1 ? '' : 's'} · ${sentWithinLabel(sentWindow)} · ${focusedSurvey.surveyTitle}`;
                     }
                 }
 
+                body.querySelectorAll('.comms-responses-sent-btn').forEach((btn) => {
+                    btn.addEventListener('click', () => {
+                        commsResponsesSentWithin = btn.getAttribute('data-sent-within') || 'latest';
+                        const nextScoped = filterAssignmentsBySentWithin(assignments, commsResponsesSentWithin);
+                        const keys = new Set(nextScoped.map(surveySendBatchKey));
+                        if (commsResponsesBatchId && !keys.has(commsResponsesBatchId)) {
+                            commsResponsesBatchId = null;
+                        }
+                        renderFeasibility();
+                    });
+                });
                 body.querySelectorAll('.comms-responses-filter-btn').forEach((btn) => {
                     btn.addEventListener('click', () => {
                         commsResponsesFilter = btn.getAttribute('data-responses-filter') || 'all';
@@ -10728,6 +10842,24 @@
                                             <option value="invited">Sent invites only</option>
 
                                             <option value="all">All answers on file</option>
+
+                                        </select>
+
+                                    </label>
+
+                                    <label class="block text-xs text-gray-500 dark:text-gray-400">Sent within
+
+                                        <select id="feasibility-sent-within-select" class="mt-1 block w-full min-w-[10rem] p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white text-sm">
+
+                                            <option value="latest">Latest send</option>
+
+                                            <option value="7d">Last 7 days</option>
+
+                                            <option value="30d">Last 30 days</option>
+
+                                            <option value="90d">Last 90 days</option>
+
+                                            <option value="all">All time</option>
 
                                         </select>
 
