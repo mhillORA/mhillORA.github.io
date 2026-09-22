@@ -4235,6 +4235,121 @@
             };
         };
 
+        /**
+         * Survey completion % for a site + template:
+         * - 100% = live response submitted for THIS survey
+         * - otherwise draft progress (answered questions / total), capped at 99
+         * - 0% = not started (prior mapped answers alone do not count as complete)
+         */
+        const countFilledAnswersAgainstQuestions = (answers, questions) => {
+            const qs = asSurveyList(questions);
+            if (!qs.length) return { filled: 0, total: 0 };
+            const list = asSurveyList(answers);
+            const byId = new Map();
+            const byLib = new Map();
+            const byLabel = new Map();
+            list.forEach((a) => {
+                if (!a || a.skipped) return;
+                const val = typeof readSurveyAnswerValue === 'function'
+                    ? readSurveyAnswerValue(a)
+                    : (a.value ?? a.answer ?? '');
+                if (val == null || String(val).trim() === '') return;
+                const qid = String(a.questionId || a.id || '').trim();
+                const lib = String(a.libraryQuestionId || '').trim();
+                const lab = normalizeSurveyDeltaLabel(a.label || a.title || '');
+                if (qid) byId.set(qid, true);
+                if (lib) byLib.set(lib, true);
+                if (lab) byLabel.set(lab, true);
+            });
+            let filled = 0;
+            qs.forEach((q) => {
+                if (!q) return;
+                const qid = String(q.id || '').trim();
+                const lib = String(q.libraryQuestionId || '').trim();
+                const lab = normalizeSurveyDeltaLabel(q.label || q.title || '');
+                if ((qid && byId.has(qid)) || (lib && byLib.has(lib)) || (lab && byLabel.has(lab))) {
+                    filled += 1;
+                }
+            });
+            return { filled, total: qs.length };
+        };
+
+        const surveyCompletionForSite = (siteId, surveyId, {
+            questions = [],
+            targetRole = 'all',
+        } = {}) => {
+            const roleFilter = String(targetRole || 'all').trim().toLowerCase();
+            const ids = typeof siteIdsForSurveyLookup === 'function'
+                ? siteIdsForSurveyLookup(siteId)
+                : new Set([siteId]);
+
+            const submitted = (allSiteSurveyResponses || []).find((r) => {
+                if (!r || r._archived || !ids.has(r.siteId)) return false;
+                if (String(r.surveyId || '') !== String(surveyId || '')) return false;
+                if (roleFilter && roleFilter !== 'all'
+                    && String(r.targetRole || '').toLowerCase() !== roleFilter) return false;
+                // Any live response for this survey counts as submitted/complete
+                return true;
+            });
+            if (submitted) {
+                const total = asSurveyList(questions).length;
+                return {
+                    status: 'submitted',
+                    completePct: 100,
+                    filled: total,
+                    total,
+                    responseId: submitted.id,
+                    when: submitted.submittedAt || submitted.createdAt || '',
+                };
+            }
+
+            // In-progress: draft answers on an open assignment for this survey
+            const drafts = (allSiteSurveyAssignments || []).filter((a) => {
+                if (!a || !ids.has(a.siteId)) return false;
+                if (String(a.surveyId || '') !== String(surveyId || '')) return false;
+                if (String(a.status || '').toLowerCase() === 'submitted') return false;
+                if (roleFilter && roleFilter !== 'all'
+                    && String(a.targetRole || '').toLowerCase() !== roleFilter) return false;
+                return Array.isArray(a.draftAnswers) && a.draftAnswers.length > 0;
+            });
+            let bestDraft = null;
+            drafts.forEach((a) => {
+                const { filled, total } = countFilledAnswersAgainstQuestions(a.draftAnswers, questions);
+                if (!bestDraft || filled > bestDraft.filled) {
+                    bestDraft = {
+                        status: 'in_progress',
+                        filled,
+                        total: total || asSurveyList(questions).length,
+                        when: a.draftSavedAt || a.updatedAt || a.createdAt || '',
+                        assignmentId: a.id,
+                    };
+                }
+            });
+            if (bestDraft && bestDraft.total > 0) {
+                const raw = Math.round((bestDraft.filled / bestDraft.total) * 100);
+                return {
+                    ...bestDraft,
+                    // Reserve 100% for real submit
+                    completePct: Math.min(99, Math.max(0, raw)),
+                };
+            }
+
+            const invited = (allSiteSurveyAssignments || []).some((a) => {
+                if (!a || !ids.has(a.siteId)) return false;
+                if (String(a.surveyId || '') !== String(surveyId || '')) return false;
+                if (roleFilter && roleFilter !== 'all'
+                    && String(a.targetRole || '').toLowerCase() !== roleFilter) return false;
+                return String(a.status || '').toLowerCase() !== 'submitted';
+            });
+            return {
+                status: invited ? 'not_started' : 'none',
+                completePct: 0,
+                filled: 0,
+                total: asSurveyList(questions).length,
+                when: '',
+            };
+        };
+
         const buildFeasibilityQuestionReport = (surveyId, targetRole = 'all', opts = {}) => {
             const includeEmptySites = opts.includeEmptySites === true;
             const def = (allSiteSurveyDefinitions || []).find(d => d && d.id === surveyId) || null;
@@ -4263,16 +4378,14 @@
                 const cid = canonicalSiteIdForReporting(r.siteId);
                 if (cid) canonicalSites.add(cid);
             });
-            if (includeEmptySites) {
-                // Keep invited-but-blank sites on full exports
-                (allSiteSurveyAssignments || []).forEach((a) => {
-                    if (!a?.siteId || a.surveyId !== surveyId) return;
-                    if (roleFilter && roleFilter !== 'all'
-                        && String(a.targetRole || '').toLowerCase() !== roleFilter) return;
-                    const cid = canonicalSiteIdForReporting(a.siteId);
-                    if (cid) canonicalSites.add(cid);
-                });
-            }
+            // Always include invited sites for this survey (shows 0% / in-progress)
+            (allSiteSurveyAssignments || []).forEach((a) => {
+                if (!a?.siteId || a.surveyId !== surveyId) return;
+                if (roleFilter && roleFilter !== 'all'
+                    && String(a.targetRole || '').toLowerCase() !== roleFilter) return;
+                const cid = canonicalSiteIdForReporting(a.siteId);
+                if (cid) canonicalSites.add(cid);
+            });
 
             const siteRows = [];
             canonicalSites.forEach((siteId) => {
@@ -4281,24 +4394,36 @@
                     preferRole: roleFilter,
                     crossSurvey,
                 });
-                const answeredCount = Number(merged.filled) || 0;
-                if (!includeEmptySites && answeredCount <= 0) return;
-                const answeredPct = questionTotal > 0
-                    ? Math.round((answeredCount / questionTotal) * 100)
-                    : 0;
+                const coverageCount = Number(merged.filled) || 0;
+                const completion = surveyCompletionForSite(siteId, surveyId, {
+                    questions,
+                    targetRole: roleFilter,
+                });
+                // Keep sites with a submit/draft/invite for this survey, or prior mapped answers
+                if (!includeEmptySites
+                    && coverageCount <= 0
+                    && completion.status === 'none') return;
+
+                const answeredPct = completion.completePct;
+                const answeredCount = completion.status === 'submitted'
+                    ? (questionTotal || coverageCount)
+                    : (completion.status === 'in_progress' ? completion.filled : 0);
                 // Include every master-list site even when still blank
                 const response = {
-                    id: merged.responseId,
+                    id: completion.responseId || merged.responseId,
                     siteId,
                     surveyId,
-                    targetRole: merged.targetRole,
-                    submittedAt: merged.when,
+                    targetRole: merged.targetRole || '',
+                    submittedAt: completion.status === 'submitted'
+                        ? (completion.when || merged.when)
+                        : merged.when,
                     createdAt: merged.when,
                     answers: merged.answers,
                     score: merged.score,
                     siteDisposition: merged.primaryResponse?.siteDisposition || merged.siteDisposition,
                     _mergedFromPrior: true,
                     _sourceResponseCount: merged.responseCount,
+                    _completionStatus: completion.status,
                 };
                 const outcome = resolveScoreOutcome(response?.score, def)
                     || (merged.primaryResponse?.siteDisposition === 'not_interested' ? 'not_interested' : null)
@@ -4310,21 +4435,29 @@
                     siteId,
                     siteName: resolveSponsorSiteDisplayName(siteId, merged.primaryResponse || response),
                     response,
-                    when: merged.when || '',
+                    when: completion.when || merged.when || '',
                     outcome,
                     pct,
                     knockouts,
                     answeredCount,
                     answeredTotal: questionTotal,
                     answeredPct,
+                    completionStatus: completion.status,
+                    coverageCount,
+                    coveragePct: questionTotal > 0
+                        ? Math.round((coverageCount / questionTotal) * 100)
+                        : 0,
                 });
             });
 
-            // Default sort: who answered most of this survey's questions
+            // Default sort: furthest along (submitted 100% first), then coverage
             siteRows.sort((a, b) => {
                 const aa = a.answeredPct ?? 0;
                 const bb = b.answeredPct ?? 0;
                 if (bb !== aa) return bb - aa;
+                const ca = a.coveragePct ?? 0;
+                const cb = b.coveragePct ?? 0;
+                if (cb !== ca) return cb - ca;
                 const pa = a.pct == null ? -1 : a.pct;
                 const pb = b.pct == null ? -1 : b.pct;
                 if (pb !== pa) return pb - pa;
@@ -4363,37 +4496,42 @@
             return { def, questions, siteRows, questionStats, hasScoring: surveyDefinitionHasScoring(def), questionTotal };
         };
 
-        const answeredPctBadgeHtml = (pct) => {
+        const answeredPctBadgeHtml = (pct, status = '') => {
             const n = Number(pct) || 0;
-            const cls = n >= 70
+            const st = String(status || '').toLowerCase();
+            const cls = st === 'submitted' || n >= 100
                 ? 'bg-emerald-100 text-emerald-900 dark:bg-emerald-900/40 dark:text-emerald-200'
-                : n >= 30
+                : st === 'in_progress' || n >= 30
                     ? 'bg-amber-100 text-amber-900 dark:bg-amber-900/40 dark:text-amber-200'
                     : 'bg-slate-100 text-slate-700 dark:bg-slate-700 dark:text-slate-200';
-            return `<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold ${cls}">${n}%</span>`;
+            const label = st === 'submitted' ? '100% · submitted' : `${n}%`;
+            return `<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold ${cls}" title="${st === 'submitted' ? 'Survey submitted' : st === 'in_progress' ? 'In progress (not submitted)' : 'Not started'}">${escapeHtml(label)}</span>`;
         };
 
         const renderFeasibilityCoverageBoardHtml = (report) => {
             if (!report?.siteRows?.length) return '';
             const totalQ = report.questionTotal || report.questions?.length || 0;
-            const high = report.siteRows.filter((r) => (r.answeredPct || 0) >= 70).length;
-            const mid = report.siteRows.filter((r) => {
-                const p = r.answeredPct || 0;
-                return p >= 30 && p < 70;
-            }).length;
-            const low = report.siteRows.filter((r) => (r.answeredPct || 0) < 30).length;
+            const submittedN = report.siteRows.filter((r) => r.completionStatus === 'submitted' || (r.answeredPct || 0) >= 100).length;
+            const inProgN = report.siteRows.filter((r) => r.completionStatus === 'in_progress').length;
+            const notStartedN = report.siteRows.filter((r) => (r.answeredPct || 0) < 100 && r.completionStatus !== 'in_progress').length;
             const rows = report.siteRows.map((row) => {
                 const when = row.when
                     ? new Date(row.when).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
                     : '—';
-                const filled = `${row.answeredCount ?? 0}/${row.answeredTotal ?? totalQ}`;
+                const filled = row.completionStatus === 'submitted'
+                    ? 'Submitted'
+                    : row.completionStatus === 'in_progress'
+                        ? `${row.answeredCount ?? 0}/${row.answeredTotal ?? totalQ} draft`
+                        : (row.coverageCount
+                            ? `0 draft · ${row.coverageCount} prior mapped`
+                            : '—');
                 return `
                     <tr class="hover:bg-gray-50 dark:hover:bg-gray-700/40">
                         <td class="px-3 py-2 text-sm text-gray-500 dark:text-gray-400">${row.rank}</td>
                         <td class="px-3 py-2 text-sm font-medium text-gray-900 dark:text-gray-100">
                             <button type="button" class="view-site-details-btn hover:underline" data-site-id="${escapeHtml(row.siteId)}">${escapeHtml(row.siteName)}</button>
                         </td>
-                        <td class="px-3 py-2 text-sm">${answeredPctBadgeHtml(row.answeredPct)}</td>
+                        <td class="px-3 py-2 text-sm">${answeredPctBadgeHtml(row.answeredPct, row.completionStatus)}</td>
                         <td class="px-3 py-2 text-xs text-gray-600 dark:text-gray-300 whitespace-nowrap">${escapeHtml(filled)}</td>
                         <td class="px-3 py-2 text-xs text-gray-600 dark:text-gray-300">
                             <button type="button" class="view-site-survey-response-btn text-indigo-600 dark:text-indigo-400 hover:underline" data-response-id="${escapeHtml(row.response.id)}">${escapeHtml(formatSiteSurveyRoleLabel(row.response.targetRole))}</button>
@@ -4407,17 +4545,16 @@
                 <div class="mb-6 rounded-xl border border-[#0F6E56]/25 dark:border-[#0F6E56]/40 overflow-hidden">
                     <div class="bg-[#0F6E56] text-white px-4 py-3 flex flex-wrap items-center justify-between gap-2">
                         <div>
-                            <div class="font-semibold">Who already answered</div>
+                            <div class="font-semibold">Survey completion</div>
                             <div class="text-xs text-white/80 mt-0.5">
-                                Share of this survey’s ${totalQ} questions already on file per site
-                                (includes prior Long/Short/Mighty answers mapped by library id / label). Sorted highest first.
+                                100% = submitted this survey. Less = still in progress (draft answers / total questions). Prior mapped answers alone do not count as complete.
                             </div>
                         </div>
                     </div>
                     <div class="grid grid-cols-3 gap-0 divide-x divide-gray-200 dark:divide-gray-700 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900/40">
-                        <div class="p-3 text-center"><div class="text-[10px] uppercase text-gray-500">≥ 70% filled</div><div class="text-lg font-bold text-emerald-700 dark:text-emerald-300">${high}</div></div>
-                        <div class="p-3 text-center"><div class="text-[10px] uppercase text-gray-500">30–69%</div><div class="text-lg font-bold text-amber-700 dark:text-amber-300">${mid}</div></div>
-                        <div class="p-3 text-center"><div class="text-[10px] uppercase text-gray-500">&lt; 30%</div><div class="text-lg font-bold text-slate-600 dark:text-slate-300">${low}</div></div>
+                        <div class="p-3 text-center"><div class="text-[10px] uppercase text-gray-500">Submitted (100%)</div><div class="text-lg font-bold text-emerald-700 dark:text-emerald-300">${submittedN}</div></div>
+                        <div class="p-3 text-center"><div class="text-[10px] uppercase text-gray-500">In progress</div><div class="text-lg font-bold text-amber-700 dark:text-amber-300">${inProgN}</div></div>
+                        <div class="p-3 text-center"><div class="text-[10px] uppercase text-gray-500">Not started</div><div class="text-lg font-bold text-slate-600 dark:text-slate-300">${notStartedN}</div></div>
                     </div>
                     <div class="overflow-x-auto max-h-[28rem]">
                         <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
@@ -4425,8 +4562,8 @@
                                 <tr>
                                     <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">#</th>
                                     <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Site</th>
-                                    <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Answered %</th>
-                                    <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Filled</th>
+                                    <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Complete %</th>
+                                    <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Progress</th>
                                     <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Role</th>
                                     <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Last activity</th>
                                     <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase">Score outcome</th>
@@ -4634,7 +4771,7 @@
 
             const matrixHead = `
                 <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase sticky left-0 bg-gray-50 dark:bg-gray-700 z-10">Site</th>
-                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Answered %</th>
+                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Complete %</th>
                 <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Outcome</th>
                 <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Role</th>
                 ${report.questions.map(q => `
@@ -4653,7 +4790,7 @@
                             <button type="button" class="view-site-details-btn hover:underline" data-site-id="${escapeHtml(row.siteId)}">${escapeHtml(row.siteName)}</button>
                             <div class="text-[10px] text-gray-400 font-normal">${escapeHtml(when)}</div>
                         </td>
-                        <td class="px-3 py-2 text-xs whitespace-nowrap">${answeredPctBadgeHtml(row.answeredPct)}</td>
+                        <td class="px-3 py-2 text-xs whitespace-nowrap">${answeredPctBadgeHtml(row.answeredPct, row.completionStatus)}</td>
                         <td class="px-3 py-2 text-xs whitespace-nowrap">${surveyOutcomeBadgeHtml(row.response, report.def)}</td>
                         <td class="px-3 py-2 text-xs text-gray-600 dark:text-gray-300 whitespace-nowrap">
                             <button type="button" class="view-site-survey-response-btn text-indigo-600 dark:text-indigo-400 hover:underline" data-response-id="${escapeHtml(row.response.id)}">${escapeHtml(formatSiteSurveyRoleLabel(row.response.targetRole))}</button>
@@ -4727,7 +4864,7 @@
                 const lines = [];
                 if (mode === 'long') {
                     lines.push(['Generated', new Date().toISOString()].map(csvEscapeCell).join(','));
-                    lines.push(['Site', 'SiteId', 'Role', 'SubmittedAt', 'AnsweredCount', 'AnsweredPct', 'Question', 'Answer'].map(csvEscapeCell).join(','));
+                    lines.push(['Site', 'SiteId', 'Role', 'SubmittedAt', 'CompleteStatus', 'CompletePct', 'Question', 'Answer'].map(csvEscapeCell).join(','));
                     report.siteRows.forEach(row => {
                         report.questions.forEach(q => {
                             const { value, skipped } = findAnswerForQuestion(row.response, q);
@@ -4737,7 +4874,7 @@
                                 row.siteId,
                                 formatSiteSurveyRoleLabel(row.response.targetRole),
                                 row.when || '',
-                                row.answeredCount ?? '',
+                                row.completionStatus || '',
                                 row.answeredPct ?? '',
                                 q.label || q.id || '',
                                 value
@@ -4747,7 +4884,7 @@
                     downloadCsvText(`feasibility_${safeTitle}_answered_${generatedStamp}.csv`, lines.join('\n'));
                 } else {
                     lines.push(['Generated', new Date().toISOString()].map(csvEscapeCell).join(','));
-                    const headers = ['Site', 'SiteId', 'Role', 'SubmittedAt', 'AnsweredCount', 'AnsweredPct', ...report.questions.map(q => q.label || q.id || '')];
+                    const headers = ['Site', 'SiteId', 'Role', 'SubmittedAt', 'CompleteStatus', 'CompletePct', 'CoverageCount', 'CoveragePct', ...report.questions.map(q => q.label || q.id || '')];
                     lines.push(headers.map(csvEscapeCell).join(','));
                     report.siteRows.forEach(row => {
                         const cells = report.questions.map(q => findAnswerForQuestion(row.response, q).value);
@@ -4756,8 +4893,10 @@
                             row.siteId,
                             formatSiteSurveyRoleLabel(row.response.targetRole),
                             row.when || '',
-                            row.answeredCount ?? cells.filter(Boolean).length,
+                            row.completionStatus || '',
                             row.answeredPct ?? '',
+                            row.coverageCount ?? '',
+                            row.coveragePct ?? '',
                             ...cells
                         ].map(csvEscapeCell).join(','));
                     });
@@ -10289,7 +10428,7 @@
 
                                     <h3 class="text-lg font-semibold text-gray-800 dark:text-gray-200">Sponsor feasibility pack</h3>
 
-                                    <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Pick a survey (e.g. ReBUILD / Mighty) to see who already answered those questions — answered % per site, then score ranking and the full matrix. Prior Long/Short answers map on when labels/library ids match.</p>
+                                    <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Pick a survey (e.g. ReBUILD / Mighty) to see completion % per site (100% = submitted), score ranking, and the answer matrix. Prior Long/Short answers still map into the matrix when labels/library ids match.</p>
 
                                 </div>
 
