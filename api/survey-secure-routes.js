@@ -1476,6 +1476,16 @@ function registerSurveySecureRoutes(app, deps) {
                 const studyTitle = String(
                     body?.studyTitle || definition.studyTitle || definition.title || ''
                 ).trim();
+                // Human label for this Send cohort (shows in Responses / Reporting).
+                const batchLabel = String(body?.batchLabel || body?.batchName || '')
+                    .trim()
+                    .slice(0, 80);
+                const hasStarFlag = Object.prototype.hasOwnProperty.call(body || {}, 'batchStarred')
+                    || Object.prototype.hasOwnProperty.call(body || {}, 'starBatch');
+                const batchStarred = hasStarFlag
+                    ? (body.batchStarred === true || body.batchStarred === 'true'
+                        || body.starBatch === true || body.starBatch === 'true')
+                    : Boolean(batchLabel);
 
                 const asgC = getContainer(ASSIGNMENTS);
                 const results = [];
@@ -1535,6 +1545,8 @@ function registerSurveySecureRoutes(app, deps) {
                         batchId: sendBatchId,
                         batchSentAt: now,
                         batchSize: siteIds.length,
+                        batchLabel: batchLabel || undefined,
+                        batchStarred: batchStarred || undefined,
                         createdAt: now,
                         updatedAt: now,
                         lastSentAt: now,
@@ -1642,6 +1654,8 @@ function registerSurveySecureRoutes(app, deps) {
                         surveyId,
                         surveyTitle: definition.title,
                         batchId: sendBatchId,
+                        batchLabel: batchLabel || null,
+                        batchStarred: batchStarred || false,
                         emailProvider: emailProviderStatus(),
                         cc: ccEmails,
                         subject: customSubject || null,
@@ -1653,6 +1667,94 @@ function registerSurveySecureRoutes(app, deps) {
                 };
             } catch (error) {
                 return handleError(context, error, 'site-survey-send');
+            }
+        },
+    });
+
+    // ---------- Ops: name / star a send batch (updates every invite in the cohort) ----------
+    app.http('siteSurveyBatchMeta', {
+        methods: ['POST', 'OPTIONS'],
+        authLevel: 'anonymous',
+        route: 'site-survey-batch-meta',
+        handler: async (request, context) => {
+            if (request.method === 'OPTIONS') {
+                return { status: 204, headers: corsHeaders() };
+            }
+            try {
+                const body = await request.json();
+                const batchId = String(body?.batchId || '').trim();
+                if (!batchId || batchId.startsWith('legacy:')) {
+                    return {
+                        status: 400,
+                        jsonBody: { error: 'batchId is required (real send batch only)' },
+                        headers: corsHeaders(),
+                    };
+                }
+                const hasLabel = Object.prototype.hasOwnProperty.call(body || {}, 'batchLabel')
+                    || Object.prototype.hasOwnProperty.call(body || {}, 'label');
+                const hasStar = Object.prototype.hasOwnProperty.call(body || {}, 'batchStarred')
+                    || Object.prototype.hasOwnProperty.call(body || {}, 'starred');
+                if (!hasLabel && !hasStar) {
+                    return {
+                        status: 400,
+                        jsonBody: { error: 'Provide batchLabel and/or batchStarred' },
+                        headers: corsHeaders(),
+                    };
+                }
+                const batchLabel = hasLabel
+                    ? String(body.batchLabel ?? body.label ?? '').trim().slice(0, 80)
+                    : null;
+                const batchStarred = hasStar
+                    ? (body.batchStarred === true || body.batchStarred === 'true'
+                        || body.starred === true || body.starred === 'true')
+                    : null;
+
+                const asgC = getContainer(ASSIGNMENTS);
+                const { resources } = await asgC.items
+                    .query({
+                        query: 'SELECT * FROM c WHERE c.batchId = @batchId',
+                        parameters: [{ name: '@batchId', value: batchId }],
+                    })
+                    .fetchAll();
+                const rows = Array.isArray(resources) ? resources : [];
+                if (!rows.length) {
+                    return {
+                        status: 404,
+                        jsonBody: { error: 'No invites found for that batch' },
+                        headers: corsHeaders(),
+                    };
+                }
+                const now = new Date().toISOString();
+                let updated = 0;
+                for (const row of rows) {
+                    if (!row || !row.id) continue;
+                    if (hasLabel) {
+                        if (batchLabel) row.batchLabel = batchLabel;
+                        else delete row.batchLabel;
+                    }
+                    if (hasStar) {
+                        if (batchStarred) row.batchStarred = true;
+                        else delete row.batchStarred;
+                    }
+                    row.updatedAt = now;
+                    await asgC.items.upsert(row);
+                    updated += 1;
+                }
+                return {
+                    status: 200,
+                    jsonBody: {
+                        ok: true,
+                        batchId,
+                        updated,
+                        batchLabel: hasLabel ? (batchLabel || null) : (rows[0]?.batchLabel || null),
+                        batchStarred: hasStar
+                            ? batchStarred
+                            : Boolean(rows[0]?.batchStarred),
+                    },
+                    headers: corsHeaders(),
+                };
+            } catch (error) {
+                return handleError(context, error, 'site-survey-batch-meta');
             }
         },
     });

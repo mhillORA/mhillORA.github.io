@@ -1186,6 +1186,18 @@
                 });
             }
 
+            /** Name / star a send cohort (updates every invite sharing that batchId). */
+            async updateSurveyBatchMeta({ batchId, batchLabel, batchStarred } = {}) {
+                const body = { batchId };
+                if (batchLabel !== undefined) body.batchLabel = batchLabel;
+                if (batchStarred !== undefined) body.batchStarred = batchStarred;
+                return this.request('/site-survey-batch-meta', {
+                    method: 'POST',
+                    headers: this.privacyHeaders(),
+                    body: JSON.stringify(body)
+                });
+            }
+
             async resendSiteSurvey(assignmentId, payload = {}) {
                 return this.request(`/site-survey-assignments/${encodeURIComponent(assignmentId)}/resend`, {
                     method: 'POST',
@@ -5273,7 +5285,9 @@
                     ? 'All answers on file'
                     : (model.scope?.batchIds?.length
                         ? `${model.scope.batchIds.length} selected send batch${model.scope.batchIds.length === 1 ? '' : 'es'}`
-                        : `Sent invites · ${sentWithinLabel(model.scope?.sentWithin || 'latest')}`)]);
+                        : (model.scope?.sentWithin === 'starred'
+                            ? '★ Starred batches'
+                            : `Sent invites · ${sentWithinLabel(model.scope?.sentWithin || 'latest')}`)]);
                 summary.addRow(['Generated', formatSponsorDate(generatedAt.toISOString())]);
                 summary.addRow(['Classification', 'Confidential — for sponsor review']);
                 summary.addRow([]);
@@ -6652,10 +6666,105 @@
             return `legacy:${a.surveyId || ''}:${day}:${by}`;
         };
 
+        const SURVEY_BATCH_PIN_KEY = 'artemis.surveyBatchPins';
+        let __surveyBatchPins = null;
+        const loadSurveyBatchPins = () => {
+            if (__surveyBatchPins) return __surveyBatchPins;
+            try {
+                const raw = localStorage.getItem(SURVEY_BATCH_PIN_KEY);
+                const parsed = raw ? JSON.parse(raw) : {};
+                __surveyBatchPins = (parsed && typeof parsed === 'object') ? parsed : {};
+            } catch (_) {
+                __surveyBatchPins = {};
+            }
+            return __surveyBatchPins;
+        };
+        const saveSurveyBatchPins = () => {
+            try {
+                localStorage.setItem(SURVEY_BATCH_PIN_KEY, JSON.stringify(loadSurveyBatchPins()));
+            } catch (_) { /* ignore quota */ }
+        };
+        const getSurveyBatchPin = (batchKey) => {
+            const id = String(batchKey || '');
+            if (!id) return null;
+            const pin = loadSurveyBatchPins()[id];
+            return pin && typeof pin === 'object' ? pin : null;
+        };
+        const setSurveyBatchPin = (batchKey, patch = {}) => {
+            const id = String(batchKey || '');
+            if (!id) return null;
+            const pins = loadSurveyBatchPins();
+            const prev = pins[id] && typeof pins[id] === 'object' ? pins[id] : {};
+            const next = { ...prev, ...patch, updatedAt: new Date().toISOString() };
+            if (!next.starred && !String(next.label || '').trim()) {
+                delete pins[id];
+            } else {
+                pins[id] = next;
+            }
+            saveSurveyBatchPins();
+            return pins[id] || null;
+        };
+
+        /** Combined label/star from Cosmos invite fields + local pin overlay. */
+        const resolveSurveyBatchMeta = (batchOrAssignment) => {
+            const isBatchObj = Array.isArray(batchOrAssignment?.items);
+            const key = String(
+                batchOrAssignment?.batchKey
+                || (isBatchObj ? batchOrAssignment.id : '')
+                || batchOrAssignment?.batchId
+                || (batchOrAssignment && !isBatchObj ? surveySendBatchKey(batchOrAssignment) : '')
+                || batchOrAssignment?.id
+                || ''
+            );
+            const pin = getSurveyBatchPin(key);
+            const fromAsgLabel = String(
+                batchOrAssignment?.batchLabel
+                || batchOrAssignment?.label
+                || ''
+            ).trim();
+            const fromPinLabel = String(pin?.label || '').trim();
+            const label = fromPinLabel || fromAsgLabel;
+            const starred = Boolean(pin?.starred) || Boolean(batchOrAssignment?.batchStarred);
+            return { key, label, starred, pin };
+        };
+
+        const isSurveyBatchStarred = (batchOrKey) => {
+            if (!batchOrKey) return false;
+            if (typeof batchOrKey === 'string') {
+                const pin = getSurveyBatchPin(batchOrKey);
+                if (pin?.starred) return true;
+                // Fall back to any live invite stamped batchStarred for this key
+                return (allSiteSurveyAssignments || []).some((a) =>
+                    isLiveSurveyInvite(a)
+                    && surveySendBatchKey(a) === batchOrKey
+                    && a.batchStarred
+                );
+            }
+            return resolveSurveyBatchMeta(batchOrKey).starred;
+        };
+
+        const surveyBatchDisplayName = (batch) => {
+            const meta = resolveSurveyBatchMeta(batch);
+            if (meta.label) return meta.label;
+            return surveySendBatchDateLabel(batch);
+        };
+
+        const surveySendBatchDateLabel = (batch) => {
+            if (!batch) return 'Send batch';
+            const when = batch.sentAt ? new Date(batch.sentAt) : null;
+            const dateStr = when && !Number.isNaN(when.getTime())
+                ? when.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
+                : 'Unknown date';
+            const by = batch.sentBy ? ` · by ${batch.sentBy}` : '';
+            const legacy = String(batch.id || '').startsWith('legacy:') ? ' · grouped by send day' : '';
+            return `Sent ${dateStr}${by}${legacy}`;
+        };
+
         const assignmentSentAtIso = (a) =>
             String(a?.batchSentAt || a?.lastSentAt || a?.createdAt || '');
 
         const SENT_WITHIN_OPTIONS = [
+            { id: 'starred', label: '★ Starred' },
             { id: 'latest', label: 'Latest send' },
             { id: '7d', label: 'Last 7 days' },
             { id: '30d', label: 'Last 30 days' },
@@ -6664,13 +6773,17 @@
         ];
 
         /**
-         * Filter invites by when they were sent.
+         * Filter invites by when they were sent / starred.
          * latest = most recent Send batch per survey (so a 30-site blast isn't buried under older hundreds).
+         * starred = batches you (or the send) marked with ★
          */
         const filterAssignmentsBySentWithin = (list, windowId) => {
             const rows = Array.isArray(list) ? list.filter(Boolean) : [];
             const w = String(windowId || 'all');
             if (w === 'all') return rows;
+            if (w === 'starred') {
+                return rows.filter((a) => isSurveyBatchStarred(surveySendBatchKey(a)) || a.batchStarred);
+            }
             if (w === 'latest') {
                 const bestBySurvey = new Map();
                 rows.forEach((a) => {
@@ -6706,14 +6819,83 @@
         }).join('');
 
         const surveySendBatchLabel = (batch) => {
-            if (!batch) return 'Send batch';
-            const when = batch.sentAt ? new Date(batch.sentAt) : null;
-            const dateStr = when && !Number.isNaN(when.getTime())
-                ? when.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
-                : 'Unknown date';
-            const by = batch.sentBy ? ` · by ${batch.sentBy}` : '';
-            const legacy = String(batch.id || '').startsWith('legacy:') ? ' · grouped by send day' : '';
-            return `Sent ${dateStr}${by}${legacy}`;
+            const meta = resolveSurveyBatchMeta(batch);
+            const dateBit = surveySendBatchDateLabel(batch);
+            if (meta.label) return `${meta.starred ? '★ ' : ''}${meta.label}`;
+            return `${meta.starred ? '★ ' : ''}${dateBit}`;
+        };
+
+        const toggleSurveyBatchStar = async (batch, { promptForLabel = false } = {}) => {
+            if (!batch?.id) return;
+            const key = String(batch.id);
+            const meta = resolveSurveyBatchMeta(batch);
+            const nextStarred = !meta.starred;
+            let nextLabel = meta.label;
+            if (nextStarred && promptForLabel && !nextLabel) {
+                const typed = window.prompt(
+                    'Name this send batch (optional — e.g. “Rebuild red 5”):',
+                    meta.label || ''
+                );
+                if (typed === null) return; // cancelled
+                nextLabel = String(typed).trim().slice(0, 80);
+            }
+            setSurveyBatchPin(key, {
+                starred: nextStarred,
+                label: nextLabel || undefined,
+            });
+            // Persist to Cosmos for real batchIds so the whole team sees it
+            if (!key.startsWith('legacy:') && apiService?.updateSurveyBatchMeta) {
+                try {
+                    await apiService.updateSurveyBatchMeta({
+                        batchId: key,
+                        batchStarred: nextStarred,
+                        ...(nextLabel !== undefined ? { batchLabel: nextLabel || '' } : {}),
+                    });
+                    (allSiteSurveyAssignments || []).forEach((a) => {
+                        if (surveySendBatchKey(a) !== key) return;
+                        a.batchStarred = nextStarred || undefined;
+                        if (nextLabel) a.batchLabel = nextLabel;
+                        else if (nextLabel === '') delete a.batchLabel;
+                    });
+                } catch (err) {
+                    console.warn('Batch star sync failed (local pin kept)', err);
+                }
+            }
+            renderFeasibility();
+        };
+
+        const renameSurveyBatch = async (batch) => {
+            if (!batch?.id) return;
+            const key = String(batch.id);
+            const meta = resolveSurveyBatchMeta(batch);
+            const typed = window.prompt(
+                'Batch name (shown in Responses & exports):',
+                meta.label || ''
+            );
+            if (typed === null) return;
+            const nextLabel = String(typed).trim().slice(0, 80);
+            setSurveyBatchPin(key, {
+                starred: meta.starred || Boolean(nextLabel),
+                label: nextLabel || undefined,
+            });
+            if (!key.startsWith('legacy:') && apiService?.updateSurveyBatchMeta) {
+                try {
+                    await apiService.updateSurveyBatchMeta({
+                        batchId: key,
+                        batchLabel: nextLabel,
+                        batchStarred: meta.starred || Boolean(nextLabel),
+                    });
+                    (allSiteSurveyAssignments || []).forEach((a) => {
+                        if (surveySendBatchKey(a) !== key) return;
+                        if (nextLabel) a.batchLabel = nextLabel;
+                        else delete a.batchLabel;
+                        if (meta.starred || nextLabel) a.batchStarred = true;
+                    });
+                } catch (err) {
+                    console.warn('Batch rename sync failed (local pin kept)', err);
+                }
+            }
+            renderFeasibility();
         };
 
         const renderFeasibility = () => {
@@ -7193,6 +7375,8 @@
                             surveyId: item.surveyId,
                             sentAt: item.a.batchSentAt || item.a.lastSentAt || item.a.createdAt || '',
                             sentBy: item.a.sentBy || item.a.createdBy || '',
+                            batchLabel: item.a.batchLabel || '',
+                            batchStarred: Boolean(item.a.batchStarred),
                             items: [],
                             submitted: 0,
                             pending: 0,
@@ -7204,6 +7388,8 @@
                     if (item.kind === 'completed') b.submitted += 1;
                     else b.pending += 1;
                     if (item.resp && !item.reviewed) b.newCount += 1;
+                    if (item.a.batchLabel && !b.batchLabel) b.batchLabel = item.a.batchLabel;
+                    if (item.a.batchStarred) b.batchStarred = true;
                     // Prefer earliest stamped batch time
                     const t = item.a.batchSentAt || item.a.lastSentAt || item.a.createdAt || '';
                     if (t && (!b.sentAt || String(t) < String(b.sentAt))) b.sentAt = t;
@@ -7220,9 +7406,12 @@
                 });
 
                 const surveyGroups = [...bySurvey.values()].map((g) => {
-                    const batchList = [...g.batches.values()].sort((a, b) =>
-                        String(b.sentAt || '').localeCompare(String(a.sentAt || ''))
-                    );
+                    const batchList = [...g.batches.values()].sort((a, b) => {
+                        const sa = resolveSurveyBatchMeta(a).starred ? 1 : 0;
+                        const sb = resolveSurveyBatchMeta(b).starred ? 1 : 0;
+                        if (sb !== sa) return sb - sa;
+                        return String(b.sentAt || '').localeCompare(String(a.sentAt || ''));
+                    });
                     return { ...g, batchList };
                 }).sort((a, b) => {
                     if (b.pending !== a.pending) return b.pending - a.pending;
@@ -7287,23 +7476,26 @@
                     body.innerHTML = `
                         ${dateBar}
                         ${surveyGroups.length === 0
-                            ? empty(sentWindow === 'all'
+                            ? empty(sentWindow === 'starred'
+                                ? 'No starred batches yet. Switch to All time, open a survey, hit ★ on a send, then filter ★ Starred.'
+                                : (sentWindow === 'all'
                                 ? 'No invites or responses yet. Hit Send survey.'
-                                : `Nothing in ${sentWithinLabel(sentWindow).toLowerCase()}. Try Last 30 days or All time.`)
+                                : `Nothing in ${sentWithinLabel(sentWindow).toLowerCase()}. Try Last 30 days or All time.`))
                             : `
                             <div class="px-1 mb-2 text-xs text-gray-500 dark:text-gray-400">
-                                Open a survey to see send batches — who was invited together, who submitted, who’s still pending.
+                                Open a survey to see send batches — star (★) the ones you care about, then filter ★ Starred or export Sponsor Excel.
                             </div>
                             ${surveyGroups.map((g) => {
                                 const search = `${g.surveyTitle} ${g.surveyId}`.toLowerCase();
                                 const total = g.invites.length;
+                                const starredN = g.batchList.filter((b) => resolveSurveyBatchMeta(b).starred).length;
                                 return `
                                     <div class="comms-row mb-2 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden" data-search="${escapeHtml(search)}">
                                         <div class="px-3 py-2.5 flex flex-wrap items-center gap-2 bg-gray-50/80 dark:bg-gray-900/30">
                                             <div class="min-w-0 flex-1">
                                                 <div class="text-sm font-semibold text-gray-900 dark:text-gray-100 truncate">${escapeHtml(g.surveyTitle)}</div>
                                                 <div class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
-                                                    ${total} invited · ${g.submitted} submitted · ${g.pending} pending · ${g.batchList.length} batch${g.batchList.length === 1 ? '' : 'es'}${g.newCount ? ` · ${g.newCount} new` : ''}${g.orphanCount ? ` · ${g.orphanCount} historical` : ''}
+                                                    ${total} invited · ${g.submitted} submitted · ${g.pending} pending · ${g.batchList.length} batch${g.batchList.length === 1 ? '' : 'es'}${starredN ? ` · ★ ${starredN}` : ''}${g.newCount ? ` · ${g.newCount} new` : ''}${g.orphanCount ? ` · ${g.orphanCount} historical` : ''}
                                                 </div>
                                             </div>
                                             <button type="button" class="comms-responses-open-survey-btn px-2 py-1 rounded text-xs bg-indigo-600 text-white shrink-0" data-survey-id="${escapeHtml(g.surveyId)}">View batches</button>
@@ -7324,7 +7516,7 @@
                         <div class="px-1 mb-2 flex flex-wrap items-center justify-between gap-2">
                             <div class="text-xs text-gray-500 dark:text-gray-400">
                                 ${focusedSurvey.submitted} submitted · ${focusedSurvey.pending} pending · ${focusedSurvey.batchList.length} send batch${focusedSurvey.batchList.length === 1 ? '' : 'es'}
-                                — check batches to export together (Sponsor Excel follows selection / date filter).
+                                — ★ star batches you care about, or check several to export together.
                             </div>
                             <div class="flex flex-wrap items-center gap-1.5">
                                 <button type="button" id="comms-responses-select-all-batches-btn" class="text-xs font-medium px-2 py-1 rounded border border-gray-300 dark:border-gray-600">Select all in filter</button>
@@ -7333,23 +7525,29 @@
                             </div>
                         </div>
                         ${focusedSurvey.batchList.length === 0 && !orphans.length
-                            ? empty(`Nothing in ${sentWithinLabel(sentWindow).toLowerCase()} for this survey.`)
+                            ? empty(sentWindow === 'starred'
+                                ? 'No starred batches yet. Open All time, hit ★ on a send, then come back to ★ Starred.'
+                                : `Nothing in ${sentWithinLabel(sentWindow).toLowerCase()} for this survey.`)
                             : focusedSurvey.batchList.map((b) => {
-                                const search = `${surveySendBatchLabel(b)} ${b.sentBy || ''}`.toLowerCase();
+                                const search = `${surveySendBatchLabel(b)} ${b.sentBy || ''} ${b.batchLabel || ''}`.toLowerCase();
                                 const checked = selectedSet.has(b.id);
+                                const meta = resolveSurveyBatchMeta(b);
+                                const dateHint = surveySendBatchDateLabel(b);
                                 return `
-                                    <div class="comms-row mb-2 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden ${checked ? 'ring-1 ring-indigo-400' : ''}" data-search="${escapeHtml(search)}">
+                                    <div class="comms-row mb-2 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden ${checked ? 'ring-1 ring-indigo-400' : ''} ${meta.starred ? 'border-amber-300 dark:border-amber-700' : ''}" data-search="${escapeHtml(search)}">
                                         <div class="px-3 py-2.5 flex flex-wrap items-center gap-2 bg-gray-50/80 dark:bg-gray-900/30">
                                             <label class="inline-flex items-center shrink-0" title="Include in multi-batch export">
                                                 <input type="checkbox" class="comms-responses-batch-check h-4 w-4 rounded border-gray-300 text-indigo-600" data-batch-id="${escapeHtml(b.id)}" ${checked ? 'checked' : ''} />
                                             </label>
+                                            <button type="button" class="comms-responses-star-batch-btn shrink-0 text-lg leading-none px-1 ${meta.starred ? 'text-amber-500' : 'text-gray-300 hover:text-amber-400'}" data-batch-id="${escapeHtml(b.id)}" title="${meta.starred ? 'Unstar batch' : 'Star batch for quick report'}">${meta.starred ? '★' : '☆'}</button>
                                             <div class="min-w-0 flex-1">
                                                 <div class="text-sm font-semibold text-gray-900 dark:text-gray-100 truncate">${escapeHtml(surveySendBatchLabel(b))}</div>
                                                 <div class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
-                                                    ${b.items.length} site${b.items.length === 1 ? '' : 's'} · ${b.submitted} submitted · ${b.pending} pending${b.newCount ? ` · ${b.newCount} new` : ''}
+                                                    ${meta.label ? `${escapeHtml(dateHint)} · ` : ''}${b.items.length} site${b.items.length === 1 ? '' : 's'} · ${b.submitted} submitted · ${b.pending} pending${b.newCount ? ` · ${b.newCount} new` : ''}
                                                 </div>
                                             </div>
-                                            <button type="button" class="comms-responses-open-batch-btn px-2 py-1 rounded text-xs bg-indigo-600 text-white shrink-0" data-batch-id="${escapeHtml(b.id)}">Open batch</button>
+                                            <button type="button" class="comms-responses-rename-batch-btn px-2 py-1 rounded text-xs border border-gray-300 dark:border-gray-600 shrink-0" data-batch-id="${escapeHtml(b.id)}">Rename</button>
+                                            <button type="button" class="comms-responses-open-batch-btn px-2 py-1 rounded text-xs bg-indigo-600 text-white shrink-0" data-batch-id="${escapeHtml(b.id)}">Open</button>
                                         </div>
                                     </div>`;
                             }).join('')}
@@ -7395,8 +7593,31 @@
                         commsResponsesSelectedBatchIds = [];
                         renderFeasibility();
                     });
+                    body.querySelectorAll('.comms-responses-star-batch-btn').forEach((btn) => {
+                        btn.addEventListener('click', () => {
+                            const id = btn.getAttribute('data-batch-id') || '';
+                            const batch = focusedSurvey.batchList.find((x) => x.id === id);
+                            if (batch) toggleSurveyBatchStar(batch, { promptForLabel: true });
+                        });
+                    });
+                    body.querySelectorAll('.comms-responses-rename-batch-btn').forEach((btn) => {
+                        btn.addEventListener('click', () => {
+                            const id = btn.getAttribute('data-batch-id') || '';
+                            const batch = focusedSurvey.batchList.find((x) => x.id === id);
+                            if (batch) renameSurveyBatch(batch);
+                        });
+                    });
                 } else {
                     if (titleEl) titleEl.textContent = surveySendBatchLabel(focusedBatch);
+                    const batchMeta = resolveSurveyBatchMeta(focusedBatch);
+                    // Star / rename while drilled into a batch
+                    if (actionsEl) {
+                        const existing = actionsEl.innerHTML;
+                        actionsEl.innerHTML = `
+                            <button type="button" id="comms-responses-star-open-batch-btn" class="text-xs font-medium px-2 py-1 rounded border ${batchMeta.starred ? 'border-amber-400 text-amber-700 dark:text-amber-300' : 'border-gray-300 dark:border-gray-600'}">${batchMeta.starred ? '★ Starred' : '☆ Star'}</button>
+                            <button type="button" id="comms-responses-rename-open-batch-btn" class="text-xs font-medium px-2 py-1 rounded border border-gray-300 dark:border-gray-600">Rename</button>
+                            ${existing}`;
+                    }
                     const counts = {
                         all: focusedBatch.items.length,
                         submitted: focusedBatch.submitted,
@@ -7479,6 +7700,13 @@
                         commsResponsesFilter = 'all';
                         renderFeasibility();
                     });
+                });
+
+                document.getElementById('comms-responses-star-open-batch-btn')?.addEventListener('click', () => {
+                    if (focusedBatch) toggleSurveyBatchStar(focusedBatch, { promptForLabel: true });
+                });
+                document.getElementById('comms-responses-rename-open-batch-btn')?.addEventListener('click', () => {
+                    if (focusedBatch) renameSurveyBatch(focusedBatch);
                 });
 
                 const backBtn = document.getElementById('comms-responses-back-btn');
@@ -9927,6 +10155,19 @@
                                             <input name="studyTitle" type="text" maxlength="200" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-gray-100 px-3 py-2" placeholder="e.g. ReBUILD / this clinical trial" />
                                         </div>
                                     </div>
+                                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                        <div>
+                                            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Batch name <span class="font-normal text-gray-400">(optional)</span></label>
+                                            <input name="batchLabel" type="text" maxlength="80" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-gray-100 px-3 py-2" placeholder="e.g. Rebuild red 5 · Wave 2" />
+                                            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Shows in Responses instead of just the send timestamp. Easy to find later.</p>
+                                        </div>
+                                        <div class="flex items-end">
+                                            <label class="flex items-start gap-2 text-sm text-gray-700 dark:text-gray-200 pb-2">
+                                                <input name="batchStarred" type="checkbox" class="mt-0.5 rounded border-gray-300 text-amber-500" checked />
+                                                <span><span class="font-medium">★ Star this batch</span><br/><span class="text-xs text-gray-500 dark:text-gray-400">Pin under ★ Starred for quick reporting / Sponsor Excel.</span></span>
+                                            </label>
+                                        </div>
+                                    </div>
                                     <div>
                                         <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Subject</label>
                                         <input name="emailSubject" id="send-email-subject" type="text" maxlength="200" value="{{studyCode}} || Feasibility Survey || {{role}}" class="mt-1 block w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 dark:text-gray-100 px-3 py-2" placeholder="{{studyCode}} || Feasibility Survey || {{role}}" />
@@ -11025,6 +11266,8 @@
                                     <label class="block text-xs text-gray-500 dark:text-gray-400">Sent within
 
                                         <select id="feasibility-sent-within-select" class="mt-1 block w-full min-w-[10rem] p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white text-sm">
+
+                                            <option value="starred">★ Starred</option>
 
                                             <option value="latest">Latest send</option>
 
@@ -16818,6 +17061,8 @@
                     const emailBody = String(form.emailBody?.value || '').trim();
                     const studyCode = String(form.studyCode?.value || '').trim();
                     const studyTitle = String(form.studyTitle?.value || '').trim();
+                    const batchLabel = String(form.batchLabel?.value || '').trim().slice(0, 80);
+                    const batchStarred = !!form.batchStarred?.checked || Boolean(batchLabel);
                     const cc = String(form.emailCc?.value || '').trim();
                     const password = String(form.emailPassword?.value || '').trim();
                     const includeGf = form.querySelector('input[name="includeGeneralFeasibility"]:checked')?.value !== 'no';
@@ -16866,11 +17111,20 @@
                         emailBody,
                         studyCode,
                         studyTitle,
+                        batchLabel: batchLabel || undefined,
+                        batchStarred,
                         cc,
                         password,
                         attachments,
                         baseUrl: window.location.origin
                     });
+
+                    if (payload?.batchId && (batchStarred || batchLabel)) {
+                        setSurveyBatchPin(payload.batchId, {
+                            starred: Boolean(batchStarred || batchLabel),
+                            label: batchLabel || undefined,
+                        });
+                    }
 
                     closeModal();
                     await initializeDataLoaders();
