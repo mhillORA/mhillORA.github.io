@@ -1517,6 +1517,7 @@
         let commsStatusSurveyId = null; // null = template overview; else drill into one survey
         let commsResponsesSurveyId = null; // null = responses by survey; else drill into one survey
         let commsResponsesBatchId = null; // null = batches for survey; else one send cohort
+        let commsResponsesSelectedBatchIds = []; // multi-select for export across batches
         let commsResponsesFilter = 'all'; // all | submitted | pending | new | reviewed
         // Sent-date window: latest = most recent Send per survey (your ~30); 7d/30d/90d/all
         let commsResponsesSentWithin = 'latest';
@@ -3834,7 +3835,13 @@
             try {
                 const d = new Date(iso);
                 if (Number.isNaN(d.getTime())) return '—';
-                return d.toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' });
+                return d.toLocaleString(undefined, {
+                    year: 'numeric',
+                    month: 'short',
+                    day: 'numeric',
+                    hour: 'numeric',
+                    minute: '2-digit',
+                });
             } catch (_) {
                 return '—';
             }
@@ -4241,6 +4248,25 @@
         };
 
         /**
+         * True Artemis Send invites only — not Mike/Stealth/GF ingest synthetic assignments.
+         * Those ingest rows were status=submitted with old dates and polluted Complete % / activity.
+         */
+        const isSyntheticSurveyAssignment = (a) => {
+            if (!a) return true;
+            const id = String(a.id || '');
+            if (/^(asg-mike|asg-stealth|asg-gf|asg-feas|asg-prior|prior-)/i.test(id)) return true;
+            const src = String(a.source || '').toLowerCase();
+            if (!src) return false;
+            return /stealth|mike-rebuild|mike.pack|ingest|feasibility.master|prior/.test(src);
+        };
+
+        const isLiveSurveyInvite = (a) => Boolean(a && a.id && !isSyntheticSurveyAssignment(a));
+
+        const assignmentActivityIso = (a) =>
+            String(a?.submittedAt || a?.draftSavedAt || a?.openedAt || a?.batchSentAt
+                || a?.lastSentAt || a?.updatedAt || a?.createdAt || '');
+
+        /**
          * Survey completion % for a site + template:
          * - 100% = live response submitted for THIS survey (any role / shared "site" invite)
          * - otherwise = share of this survey's questions that already have an answer on file
@@ -4298,31 +4324,49 @@
                 return r === roleFilter;
             };
 
-            const realAssignments = (allSiteSurveyAssignments || []).filter((a) => {
-                if (!a || !a.id || !ids.has(a.siteId)) return false;
+            const liveAssignments = (allSiteSurveyAssignments || []).filter((a) => {
+                if (!isLiveSurveyInvite(a) || !ids.has(a.siteId)) return false;
                 if (String(a.surveyId || '') !== String(surveyId || '')) return false;
                 return roleOk(a.targetRole);
             });
 
-            // 100% ONLY when a real Artemis invite was submitted — not ingested/historical
-            // responses that carry synthetic assignmentIds (asg-gf-*, asg-feas-*, etc.).
-            const submittedAsg = realAssignments.find(
-                (a) => String(a.status || '').toLowerCase() === 'submitted'
-            );
+            // 100% ONLY when a real Artemis invite was submitted — never Mike/Stealth ingest asgs.
+            // Prefer the latest live submit (sites can have older ingest "submitted" noise).
+            const submittedLive = liveAssignments
+                .filter((a) => String(a.status || '').toLowerCase() === 'submitted')
+                .sort((a, b) => String(b.submittedAt || b.updatedAt || '').localeCompare(
+                    String(a.submittedAt || a.updatedAt || '')
+                ));
+            const submittedAsg = submittedLive[0] || null;
             if (submittedAsg) {
-                const linkedRsp = (allSiteSurveyResponses || []).find((r) => {
+                // Prefer the response bound to THIS invite; never fall back to an ingest rsp date.
+                let linkedRsp = (allSiteSurveyResponses || []).find((r) => {
                     if (!r || r._archived) return false;
-                    if (String(r.surveyId || '') !== String(surveyId || '')) return false;
-                    if (!ids.has(r.siteId) && r.assignmentId !== submittedAsg.id) return false;
-                    return r.assignmentId === submittedAsg.id || ids.has(r.siteId);
+                    return r.assignmentId === submittedAsg.id;
                 });
+                if (!linkedRsp) {
+                    linkedRsp = (allSiteSurveyResponses || [])
+                        .filter((r) => {
+                            if (!r || r._archived) return false;
+                            if (String(r.surveyId || '') !== String(surveyId || '')) return false;
+                            if (!ids.has(r.siteId)) return false;
+                            // Skip ingest/prior response docs when a live invite exists
+                            const aid = String(r.assignmentId || '');
+                            if (/^(asg-mike|asg-stealth|asg-gf|asg-feas|prior-)/i.test(aid)) return false;
+                            if (String(r.source || '').toLowerCase().match(/stealth|mike-rebuild|ingest/)) return false;
+                            return true;
+                        })
+                        .sort((a, b) => String(b.submittedAt || b.updatedAt || '').localeCompare(
+                            String(a.submittedAt || a.updatedAt || '')
+                        ))[0] || null;
+                }
                 return {
                     status: 'submitted',
                     completePct: 100,
                     filled: total,
                     total,
                     responseId: linkedRsp?.id || '',
-                    when: linkedRsp?.submittedAt || linkedRsp?.createdAt
+                    when: linkedRsp?.submittedAt || linkedRsp?.updatedAt || linkedRsp?.createdAt
                         || submittedAsg.submittedAt || submittedAsg.updatedAt || submittedAsg.createdAt || '',
                 };
             }
@@ -4333,7 +4377,7 @@
             // Draft progress on open assignments for this survey
             let draftFilled = 0;
             let draftWhen = '';
-            realAssignments.forEach((a) => {
+            liveAssignments.forEach((a) => {
                 if (String(a.status || '').toLowerCase() === 'submitted') return;
                 if (!Array.isArray(a.draftAnswers) || !a.draftAnswers.length) return;
                 const { filled } = countFilledAnswersAgainstQuestions(a.draftAnswers, questions);
@@ -4348,7 +4392,7 @@
                 ? Math.max(0, Number(coverageFilled))
                 : 0;
             const filled = Math.max(draftFilled, coverage);
-            const invited = realAssignments.some(
+            const invited = liveAssignments.some(
                 (a) => String(a.status || '').toLowerCase() !== 'submitted'
             );
 
@@ -4399,16 +4443,23 @@
             const sentWindow = opts.sentWithin !== undefined
                 ? opts.sentWithin
                 : (feasibilityReportSentWithin || 'latest');
-            const invitePool = invitedOnly
-                ? filterAssignmentsBySentWithin(
-                    (allSiteSurveyAssignments || []).filter((a) => a && a.surveyId === surveyId),
-                    sentWindow
-                )
-                : (allSiteSurveyAssignments || []).filter((a) => a && a.surveyId === surveyId);
+            const batchIds = Array.isArray(opts.batchIds)
+                ? opts.batchIds.map(String).filter(Boolean)
+                : (opts.batchId ? [String(opts.batchId)] : null);
+            const liveInvites = (allSiteSurveyAssignments || []).filter((a) => {
+                if (!isLiveSurveyInvite(a) || a.surveyId !== surveyId) return false;
+                if (roleFilter && roleFilter !== 'all'
+                    && String(a.targetRole || '').toLowerCase() !== roleFilter) return false;
+                return true;
+            });
+            const windowed = invitedOnly
+                ? filterAssignmentsBySentWithin(liveInvites, sentWindow)
+                : liveInvites;
+            const invitePool = batchIds?.length
+                ? windowed.filter((a) => batchIds.includes(surveySendBatchKey(a)))
+                : windowed;
             invitePool.forEach((a) => {
                 if (!a?.siteId) return;
-                if (roleFilter && roleFilter !== 'all'
-                    && String(a.targetRole || '').toLowerCase() !== roleFilter) return;
                 const cid = canonicalSiteIdForReporting(a.siteId);
                 if (cid) {
                     invitedCanonical.add(cid);
@@ -4544,6 +4595,7 @@
                 invitedOnly,
                 invitedCount: invitedCanonical.size,
                 sentWithin: sentWindow,
+                batchIds: batchIds || null,
             };
         };
 
@@ -4897,9 +4949,10 @@
             setTimeout(() => URL.revokeObjectURL(a.href), 1000);
         };
 
-        const exportFeasibilitySurveyCsv = ({ surveyId, mode = 'wide', targetRole = 'all' } = {}) => {
+        const exportFeasibilitySurveyCsv = ({ surveyId, mode = 'wide', targetRole = 'all', invitedOnly, sentWithin, batchIds } = {}) => {
             try {
-                const sid = surveyId || feasibilityReportSurveyId;
+                const scope = resolveFeasibilityExportScope({ surveyId, targetRole });
+                const sid = scope.surveyId || surveyId || feasibilityReportSurveyId;
                 if (!sid) {
                     showNotification('Select a survey first.', 'info');
                     return;
@@ -4907,12 +4960,19 @@
                 const wantEveryone = mode === 'wide' || mode === 'everyone';
                 const report = buildFeasibilityQuestionReport(
                     sid,
-                    targetRole || feasibilityReportRole,
+                    scope.targetRole || targetRole || feasibilityReportRole,
                     {
                         includeEmptySites: wantEveryone,
-                        // Full catalog export ignores cohort; selected CSV follows the UI toggle.
-                        invitedOnly: wantEveryone ? false : (feasibilityReportCohort !== 'all'),
-                        sentWithin: wantEveryone ? 'all' : (feasibilityReportSentWithin || 'latest'),
+                        // Full catalog export ignores cohort; long/selected CSV follows Responses or Reporting filter.
+                        invitedOnly: wantEveryone
+                            ? false
+                            : (invitedOnly !== undefined ? invitedOnly : scope.invitedOnly),
+                        sentWithin: wantEveryone
+                            ? 'all'
+                            : (sentWithin !== undefined ? sentWithin : scope.sentWithin),
+                        batchIds: wantEveryone
+                            ? null
+                            : (batchIds !== undefined ? batchIds : scope.batchIds),
                     }
                 );
                 if (!report.def) {
@@ -5052,11 +5112,25 @@
             sheet.getColumn(notesCol).width = 36;
         };
 
-        const surveyInviteStats = (surveyId, targetRole = 'all') => {
+        const surveyInviteStats = (surveyId, targetRole = 'all', opts = {}) => {
             const roleFilter = String(targetRole || 'all').trim().toLowerCase();
-            let assignments = asSurveyList(allSiteSurveyAssignments).filter(a => a && a.surveyId === surveyId);
+            let assignments = asSurveyList(allSiteSurveyAssignments).filter(
+                (a) => a && a.surveyId === surveyId && isLiveSurveyInvite(a)
+            );
             if (roleFilter && roleFilter !== 'all') {
                 assignments = assignments.filter(a => String(a.targetRole || '').toLowerCase() === roleFilter);
+            }
+            const sentWindow = opts.sentWithin !== undefined
+                ? opts.sentWithin
+                : (feasibilityReportSentWithin || 'latest');
+            if (opts.invitedOnly !== false) {
+                assignments = filterAssignmentsBySentWithin(assignments, sentWindow);
+            }
+            const batchIds = Array.isArray(opts.batchIds)
+                ? opts.batchIds.map(String).filter(Boolean)
+                : (opts.batchId ? [String(opts.batchId)] : null);
+            if (batchIds?.length) {
+                assignments = assignments.filter((a) => batchIds.includes(surveySendBatchKey(a)));
             }
             const bySite = new Map();
             assignments.forEach(a => {
@@ -5071,14 +5145,51 @@
             return { invited, submitted, pending: Math.max(0, invited - submitted), assignments };
         };
 
-        const buildSponsorPackModel = ({ surveyId, targetRole = 'all' } = {}) => {
-            const sid = surveyId || feasibilityReportSurveyId;
+        /**
+         * Cohort for Reporting / Sponsor Excel / CSV.
+         * When exporting from Feasibility→Responses, prefer that survey + date/batch filter
+         * so you don't get Mike/Stealth overlap (~86) instead of the send you just viewed.
+         */
+        const resolveFeasibilityExportScope = ({ surveyId, targetRole } = {}) => {
+            const fromResponses = activeTab === 'feasibility' && commsPanel === 'responses';
+            const sid = surveyId
+                || (fromResponses ? commsResponsesSurveyId : null)
+                || feasibilityReportSurveyId
+                || null;
             const role = targetRole || feasibilityReportRole || 'all';
-            const report = buildFeasibilityQuestionReport(sid, role);
+            const invitedOnly = fromResponses
+                ? true
+                : (feasibilityReportCohort !== 'all');
+            const sentWithin = fromResponses
+                ? (commsResponsesSentWithin || 'latest')
+                : (feasibilityReportSentWithin || 'latest');
+            let batchIds = null;
+            if (fromResponses) {
+                const selected = Array.isArray(commsResponsesSelectedBatchIds)
+                    ? commsResponsesSelectedBatchIds.filter(Boolean)
+                    : [];
+                if (selected.length) batchIds = selected.slice();
+                else if (commsResponsesBatchId) batchIds = [String(commsResponsesBatchId)];
+            }
+            return { surveyId: sid, targetRole: role, invitedOnly, sentWithin, batchIds };
+        };
+
+        const buildSponsorPackModel = ({ surveyId, targetRole = 'all', invitedOnly, sentWithin, batchIds } = {}) => {
+            const scope = resolveFeasibilityExportScope({ surveyId, targetRole });
+            const sid = scope.surveyId;
+            const role = scope.targetRole;
+            const reportOpts = {
+                includeEmptySites: false,
+                invitedOnly: invitedOnly !== undefined ? invitedOnly : scope.invitedOnly,
+                sentWithin: sentWithin !== undefined ? sentWithin : scope.sentWithin,
+                batchIds: batchIds !== undefined ? batchIds : scope.batchIds,
+            };
+            const report = buildFeasibilityQuestionReport(sid, role, reportOpts);
             if (!report?.def) return null;
-            const invites = surveyInviteStats(sid, role);
+            const invites = surveyInviteStats(sid, role, reportOpts);
             const responded = report.siteRows.length;
-            const invited = Math.max(invites.invited, responded);
+            // Invited = send cohort size; don't inflate with prior-answer sites
+            const invited = Math.max(invites.invited, 0);
             const rate = invited ? Math.round((responded / invited) * 100) : (responded ? 100 : 0);
             const generatedAt = new Date();
             const surveyTitle = formatSponsorSurveyTitle(report.def, sid);
@@ -5099,7 +5210,19 @@
                     top: s.distribution[0] || null,
                     distribution: s.distribution.slice(0, 4)
                 }));
-            return { report, invites, invited, responded, rate, role, generatedAt, highlights, surveyId: sid, surveyTitle };
+            return {
+                report,
+                invites,
+                invited,
+                responded,
+                rate,
+                role,
+                generatedAt,
+                highlights,
+                surveyId: sid,
+                surveyTitle,
+                scope: reportOpts,
+            };
         };
 
         const ensureSponsorPackLookups = async () => {
@@ -5112,10 +5235,10 @@
             }
         };
 
-        const exportSponsorPackExcel = async ({ surveyId, targetRole = 'all' } = {}) => {
+        const exportSponsorPackExcel = async ({ surveyId, targetRole = 'all', invitedOnly, sentWithin, batchIds } = {}) => {
             try {
                 await ensureSponsorPackLookups();
-                const model = buildSponsorPackModel({ surveyId, targetRole });
+                const model = buildSponsorPackModel({ surveyId, targetRole, invitedOnly, sentWithin, batchIds });
                 if (!model) {
                     showNotification('Select a survey with a definition first.', 'info');
                     return;
@@ -5146,12 +5269,17 @@
                 summary.addRow([]);
                 summary.addRow(['Survey', surveyTitle]);
                 summary.addRow(['Audience', roleLabel]);
+                summary.addRow(['Cohort', model.scope?.invitedOnly === false
+                    ? 'All answers on file'
+                    : (model.scope?.batchIds?.length
+                        ? `${model.scope.batchIds.length} selected send batch${model.scope.batchIds.length === 1 ? '' : 'es'}`
+                        : `Sent invites · ${sentWithinLabel(model.scope?.sentWithin || 'latest')}`)]);
                 summary.addRow(['Generated', formatSponsorDate(generatedAt.toISOString())]);
                 summary.addRow(['Classification', 'Confidential — for sponsor review']);
                 summary.addRow([]);
                 summary.addRow(['Metric', 'Value']);
                 summary.addRow(['Participating sites', responded]);
-                summary.addRow(['Sites invited', invited]);
+                summary.addRow(['Sites invited (this cohort)', invited]);
                 summary.addRow(['Response rate', `${rate}%`]);
                 summary.addRow(['Questions', report.questions.length]);
                 summary.addRow([]);
@@ -5195,7 +5323,7 @@
                 });
                 review.getColumn(1).width = 28;
                 review.getColumn(2).width = 14;
-                review.getColumn(3).width = 14;
+                review.getColumn(3).width = 22;
                 review.getColumn(4).width = 16;
                 review.getColumn(5).width = 10;
                 applySponsorReviewColumns(review, 3, 2 + report.siteRows.length, 6, 7, 8);
@@ -5251,7 +5379,7 @@
                 });
                 matrix.getColumn(1).width = 26;
                 matrix.getColumn(2).width = 14;
-                matrix.getColumn(3).width = 14;
+                matrix.getColumn(3).width = 22;
                 matrix.getColumn(4).width = 10;
                 for (let c = 5; c <= 4 + report.questions.length; c++) {
                     matrix.getColumn(c).width = 18;
@@ -5282,23 +5410,27 @@
                 });
                 detail.getColumn(1).width = 26;
                 detail.getColumn(2).width = 14;
-                detail.getColumn(3).width = 14;
+                detail.getColumn(3).width = 22;
                 detail.getColumn(4).width = 40;
                 detail.getColumn(5).width = 36;
 
                 const filename = `ORA_Feasibility_SponsorPack_${safeTitle}_${generatedAt.toISOString().slice(0, 10)}.xlsx`;
                 await downloadExcelJsWorkbook(wb, filename);
-                showNotification('Sponsor Excel pack downloaded.', 'success');
+                const n = model.report.siteRows.length;
+                const cohortHint = model.scope?.batchIds?.length
+                    ? `${model.scope.batchIds.length} batch${model.scope.batchIds.length === 1 ? '' : 'es'}`
+                    : sentWithinLabel(model.scope?.sentWithin || 'latest');
+                showNotification(`Sponsor Excel · ${n} site${n === 1 ? '' : 's'} · ${cohortHint}`, 'success');
             } catch (err) {
                 console.error(err);
                 showNotification(err.message || 'Failed to export sponsor Excel.', 'error');
             }
         };
 
-        const exportSponsorPackPdf = async ({ surveyId, targetRole = 'all' } = {}) => {
+        const exportSponsorPackPdf = async ({ surveyId, targetRole = 'all', invitedOnly, sentWithin, batchIds } = {}) => {
             try {
                 await ensureSponsorPackLookups();
-                const model = buildSponsorPackModel({ surveyId, targetRole });
+                const model = buildSponsorPackModel({ surveyId, targetRole, invitedOnly, sentWithin, batchIds });
                 if (!model) {
                     showNotification('Select a survey with a definition first.', 'info');
                     return;
@@ -5311,6 +5443,11 @@
                 const roleLabel = role === 'all' ? 'All respondents' : formatSponsorRoleLabel(role);
                 const esc = escapeHtml;
                 const generatedLabel = formatSponsorDate(generatedAt.toISOString());
+                const cohortLabel = model.scope?.invitedOnly === false
+                    ? 'All answers on file'
+                    : (model.scope?.batchIds?.length
+                        ? `${model.scope.batchIds.length} selected send batch${model.scope.batchIds.length === 1 ? '' : 'es'}`
+                        : `Sent invites · ${sentWithinLabel(model.scope?.sentWithin || 'latest')}`);
                 const description = String(report.def.description || '').trim();
                 const cleanDescription = description && !looksLikeInternalSiteId(description)
                     ? description
@@ -5526,7 +5663,7 @@
           <div class="cover-meta">
             <div><div class="l">Prepared</div><div class="v">${esc(generatedLabel)}</div></div>
             <div><div class="l">Audience</div><div class="v">${esc(roleLabel)}</div></div>
-            <div><div class="l">Participating sites</div><div class="v">${responded}</div></div>
+            <div><div class="l">Cohort</div><div class="v">${esc(cohortLabel)}</div></div>
           </div>
         </div>
       </div>
@@ -5543,7 +5680,7 @@
           <div class="kpi"><div class="l">Questions</div><div class="v">${report.questions.length}</div></div>
         </div>
         <div class="note">
-          This pack is organized for sponsor discussion: summary metrics, leading answer patterns, a site roster, a compact snapshot matrix, then each site’s full responses.
+          Cohort: ${esc(cohortLabel)}. This pack is organized for sponsor discussion: summary metrics, leading answer patterns, a site roster, a compact snapshot matrix, then each site’s full responses.
         </div>
       </div>
     </section>
@@ -6591,7 +6728,8 @@
             const predefined = allDefs.filter(isPredefinedSurveyDef);
             const custom = allDefs.filter(d => !isPredefinedSurveyDef(d));
 
-            let assignments = asSurveyList(allSiteSurveyAssignments).slice();
+            let assignments = asSurveyList(allSiteSurveyAssignments).slice()
+                .filter((a) => isLiveSurveyInvite(a));
             if (commsSiteFilterId) assignments = assignments.filter(a => a && a.siteId === commsSiteFilterId);
             assignments.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
 
@@ -7179,19 +7317,32 @@
                 } else if (!commsResponsesBatchId || !focusedBatch) {
                     if (titleEl) titleEl.textContent = focusedSurvey.surveyTitle;
                     const orphans = orphanResponses.filter((r) => (r.surveyId || '_unknown') === focusedSurvey.surveyId);
+                    const selectedSet = new Set(commsResponsesSelectedBatchIds || []);
+                    const selectedCount = focusedSurvey.batchList.filter((b) => selectedSet.has(b.id)).length;
                     body.innerHTML = `
                         ${dateBar}
-                        <div class="px-1 mb-2 text-xs text-gray-500 dark:text-gray-400">
-                            ${focusedSurvey.submitted} submitted · ${focusedSurvey.pending} pending · ${focusedSurvey.batchList.length} send batch${focusedSurvey.batchList.length === 1 ? '' : 'es'}
-                            — each batch is one Send click (sites invited together).
+                        <div class="px-1 mb-2 flex flex-wrap items-center justify-between gap-2">
+                            <div class="text-xs text-gray-500 dark:text-gray-400">
+                                ${focusedSurvey.submitted} submitted · ${focusedSurvey.pending} pending · ${focusedSurvey.batchList.length} send batch${focusedSurvey.batchList.length === 1 ? '' : 'es'}
+                                — check batches to export together (Sponsor Excel follows selection / date filter).
+                            </div>
+                            <div class="flex flex-wrap items-center gap-1.5">
+                                <button type="button" id="comms-responses-select-all-batches-btn" class="text-xs font-medium px-2 py-1 rounded border border-gray-300 dark:border-gray-600">Select all in filter</button>
+                                <button type="button" id="comms-responses-clear-batches-btn" class="text-xs font-medium px-2 py-1 rounded border border-gray-300 dark:border-gray-600">Clear</button>
+                                ${selectedCount ? `<span class="text-xs text-indigo-700 dark:text-indigo-300 font-medium">${selectedCount} selected</span>` : ''}
+                            </div>
                         </div>
                         ${focusedSurvey.batchList.length === 0 && !orphans.length
                             ? empty(`Nothing in ${sentWithinLabel(sentWindow).toLowerCase()} for this survey.`)
                             : focusedSurvey.batchList.map((b) => {
                                 const search = `${surveySendBatchLabel(b)} ${b.sentBy || ''}`.toLowerCase();
+                                const checked = selectedSet.has(b.id);
                                 return `
-                                    <div class="comms-row mb-2 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden" data-search="${escapeHtml(search)}">
+                                    <div class="comms-row mb-2 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden ${checked ? 'ring-1 ring-indigo-400' : ''}" data-search="${escapeHtml(search)}">
                                         <div class="px-3 py-2.5 flex flex-wrap items-center gap-2 bg-gray-50/80 dark:bg-gray-900/30">
+                                            <label class="inline-flex items-center shrink-0" title="Include in multi-batch export">
+                                                <input type="checkbox" class="comms-responses-batch-check h-4 w-4 rounded border-gray-300 text-indigo-600" data-batch-id="${escapeHtml(b.id)}" ${checked ? 'checked' : ''} />
+                                            </label>
                                             <div class="min-w-0 flex-1">
                                                 <div class="text-sm font-semibold text-gray-900 dark:text-gray-100 truncate">${escapeHtml(surveySendBatchLabel(b))}</div>
                                                 <div class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
@@ -7224,8 +7375,26 @@
                             </div>` : ''}
                     `;
                     if (footerEl) {
-                        footerEl.textContent = `${focusedSurvey.invites.length} invited · ${sentWithinLabel(sentWindow)} · ${focusedSurvey.surveyTitle}`;
+                        footerEl.textContent = `${focusedSurvey.invites.length} invited · ${sentWithinLabel(sentWindow)}${selectedCount ? ` · ${selectedCount} batch(es) selected` : ''} · ${focusedSurvey.surveyTitle}`;
                     }
+                    body.querySelectorAll('.comms-responses-batch-check').forEach((cb) => {
+                        cb.addEventListener('change', () => {
+                            const id = cb.getAttribute('data-batch-id') || '';
+                            const set = new Set(commsResponsesSelectedBatchIds || []);
+                            if (cb.checked) set.add(id);
+                            else set.delete(id);
+                            commsResponsesSelectedBatchIds = [...set];
+                            renderFeasibility();
+                        });
+                    });
+                    document.getElementById('comms-responses-select-all-batches-btn')?.addEventListener('click', () => {
+                        commsResponsesSelectedBatchIds = focusedSurvey.batchList.map((b) => b.id);
+                        renderFeasibility();
+                    });
+                    document.getElementById('comms-responses-clear-batches-btn')?.addEventListener('click', () => {
+                        commsResponsesSelectedBatchIds = [];
+                        renderFeasibility();
+                    });
                 } else {
                     if (titleEl) titleEl.textContent = surveySendBatchLabel(focusedBatch);
                     const counts = {
@@ -7282,6 +7451,10 @@
                         if (commsResponsesBatchId && !keys.has(commsResponsesBatchId)) {
                             commsResponsesBatchId = null;
                         }
+                        // Drop multi-select picks that fall outside the new date window
+                        if (Array.isArray(commsResponsesSelectedBatchIds) && commsResponsesSelectedBatchIds.length) {
+                            commsResponsesSelectedBatchIds = commsResponsesSelectedBatchIds.filter((id) => keys.has(id));
+                        }
                         renderFeasibility();
                     });
                 });
@@ -7295,6 +7468,7 @@
                     btn.addEventListener('click', () => {
                         commsResponsesSurveyId = btn.getAttribute('data-survey-id') || null;
                         commsResponsesBatchId = null;
+                        commsResponsesSelectedBatchIds = [];
                         commsResponsesFilter = 'all';
                         renderFeasibility();
                     });
@@ -7317,6 +7491,7 @@
                         } else {
                             commsResponsesSurveyId = null;
                             commsResponsesBatchId = null;
+                            commsResponsesSelectedBatchIds = [];
                             commsResponsesFilter = 'all';
                         }
                         renderFeasibility();
@@ -17138,44 +17313,50 @@
             if (e.target.id === 'feasibility-export-wide-btn') {
                 const surveySel = document.getElementById('feasibility-survey-select');
                 const roleSel = document.getElementById('feasibility-role-select');
-                exportFeasibilitySurveyCsv({
+                const scope = resolveFeasibilityExportScope({
                     surveyId: surveySel?.value || feasibilityReportSurveyId || 'survey-general-feasibility',
-                    mode: 'wide',
-                    targetRole: roleSel?.value || feasibilityReportRole
+                    targetRole: roleSel?.value || feasibilityReportRole,
                 });
+                exportFeasibilitySurveyCsv({ ...scope, mode: 'wide' });
             }
             if (e.target.id === 'feasibility-export-long-btn') {
                 const surveySel = document.getElementById('feasibility-survey-select');
                 const roleSel = document.getElementById('feasibility-role-select');
-                exportFeasibilitySurveyCsv({
+                const scope = resolveFeasibilityExportScope({
                     surveyId: surveySel?.value || feasibilityReportSurveyId || 'survey-general-feasibility',
-                    mode: 'long',
-                    targetRole: roleSel?.value || feasibilityReportRole || 'all'
+                    targetRole: roleSel?.value || feasibilityReportRole || 'all',
                 });
+                exportFeasibilitySurveyCsv({ ...scope, mode: 'long' });
             }
             if (e.target.id === 'feasibility-sponsor-excel-btn' || e.target.id === 'comms-sponsor-excel-btn') {
                 const surveySel = document.getElementById('feasibility-survey-select');
                 const roleSel = document.getElementById('feasibility-role-select');
-                const surveyId = surveySel?.value
-                    || feasibilityReportSurveyId
-                    || (allSiteSurveyDefinitions || []).find(d => d.id === 'survey-general-feasibility')?.id
-                    || (allSiteSurveyDefinitions || [])[0]?.id;
-                exportSponsorPackExcel({
-                    surveyId,
-                    targetRole: roleSel?.value || feasibilityReportRole || 'all'
+                const scope = resolveFeasibilityExportScope({
+                    surveyId: (activeTab === 'feasibility' && commsPanel === 'responses' && commsResponsesSurveyId)
+                        ? commsResponsesSurveyId
+                        : (surveySel?.value || feasibilityReportSurveyId || null),
+                    targetRole: roleSel?.value || feasibilityReportRole || 'all',
                 });
+                if (!scope.surveyId) {
+                    showNotification('Open a survey (or pick one in Reporting) first.', 'info');
+                    return;
+                }
+                exportSponsorPackExcel(scope);
             }
             if (e.target.id === 'feasibility-sponsor-pdf-btn' || e.target.id === 'comms-sponsor-pdf-btn') {
                 const surveySel = document.getElementById('feasibility-survey-select');
                 const roleSel = document.getElementById('feasibility-role-select');
-                const surveyId = surveySel?.value
-                    || feasibilityReportSurveyId
-                    || (allSiteSurveyDefinitions || []).find(d => d.id === 'survey-general-feasibility')?.id
-                    || (allSiteSurveyDefinitions || [])[0]?.id;
-                exportSponsorPackPdf({
-                    surveyId,
-                    targetRole: roleSel?.value || feasibilityReportRole || 'all'
+                const scope = resolveFeasibilityExportScope({
+                    surveyId: (activeTab === 'feasibility' && commsPanel === 'responses' && commsResponsesSurveyId)
+                        ? commsResponsesSurveyId
+                        : (surveySel?.value || feasibilityReportSurveyId || null),
+                    targetRole: roleSel?.value || feasibilityReportRole || 'all',
                 });
+                if (!scope.surveyId) {
+                    showNotification('Open a survey (or pick one in Reporting) first.', 'info');
+                    return;
+                }
+                exportSponsorPackPdf(scope);
             }
             if (e.target.id === 'feasibility-ops-html-btn' || e.target.id === 'feasibility-ops-html-btn-toolbar') {
                 const surveySel = document.getElementById('feasibility-survey-select');
