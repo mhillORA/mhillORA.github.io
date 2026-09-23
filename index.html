@@ -1198,6 +1198,21 @@
                 });
             }
 
+            /** Delete one or more send cohorts (invites + archive linked responses). */
+            async deleteSurveyBatches({ batchIds, assignmentIds, hardDeleteResponses = false } = {}) {
+                return this.request('/site-survey-batch-delete', {
+                    method: 'POST',
+                    headers: this.privacyHeaders(),
+                    body: JSON.stringify({
+                        confirm: true,
+                        batchIds: Array.isArray(batchIds) ? batchIds : [],
+                        assignmentIds: Array.isArray(assignmentIds) ? assignmentIds : [],
+                        hardDeleteResponses: !!hardDeleteResponses,
+                        archiveResponses: true,
+                    })
+                });
+            }
+
             async resendSiteSurvey(assignmentId, payload = {}) {
                 return this.request(`/site-survey-assignments/${encodeURIComponent(assignmentId)}/resend`, {
                     method: 'POST',
@@ -6900,6 +6915,85 @@
             renderFeasibility();
         };
 
+        const deleteSurveyBatchesUi = async (batches) => {
+            const list = (Array.isArray(batches) ? batches : [batches]).filter((b) => b?.id);
+            if (!list.length) return;
+            const inviteN = list.reduce((n, b) => n + (b.items?.length || 0), 0);
+            const submittedN = list.reduce((n, b) => n + (b.submitted || 0), 0);
+            const names = list.slice(0, 5).map((b) => surveySendBatchLabel(b)).join('\n• ');
+            const more = list.length > 5 ? `\n…and ${list.length - 5} more` : '';
+            const ok = window.confirm(
+                `Delete ${list.length} send batch${list.length === 1 ? '' : 'es'}?\n\n`
+                + `• ${names}${more}\n\n`
+                + `${inviteN} invite link${inviteN === 1 ? '' : 's'} will be removed`
+                + (submittedN ? ` (${submittedN} already submitted — those responses will be archived/hidden)` : '')
+                + '.\n\nThis cannot be undone. Use for test cleanup.'
+            );
+            if (!ok) return;
+
+            const realBatchIds = list
+                .map((b) => String(b.id))
+                .filter((id) => id && !id.startsWith('legacy:'));
+            const assignmentIds = list.flatMap((b) =>
+                (b.items || []).map((x) => x?.a?.id).filter(Boolean)
+            );
+
+            showNotification('Deleting send batch(es)…', 'info');
+            try {
+                let result;
+                if (apiService?.deleteSurveyBatches) {
+                    result = await apiService.deleteSurveyBatches({
+                        batchIds: realBatchIds,
+                        assignmentIds,
+                    });
+                } else {
+                    // Fallback if API deploy lags: delete invites one-by-one
+                    let deleted = 0;
+                    for (const id of assignmentIds) {
+                        try {
+                            await apiService.deleteSiteSurveyAssignment(id);
+                            deleted += 1;
+                        } catch (_) { /* continue */ }
+                    }
+                    result = { deletedAssignments: deleted, deletedAssignmentIds: assignmentIds, responsesArchived: 0 };
+                }
+                const deletedIds = new Set(result?.deletedAssignmentIds || assignmentIds);
+                allSiteSurveyAssignments = (allSiteSurveyAssignments || []).filter(
+                    (a) => a && !deletedIds.has(a.id)
+                );
+                const now = new Date().toISOString();
+                (allSiteSurveyResponses || []).forEach((r) => {
+                    if (r && deletedIds.has(r.assignmentId)) {
+                        r._archived = true;
+                        r._archivedAt = now;
+                        r._archivedReason = 'batch_delete';
+                    }
+                });
+                list.forEach((b) => {
+                    const pins = loadSurveyBatchPins();
+                    if (pins[b.id]) {
+                        delete pins[b.id];
+                        saveSurveyBatchPins();
+                    }
+                });
+                if (commsResponsesBatchId && list.some((b) => b.id === commsResponsesBatchId)) {
+                    commsResponsesBatchId = null;
+                }
+                commsResponsesSelectedBatchIds = (commsResponsesSelectedBatchIds || [])
+                    .filter((id) => !list.some((b) => b.id === id));
+                const n = result?.deletedAssignments ?? deletedIds.size;
+                showNotification(
+                    `Deleted ${n} invite${n === 1 ? '' : 's'}`
+                    + (result?.responsesArchived ? ` · archived ${result.responsesArchived} response(s)` : ''),
+                    'success'
+                );
+                renderFeasibility();
+            } catch (err) {
+                console.error(err);
+                showNotification(err.message || 'Failed to delete batch(es).', 'error');
+            }
+        };
+
         const renderFeasibility = () => {
             const body = document.getElementById('comms-panel-body');
             const titleEl = document.getElementById('comms-panel-title');
@@ -7523,6 +7617,7 @@
                             <div class="flex flex-wrap items-center gap-1.5">
                                 <button type="button" id="comms-responses-select-all-batches-btn" class="text-xs font-medium px-2 py-1 rounded border border-gray-300 dark:border-gray-600">Select all in filter</button>
                                 <button type="button" id="comms-responses-clear-batches-btn" class="text-xs font-medium px-2 py-1 rounded border border-gray-300 dark:border-gray-600">Clear</button>
+                                ${selectedCount ? `<button type="button" id="comms-responses-delete-selected-batches-btn" class="text-xs font-medium px-2 py-1 rounded border border-red-300 text-red-700 dark:border-red-700 dark:text-red-300">Delete selected (${selectedCount})</button>` : ''}
                                 ${selectedCount ? `<span class="text-xs text-indigo-700 dark:text-indigo-300 font-medium">${selectedCount} selected</span>` : ''}
                             </div>
                         </div>
@@ -7549,6 +7644,7 @@
                                                 </div>
                                             </div>
                                             <button type="button" class="comms-responses-rename-batch-btn px-2 py-1 rounded text-xs border border-gray-300 dark:border-gray-600 shrink-0" data-batch-id="${escapeHtml(b.id)}">Rename</button>
+                                            <button type="button" class="comms-responses-delete-batch-btn px-2 py-1 rounded text-xs border border-red-300 text-red-700 dark:border-red-700 dark:text-red-300 shrink-0" data-batch-id="${escapeHtml(b.id)}">Delete</button>
                                             <button type="button" class="comms-responses-open-batch-btn px-2 py-1 rounded text-xs bg-indigo-600 text-white shrink-0" data-batch-id="${escapeHtml(b.id)}">Open</button>
                                         </div>
                                     </div>`;
@@ -7595,6 +7691,10 @@
                         commsResponsesSelectedBatchIds = [];
                         renderFeasibility();
                     });
+                    document.getElementById('comms-responses-delete-selected-batches-btn')?.addEventListener('click', () => {
+                        const selected = focusedSurvey.batchList.filter((b) => selectedSet.has(b.id));
+                        deleteSurveyBatchesUi(selected);
+                    });
                     body.querySelectorAll('.comms-responses-star-batch-btn').forEach((btn) => {
                         btn.addEventListener('click', () => {
                             const id = btn.getAttribute('data-batch-id') || '';
@@ -7609,15 +7709,23 @@
                             if (batch) renameSurveyBatch(batch);
                         });
                     });
+                    body.querySelectorAll('.comms-responses-delete-batch-btn').forEach((btn) => {
+                        btn.addEventListener('click', () => {
+                            const id = btn.getAttribute('data-batch-id') || '';
+                            const batch = focusedSurvey.batchList.find((x) => x.id === id);
+                            if (batch) deleteSurveyBatchesUi([batch]);
+                        });
+                    });
                 } else {
                     if (titleEl) titleEl.textContent = surveySendBatchLabel(focusedBatch);
                     const batchMeta = resolveSurveyBatchMeta(focusedBatch);
-                    // Star / rename while drilled into a batch
+                    // Star / rename / delete while drilled into a batch
                     if (actionsEl) {
                         const existing = actionsEl.innerHTML;
                         actionsEl.innerHTML = `
                             <button type="button" id="comms-responses-star-open-batch-btn" class="text-xs font-medium px-2 py-1 rounded border ${batchMeta.starred ? 'border-amber-400 text-amber-700 dark:text-amber-300' : 'border-gray-300 dark:border-gray-600'}">${batchMeta.starred ? '★ Starred' : '☆ Star'}</button>
                             <button type="button" id="comms-responses-rename-open-batch-btn" class="text-xs font-medium px-2 py-1 rounded border border-gray-300 dark:border-gray-600">Rename</button>
+                            <button type="button" id="comms-responses-delete-open-batch-btn" class="text-xs font-medium px-2 py-1 rounded border border-red-300 text-red-700 dark:border-red-700 dark:text-red-300">Delete batch</button>
                             ${existing}`;
                     }
                     const counts = {
@@ -7709,6 +7817,9 @@
                 });
                 document.getElementById('comms-responses-rename-open-batch-btn')?.addEventListener('click', () => {
                     if (focusedBatch) renameSurveyBatch(focusedBatch);
+                });
+                document.getElementById('comms-responses-delete-open-batch-btn')?.addEventListener('click', () => {
+                    if (focusedBatch) deleteSurveyBatchesUi([focusedBatch]);
                 });
 
                 const backBtn = document.getElementById('comms-responses-back-btn');

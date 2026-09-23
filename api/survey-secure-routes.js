@@ -1759,6 +1759,143 @@ function registerSurveySecureRoutes(app, deps) {
         },
     });
 
+    // ---------- Ops: delete one or more send batches (test / cleanup) ----------
+    app.http('siteSurveyBatchDelete', {
+        methods: ['POST', 'OPTIONS'],
+        authLevel: 'anonymous',
+        route: 'site-survey-batch-delete',
+        handler: async (request, context) => {
+            if (request.method === 'OPTIONS') {
+                return { status: 204, headers: corsHeaders() };
+            }
+            try {
+                const body = await request.json();
+                if (body?.confirm !== true && body?.confirm !== 'true') {
+                    return {
+                        status: 400,
+                        jsonBody: { error: 'Set confirm: true to delete send batch(es)' },
+                        headers: corsHeaders(),
+                    };
+                }
+                const batchIds = [
+                    ...(Array.isArray(body?.batchIds) ? body.batchIds : []),
+                    ...(body?.batchId ? [body.batchId] : []),
+                ].map((x) => String(x || '').trim()).filter(Boolean);
+                const assignmentIds = (Array.isArray(body?.assignmentIds) ? body.assignmentIds : [])
+                    .map((x) => String(x || '').trim())
+                    .filter(Boolean);
+                // Default: archive linked responses (hide from UI). Hard-delete when asked.
+                const hardDeleteResponses = body?.hardDeleteResponses === true
+                    || body?.deleteResponses === 'hard';
+                const archiveResponses = body?.archiveResponses !== false;
+
+                if (!batchIds.length && !assignmentIds.length) {
+                    return {
+                        status: 400,
+                        jsonBody: { error: 'Provide batchId(s) and/or assignmentIds' },
+                        headers: corsHeaders(),
+                    };
+                }
+
+                const asgC = getContainer(ASSIGNMENTS);
+                const rspC = getContainer('site-survey-responses');
+                const found = new Map();
+
+                for (const batchId of batchIds) {
+                    if (batchId.startsWith('legacy:')) continue;
+                    const { resources } = await asgC.items
+                        .query({
+                            query: 'SELECT * FROM c WHERE c.batchId = @batchId',
+                            parameters: [{ name: '@batchId', value: batchId }],
+                        })
+                        .fetchAll();
+                    (resources || []).forEach((row) => {
+                        if (row?.id) found.set(row.id, row);
+                    });
+                }
+
+                for (const id of assignmentIds) {
+                    if (found.has(id)) continue;
+                    try {
+                        const read = await asgC.item(id, id).read();
+                        if (read.resource) found.set(id, read.resource);
+                    } catch (_) { /* missing ok */ }
+                }
+
+                const rows = [...found.values()];
+                if (!rows.length) {
+                    return {
+                        status: 404,
+                        jsonBody: { error: 'No invites found for those batch(es)' },
+                        headers: corsHeaders(),
+                    };
+                }
+
+                const now = new Date().toISOString();
+                const deletedAssignmentIds = [];
+                for (const row of rows) {
+                    try {
+                        await asgC.item(row.id, row.id).delete();
+                        deletedAssignmentIds.push(row.id);
+                    } catch (err) {
+                        context.log?.(`batch-delete assignment ${row.id}: ${err.message || err}`);
+                    }
+                }
+
+                let responsesArchived = 0;
+                let responsesDeleted = 0;
+                if (archiveResponses || hardDeleteResponses) {
+                    const idList = deletedAssignmentIds;
+                    // Chunk IN queries (Cosmos parameter limits)
+                    for (let i = 0; i < idList.length; i += 40) {
+                        const chunk = idList.slice(i, i + 40);
+                        const params = chunk.map((id, idx) => ({ name: `@a${idx}`, value: id }));
+                        const inList = chunk.map((_, idx) => `@a${idx}`).join(', ');
+                        const { resources: rsps } = await rspC.items
+                            .query({
+                                query: `SELECT * FROM c WHERE c.assignmentId IN (${inList})`,
+                                parameters: params,
+                            })
+                            .fetchAll();
+                        for (const r of rsps || []) {
+                            if (!r?.id) continue;
+                            try {
+                                if (hardDeleteResponses) {
+                                    await rspC.item(r.id, r.id).delete();
+                                    responsesDeleted += 1;
+                                } else {
+                                    r._archived = true;
+                                    r._archivedAt = now;
+                                    r._archivedReason = 'batch_delete';
+                                    r.updatedAt = now;
+                                    await rspC.items.upsert(r);
+                                    responsesArchived += 1;
+                                }
+                            } catch (err) {
+                                context.log?.(`batch-delete response ${r.id}: ${err.message || err}`);
+                            }
+                        }
+                    }
+                }
+
+                return {
+                    status: 200,
+                    jsonBody: {
+                        ok: true,
+                        deletedAssignments: deletedAssignmentIds.length,
+                        deletedAssignmentIds,
+                        responsesArchived,
+                        responsesDeleted,
+                        batchIds: batchIds.filter((id) => !id.startsWith('legacy:')),
+                    },
+                    headers: corsHeaders(),
+                };
+            } catch (error) {
+                return handleError(context, error, 'site-survey-batch-delete');
+            }
+        },
+    });
+
     // ---------- Ops: rotate / resend token for one assignment ----------
     const resendOneAssignment = async ({
         assignment,
