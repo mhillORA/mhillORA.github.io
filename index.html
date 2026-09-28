@@ -5844,9 +5844,13 @@
                 if (!normalizedDate) return false;
 
                 // Rebuild when events change (in-place mutations used to leave ghosts as "already scheduled").
+                // Use collapsed (display) winners only — hidden duplicate losers must not block scheduling.
                 if (!_siteAssignByDateCache.map || _siteAssignByDateCache.gen !== _siteAssignCacheGen) {
                     const map = new Map();
-                    (state.crc_events || []).forEach((event) => {
+                    const sourceEvents = (typeof collapseDuplicateSiteAssignments === 'function')
+                        ? collapseDuplicateSiteAssignments(state.crc_events || [])
+                        : (state.crc_events || []);
+                    sourceEvents.forEach((event) => {
                         if (!event || event.type !== 'Site Assignment') return;
                         if (typeof isCancelledShift === 'function' && isCancelledShift(event)) return;
                         const eventDate = toDateOnlyString(parseDateFlexible(event.date || event.startDate))
@@ -5866,6 +5870,33 @@
                     if (siteAssignmentListsCrc(event, target)) return true;
                 }
                 return false;
+            };
+
+            /** Describe visible conflicting Site Assignments for override copy (site + date). */
+            const describeCrcScheduleConflicts = (crcId, dateStr, excludeEventId = null, excludeGroupId = null) => {
+                const target = normalizeCrcId(crcId);
+                if (!target || !dateStr) return [];
+                const sourceEvents = (typeof collapseDuplicateSiteAssignments === 'function')
+                    ? collapseDuplicateSiteAssignments(state.crc_events || [])
+                    : (state.crc_events || []);
+                return sourceEvents.filter((event) => {
+                    if (!event || event.type !== 'Site Assignment') return false;
+                    if (typeof isCancelledShift === 'function' && isCancelledShift(event)) return false;
+                    if (excludeEventId && event.id === excludeEventId) return false;
+                    if (excludeGroupId && event.groupId && event.groupId === excludeGroupId) return false;
+                    const eventDate = toDateOnlyString(parseDateFlexible(event.date || event.startDate))
+                        || String(event.date || event.startDate || '').slice(0, 10);
+                    if (eventDate !== dateStr) return false;
+                    return siteAssignmentListsCrc(event, target);
+                }).map((event) => {
+                    const site = (state.crc_sites || []).find((s) => s.id === event.siteId);
+                    return {
+                        eventId: event.id,
+                        date: dateStr,
+                        siteName: site?.name || event.siteId || 'Unknown site',
+                        visitNumber: event.visitNumber || null
+                    };
+                });
             };
 
             /** PTO / approved time off — informational for calendar; does not block shift assignment. */
@@ -6345,6 +6376,13 @@
                 const add = (id) => {
                     if (id && id !== 'SITE_STAFF' && id !== 'UNASSIGNED') ids.add(id);
                 };
+                // When roleAssignments exists, it is source of truth (ignore stale crcId).
+                if (event?.type === 'Site Assignment' && event.roleAssignments != null && typeof event.roleAssignments === 'object') {
+                    Object.values(event.roleAssignments).forEach((assignments) => {
+                        if (Array.isArray(assignments)) assignments.forEach(add);
+                    });
+                    return ids.size;
+                }
                 add(event?.crcId);
                 if (Array.isArray(event?.crcIds)) event.crcIds.forEach(add);
                 if (event?.roleAssignments && typeof event.roleAssignments === 'object') {
@@ -6358,13 +6396,29 @@
             const pickRicherSiteAssignment = (a, b) => {
                 if (!a) return b;
                 if (!b) return a;
+                // Staffed shifts always beat empty open-shift shells (more role KEYS used to hide real CRCs).
+                const ca = countAssignedCrcsOnEvent(a);
+                const cb = countAssignedCrcsOnEvent(b);
+                if (ca !== cb) return ca > cb ? a : b;
+                const filledSlots = (e) => {
+                    if (!e?.roleAssignments || typeof e.roleAssignments !== 'object') return 0;
+                    let n = 0;
+                    Object.values(e.roleAssignments).forEach((assignments) => {
+                        if (!Array.isArray(assignments)) return;
+                        assignments.forEach((entry) => {
+                            const id = normalizeCrcId(entry);
+                            if (id && id !== 'SITE_STAFF' && id !== 'UNASSIGNED') n += 1;
+                        });
+                    });
+                    return n;
+                };
+                const fa = filledSlots(a);
+                const fb = filledSlots(b);
+                if (fa !== fb) return fa > fb ? a : b;
                 const roleCount = (e) => (e.roleAssignments && typeof e.roleAssignments === 'object') ? Object.keys(e.roleAssignments).length : 0;
                 const ra = roleCount(a);
                 const rb = roleCount(b);
                 if (ra !== rb) return ra > rb ? a : b;
-                const ca = countAssignedCrcsOnEvent(a);
-                const cb = countAssignedCrcsOnEvent(b);
-                if (ca !== cb) return ca > cb ? a : b;
                 const ta = Date.parse(a.updatedAt || a.createdAt || 0) || Number(a._ts) || 0;
                 const tb = Date.parse(b.updatedAt || b.createdAt || 0) || Number(b._ts) || 0;
                 if (ta !== tb) return ta >= tb ? a : b;
@@ -38143,8 +38197,11 @@
 
                         // Detect existing assignments for the same CRC on the selected date range
                         // Exclude SITE_STAFF from duplicate day checks (can be used unlimited times)
-                        // For Travel Day events, allow same-day scheduling with shifts (don't count as conflict)
+                        // Travel Day on the same day does NOT block Site Assignment (and vice versa for travel-only).
                         const duplicateDayMap = new Map();
+                        const displayEventsForConflict = (typeof collapseDuplicateSiteAssignments === 'function')
+                            ? collapseDuplicateSiteAssignments(state.crc_events || [])
+                            : (state.crc_events || []);
                         if (startDateObj && endDateObj) {
                             const cursor = new Date(startDateObj);
                             while (cursor <= endDateObj) {
@@ -38152,7 +38209,7 @@
                                 allCrcIds.forEach(crcId => {
                                     // Skip SITE_STAFF and UNASSIGNED - can be used unlimited times
                                     if (!crcId || crcId === 'SITE_STAFF' || crcId === 'UNASSIGNED') return;
-                                    const existingEvents = state.crc_events.filter(event => {
+                                    const existingEvents = displayEventsForConflict.filter(event => {
                                         if (!event) return false;
                                         if (event.date !== dateStr && String(event.date || '').slice(0, 10) !== dateStr) {
                                             const ed = toDateOnlyString(parseDateFlexible(event.date || event.startDate));
@@ -38163,8 +38220,11 @@
                                             ? (typeof siteAssignmentListsCrc === 'function' && siteAssignmentListsCrc(event, crcId))
                                             : (event.crcId === crcId || (Array.isArray(event.crcIds) && event.crcIds.includes(crcId)));
                                         if (!onShift) return false;
-                                        // For Travel Day events, only check conflicts with Site Assignment and Open Shift (allow same day as shifts)
+                                        // Site Assignment conflicts only with other Site Assignments / Open Shifts —
+                                        // Travel Day must not raise "shifts exist" when the grid shows travel only.
                                         if (eventType === 'Travel Day') {
+                                            if (!['Site Assignment', 'Open Shift'].includes(event.type)) return false;
+                                        } else if (eventType === 'Site Assignment' || eventType === 'Open Shift') {
                                             if (!['Site Assignment', 'Open Shift'].includes(event.type)) return false;
                                         } else {
                                             if (!['Site Assignment', 'Travel Day', 'Open Shift'].includes(event.type)) return false;
@@ -38207,13 +38267,22 @@
                                 const isSchedulingConflict = isCRCScheduledOnDate(crcId, dayStr, period, excludeEventId, existingGroupId);
                                 if (isSchedulingConflict) {
                                     const p = getUnavailabilityPeriod(crcId, dayStr);
+                                    const details = (typeof describeCrcScheduleConflicts === 'function')
+                                        ? describeCrcScheduleConflicts(crcId, dayStr, excludeEventId, existingGroupId)
+                                        : [];
                                     if (!schedulingConflicts.some((c) => c.crcId === crcId && c.date === dayStr)) {
-                                        schedulingConflicts.push({ crcId, period: p || 'Full Day', date: dayStr });
+                                        schedulingConflicts.push({
+                                            crcId,
+                                            period: p || 'Full Day',
+                                            date: dayStr,
+                                            siteName: details[0]?.siteName || null,
+                                            details
+                                        });
                                     }
                                 }
                                 // Check if this CRC is already scheduled for a different site/study on this date
                                 if (crcId !== 'SITE_STAFF' && selectedSiteId && selectedStudyIds.length > 0) {
-                                    const conflictingEvents = state.crc_events.filter(event => {
+                                    const conflictingEvents = displayEventsForConflict.filter(event => {
                                         if (excludeEventId && event.id === excludeEventId) return false;
                                         if (excludeGroupEventIds.includes(event.id)) return false;
                                         if (event.type !== 'Site Assignment') return false;
@@ -41365,7 +41434,8 @@
                             if (filteredSchedulingConflicts.length) {
                                 lines.push('Scheduling conflicts: ' + filteredSchedulingConflicts.map(c => {
                                     const crcName = state.crcs.find(x => x.id === c.crcId)?.name || c.crcId;
-                                    return `${crcName}${c.date ? ' on ' + c.date : ''} (${c.period || 'Full Day'})`;
+                                    const where = c.siteName || c.details?.[0]?.siteName;
+                                    return `${crcName}${c.date ? ' on ' + c.date : ''}${where ? ' @ ' + where : ''} (${c.period || 'Full Day'})`;
                                 }).join(', '));
                             }
                             if (filteredSiteStudyConflicts.length) {
@@ -41383,7 +41453,11 @@
                             if (filteredDuplicateDayAssignments.length) {
                                 lines.push('Existing assignments: ' + filteredDuplicateDayAssignments.map(c => {
                                     const crcName = state.crcs.find(x => x.id === c.crcId)?.name || c.crcId;
-                                    return `${crcName} on ${c.date}`;
+                                    const siteHint = (c.events || []).map((ev) => {
+                                        const site = (state.crc_sites || []).find((s) => s.id === ev.siteId);
+                                        return site?.name || ev.siteId || ev.type;
+                                    }).filter(Boolean).slice(0, 2).join('/');
+                                    return `${crcName} on ${c.date}${siteHint ? ' (' + siteHint + ')' : ''}`;
                                 }).join(', '));
                             }
                             const proceed = window.confirm(
