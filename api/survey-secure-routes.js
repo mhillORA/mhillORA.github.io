@@ -138,7 +138,12 @@ function rateLimit(key, limit, windowMs) {
 function roleLabel(role) {
     const r = normalizeRole(role);
     if (r === 'pi') return 'PI';
+    if (r === 'pi2' || r === 'investigator2') return 'Investigator 2';
+    if (r === 'pi3' || r === 'investigator3') return 'Investigator 3';
     if (r === 'coordinator') return 'Primary contact';
+    if (r === 'coordinator2' || r === 'sc2') return 'Coordinator 2';
+    if (r === 'coordinator3' || r === 'sc3') return 'Coordinator 3';
+    if (r === 'contact' || r === 'site_contact' || r === 'sitecontact') return 'Site contact';
     if (r === 'site') return 'Site';
     return role || 'Staff';
 }
@@ -147,7 +152,12 @@ function roleLabel(role) {
 function roleSubjectLabel(role) {
     const r = normalizeRole(role);
     if (r === 'pi') return 'PI';
+    if (r === 'pi2' || r === 'investigator2') return 'PI2';
+    if (r === 'pi3' || r === 'investigator3') return 'PI3';
     if (r === 'coordinator') return 'SC';
+    if (r === 'coordinator2' || r === 'sc2') return 'SC2';
+    if (r === 'coordinator3' || r === 'sc3') return 'SC3';
+    if (r === 'contact' || r === 'site_contact' || r === 'sitecontact') return 'Contact';
     if (r === 'site') return 'Site';
     return roleLabel(role);
 }
@@ -626,8 +636,24 @@ async function resolveRecipientEmail(getContainer, siteId, targetRole) {
         const site = siteRead.resource;
         if (site) {
             if (role === 'pi' && site.piEmail) return String(site.piEmail).trim();
+            if ((role === 'pi2' || role === 'investigator2') && site.pi2Email) {
+                return String(site.pi2Email).trim();
+            }
+            if ((role === 'pi3' || role === 'investigator3') && site.pi3Email) {
+                return String(site.pi3Email).trim();
+            }
             if (role === 'coordinator' && site.siteCoordinatorEmail) {
                 return String(site.siteCoordinatorEmail).trim();
+            }
+            if ((role === 'coordinator2' || role === 'sc2') && site.siteCoordinator2Email) {
+                return String(site.siteCoordinator2Email).trim();
+            }
+            if ((role === 'coordinator3' || role === 'sc3') && site.siteCoordinator3Email) {
+                return String(site.siteCoordinator3Email).trim();
+            }
+            if ((role === 'contact' || role === 'site_contact' || role === 'sitecontact')
+                && site.siteContactEmail) {
+                return String(site.siteContactEmail).trim();
             }
         }
     } catch (_) {}
@@ -637,8 +663,17 @@ async function resolveRecipientEmail(getContainer, siteId, targetRole) {
         const leg = legRead.resource;
         if (leg) {
             if (role === 'pi' && leg.piEmail) return String(leg.piEmail).trim();
+            if ((role === 'pi2' || role === 'investigator2') && leg.pi2Email) {
+                return String(leg.pi2Email).trim();
+            }
+            if ((role === 'pi3' || role === 'investigator3') && leg.pi3Email) {
+                return String(leg.pi3Email).trim();
+            }
             const coordEmail = leg.siteCoordinatorEmail || leg.coordinatorEmail;
             if (role === 'coordinator' && coordEmail) return String(coordEmail).trim();
+            if ((role === 'contact' || role === 'site_contact') && (leg.siteContactEmail || leg.contactEmail)) {
+                return String(leg.siteContactEmail || leg.contactEmail).trim();
+            }
         }
     } catch (_) {}
 
@@ -650,14 +685,16 @@ async function resolveRecipientEmail(getContainer, siteId, targetRole) {
                         'SELECT * FROM c WHERE c.siteId = @siteId AND LOWER(c.role) = @role',
                     parameters: [
                         { name: '@siteId', value: String(siteId) },
-                        { name: '@role', value: role === 'pi' ? 'pi' : 'coordinator' },
+                        { name: '@role', value: role === 'pi' || role === 'pi2' || role === 'pi3' ? 'pi' : 'coordinator' },
                     ],
                 },
                 { enableCrossPartitionQuery: true }
             )
             .fetchAll();
         const withEmail = (resources || []).find((s) => s && s.email);
-        if (withEmail?.email) return String(withEmail.email).trim();
+        if (withEmail?.email && (role === 'pi' || role === 'coordinator')) {
+            return String(withEmail.email).trim();
+        }
         // Staff roles may be stored as Investigator / Coordinator labels
         const { resources: all } = await getContainer(SITE_STAFF)
             .items.query(
@@ -671,7 +708,12 @@ async function resolveRecipientEmail(getContainer, siteId, targetRole) {
         const match = (all || []).find((s) => {
             const r = String(s.role || s.title || '').toLowerCase();
             if (!s.email) return false;
-            if (role === 'pi') return /pi|investigator|investigator 1/.test(r);
+            if (role === 'pi' || role === 'pi2' || role === 'pi3') {
+                return /pi|investigator/.test(r);
+            }
+            if (role === 'contact' || role === 'site_contact') {
+                return /contact|feasib|admin|research/.test(r);
+            }
             return /coord/.test(r);
         });
         if (match?.email) return String(match.email).trim();
@@ -1500,7 +1542,13 @@ function registerSurveySecureRoutes(app, deps) {
                     const siteName = await resolveSiteName(getContainer, boundSiteId);
 
                     const recipients = [];
-                    for (const role of targetRoles) {
+                    const siteRolesRaw = body?.siteTargetRoles && typeof body.siteTargetRoles === 'object'
+                        ? body.siteTargetRoles[boundSiteId]
+                        : null;
+                    const rolesForSite = Array.isArray(siteRolesRaw) && siteRolesRaw.length
+                        ? [...new Set(siteRolesRaw.map(normalizeRole).filter(Boolean))]
+                        : targetRoles;
+                    for (const role of rolesForSite) {
                         const email =
                             (body?.emailOverrides && body.emailOverrides[`${boundSiteId}:${role}`]) ||
                             (await resolveRecipientEmail(getContainer, boundSiteId, role));
@@ -1526,7 +1574,7 @@ function registerSurveySecureRoutes(app, deps) {
                         siteId: boundSiteId,
                         // Shared site invite — people at this site share one link.
                         targetRole: 'site',
-                        notifyRoles: targetRoles.slice(),
+                        notifyRoles: rolesForSite.slice(),
                         recipients,
                         targetEmail: uniqueEmails.length ? uniqueEmails.join(', ') : undefined,
                         status: 'sent',
@@ -1759,6 +1807,161 @@ function registerSurveySecureRoutes(app, deps) {
         },
     });
 
+    // ---------- Ops: combine send batches (fold absorb into primary) ----------
+    app.http('siteSurveyBatchCombine', {
+        methods: ['POST', 'OPTIONS'],
+        authLevel: 'anonymous',
+        route: 'site-survey-batch-combine',
+        handler: async (request, context) => {
+            if (request.method === 'OPTIONS') {
+                return { status: 204, headers: corsHeaders() };
+            }
+            try {
+                const body = await request.json().catch(() => ({}));
+                const primaryBatchId = String(body?.primaryBatchId || body?.targetBatchId || '').trim();
+                const absorbBatchIds = [
+                    ...(Array.isArray(body?.absorbBatchIds) ? body.absorbBatchIds : []),
+                    ...(body?.absorbBatchId ? [body.absorbBatchId] : []),
+                ].map((x) => String(x || '').trim()).filter(Boolean);
+                const absorbAssignmentIds = (Array.isArray(body?.absorbAssignmentIds) ? body.absorbAssignmentIds : [])
+                    .map((x) => String(x || '').trim())
+                    .filter(Boolean);
+
+                if (!primaryBatchId || primaryBatchId.startsWith('legacy:')) {
+                    return {
+                        status: 400,
+                        jsonBody: { error: 'primaryBatchId must be a real send batch id (not legacy:…)' },
+                        headers: corsHeaders(),
+                    };
+                }
+                if (!absorbBatchIds.length && !absorbAssignmentIds.length) {
+                    return {
+                        status: 400,
+                        jsonBody: { error: 'Provide absorbBatchId(s) and/or absorbAssignmentIds' },
+                        headers: corsHeaders(),
+                    };
+                }
+
+                const asgC = getContainer(ASSIGNMENTS);
+                const found = new Map();
+
+                // Primary cohort rows (so we can keep earliest batchSentAt / label)
+                {
+                    const { resources } = await asgC.items
+                        .query({
+                            query: 'SELECT * FROM c WHERE c.batchId = @batchId',
+                            parameters: [{ name: '@batchId', value: primaryBatchId }],
+                        })
+                        .fetchAll();
+                    (resources || []).forEach((row) => {
+                        if (row?.id) found.set(row.id, { row, isPrimary: true });
+                    });
+                }
+
+                for (const batchId of absorbBatchIds) {
+                    if (!batchId || batchId === primaryBatchId || batchId.startsWith('legacy:')) continue;
+                    const { resources } = await asgC.items
+                        .query({
+                            query: 'SELECT * FROM c WHERE c.batchId = @batchId',
+                            parameters: [{ name: '@batchId', value: batchId }],
+                        })
+                        .fetchAll();
+                    (resources || []).forEach((row) => {
+                        if (row?.id && !found.has(row.id)) found.set(row.id, { row, isPrimary: false });
+                    });
+                }
+
+                for (const id of absorbAssignmentIds) {
+                    if (found.has(id)) continue;
+                    try {
+                        const read = await asgC.item(id, id).read();
+                        if (read.resource) found.set(id, { row: read.resource, isPrimary: false });
+                    } catch (_) { /* missing ok */ }
+                }
+
+                const entries = [...found.values()];
+                if (!entries.length) {
+                    return {
+                        status: 404,
+                        jsonBody: { error: 'No invites found to combine' },
+                        headers: corsHeaders(),
+                    };
+                }
+
+                const primaryRows = entries.filter((e) => e.isPrimary).map((e) => e.row);
+                const absorbRows = entries.filter((e) => !e.isPrimary).map((e) => e.row);
+                if (!absorbRows.length) {
+                    return {
+                        status: 400,
+                        jsonBody: { error: 'Nothing to absorb — pick a different batch or assignments' },
+                        headers: corsHeaders(),
+                    };
+                }
+
+                const hasLabel = Object.prototype.hasOwnProperty.call(body || {}, 'batchLabel')
+                    || Object.prototype.hasOwnProperty.call(body || {}, 'label');
+                const hasStar = Object.prototype.hasOwnProperty.call(body || {}, 'batchStarred')
+                    || Object.prototype.hasOwnProperty.call(body || {}, 'starred');
+                const batchLabel = hasLabel
+                    ? String(body.batchLabel ?? body.label ?? '').trim().slice(0, 80)
+                    : (primaryRows[0]?.batchLabel || absorbRows[0]?.batchLabel || '');
+                const batchStarred = hasStar
+                    ? (body.batchStarred === true || body.batchStarred === 'true'
+                        || body.starred === true || body.starred === 'true')
+                    : Boolean(primaryRows[0]?.batchStarred || absorbRows[0]?.batchStarred || batchLabel);
+
+                let earliest = null;
+                for (const row of [...primaryRows, ...absorbRows]) {
+                    const t = row.batchSentAt || row.createdAt || '';
+                    if (!t) continue;
+                    if (!earliest || String(t) < String(earliest)) earliest = t;
+                }
+                const now = new Date().toISOString();
+                let updated = 0;
+                const movedAssignmentIds = [];
+                for (const { row, isPrimary } of entries) {
+                    if (!row?.id) continue;
+                    const priorBatch = row.batchId || null;
+                    row.batchId = primaryBatchId;
+                    row.batchSentAt = earliest || row.batchSentAt || row.createdAt || now;
+                    if (batchLabel) row.batchLabel = batchLabel;
+                    else if (hasLabel) delete row.batchLabel;
+                    if (batchStarred) row.batchStarred = true;
+                    else if (hasStar) delete row.batchStarred;
+                    row.batchSize = entries.length;
+                    if (!isPrimary && priorBatch && priorBatch !== primaryBatchId) {
+                        const prior = Array.isArray(row.priorBatchIds) ? row.priorBatchIds.slice() : [];
+                        if (!prior.includes(String(priorBatch))) prior.push(String(priorBatch));
+                        row.priorBatchIds = prior;
+                        row._combinedIntoBatchId = primaryBatchId;
+                        row._combinedAt = now;
+                        movedAssignmentIds.push(row.id);
+                    }
+                    row.updatedAt = now;
+                    await asgC.items.upsert(row);
+                    updated += 1;
+                }
+
+                return {
+                    status: 200,
+                    jsonBody: {
+                        ok: true,
+                        primaryBatchId,
+                        updated,
+                        moved: movedAssignmentIds.length,
+                        movedAssignmentIds,
+                        batchLabel: batchLabel || null,
+                        batchStarred: Boolean(batchStarred),
+                        batchSentAt: earliest || null,
+                    },
+                    headers: corsHeaders(),
+                };
+            } catch (error) {
+                return handleError(context, error, 'site-survey-batch-combine');
+            }
+        },
+    });
+
     // ---------- Ops: delete one or more send batches (test / cleanup) ----------
     app.http('siteSurveyBatchDelete', {
         methods: ['POST', 'OPTIONS'],
@@ -1921,6 +2124,12 @@ function registerSurveySecureRoutes(app, deps) {
         if (reminder) {
             assignment.lastRemindedAt = now;
             assignment.remindCount = (assignment.remindCount || 0) + 1;
+            // Keep invite in its original send cohort — never mint a new batchId on remind.
+            if (!assignment.batchSentAt) {
+                assignment.batchSentAt = assignment.createdAt || now;
+            }
+        } else if (!assignment.batchSentAt) {
+            assignment.batchSentAt = assignment.createdAt || now;
         }
         if (body.expiresInDays) {
             assignment.expiresAt = defaultExpiresAt(clampExpiresInDays(body.expiresInDays));
@@ -1932,7 +2141,15 @@ function registerSurveySecureRoutes(app, deps) {
             expiresInDays: clampExpiresInDays(body.expiresInDays || DEFAULT_TTL_DAYS),
             baseUrl,
         });
-        await getContainer(ASSIGNMENTS).items.upsert(assignment);
+        // Persist token before email. Soft-fail: still attempt delivery if upsert flakes.
+        try {
+            await getContainer(ASSIGNMENTS).items.upsert(assignment);
+        } catch (upsertErr) {
+            // Continue — email must still go out; client was seeing 500 after Graph already sent.
+            try {
+                console.warn('resend upsert(pre-email) failed', assignment.id, upsertErr?.message || upsertErr);
+            } catch (_) {}
+        }
 
         const siteName = await resolveSiteName(getContainer, assignment.siteId);
         // Contacts for THIS assignment.siteId only — never another site.
@@ -1953,14 +2170,20 @@ function registerSurveySecureRoutes(app, deps) {
                 .slice(0, 200);
             let resendFiles = [];
             let attachmentNames = [];
-            try {
-                const docs = await loadAttachmentDocs(
-                    getContainer,
-                    assignment.attachmentIds || []
-                );
-                resendFiles = emailAttachmentPayload(docs);
-                attachmentNames = docs.map((d) => d.fileName).filter(Boolean);
-            } catch (_) {}
+            // Reminders: skip heavy attachments by default (faster, avoids post-send timeouts/500s).
+            // Original resend / explicit includeAttachments: true keeps them.
+            const includeAttachments =
+                body.includeAttachments === true || (!reminder && body.includeAttachments !== false);
+            if (includeAttachments) {
+                try {
+                    const docs = await loadAttachmentDocs(
+                        getContainer,
+                        assignment.attachmentIds || []
+                    );
+                    resendFiles = emailAttachmentPayload(docs);
+                    attachmentNames = docs.map((d) => d.fileName).filter(Boolean);
+                } catch (_) {}
+            }
             const copyOpts = {
                 siteName,
                 roleLabel: roleLabel(assignment.targetRole),
@@ -1984,26 +2207,43 @@ function registerSurveySecureRoutes(app, deps) {
                 : inviteEmailCopy(copyOpts);
             const emailDeliveries = [];
             for (const email of emails) {
-                const one = await deliverSurveyEmail({
-                    to: email,
-                    cc: resendCc,
-                    subject: copy.subject,
-                    text: copy.text,
-                    html: copy.html,
-                    attachments: resendFiles,
-                    meta: {
-                        assignmentId: assignment.id,
-                        siteId: assignment.siteId,
-                        resend: !reminder,
-                        reminder: !!reminder,
-                        statusKind,
-                    },
-                });
-                emailDeliveries.push({ to: email, ...one });
+                try {
+                    const one = await deliverSurveyEmail({
+                        to: email,
+                        cc: resendCc,
+                        subject: copy.subject,
+                        text: copy.text,
+                        html: copy.html,
+                        attachments: resendFiles,
+                        meta: {
+                            assignmentId: assignment.id,
+                            siteId: assignment.siteId,
+                            resend: !reminder,
+                            reminder: !!reminder,
+                            statusKind,
+                        },
+                    });
+                    emailDeliveries.push({ to: email, ...one });
+                } catch (mailErr) {
+                    emailDeliveries.push({
+                        to: email,
+                        ok: false,
+                        mode: 'error',
+                        error: mailErr?.message || String(mailErr),
+                    });
+                }
             }
             emailResult = emailDeliveries.find((d) => d.ok) || emailDeliveries[0] || emailResult;
             emailResult.deliveries = emailDeliveries;
-            await getContainer(ASSIGNMENTS).items.upsert(assignment);
+            try {
+                await getContainer(ASSIGNMENTS).items.upsert(assignment);
+            } catch (upsertErr) {
+                // Email may already be out — never turn a successful send into a 500.
+                emailResult.persistWarning = upsertErr?.message || String(upsertErr);
+                try {
+                    console.warn('resend upsert(post-email) failed', assignment.id, emailResult.persistWarning);
+                } catch (_) {}
+            }
         }
 
         return {

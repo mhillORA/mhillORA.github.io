@@ -286,6 +286,10 @@ const validateSitesSchema = (data) => {
         'siteCoordinator2Email',
         'siteCoordinator3Name',
         'siteCoordinator3Email',
+        'siteContactName',
+        'siteContactEmail',
+        'siteContactPhone',
+        'siteContactRole',
     ];
     optionalCoordFields.forEach((field) => {
         if (data[field] !== undefined && data[field] !== null && typeof data[field] !== 'string') {
@@ -956,6 +960,17 @@ async function crudHandler(context, request, containerName) {
     
     const { method } = request;
     const id = getIdFromRequest(request);
+
+    // Reserved path segments that used to collide with sites/{id?} (merge / graduate).
+    if (containerName === 'sites' && id && ['merge', 'graduate-legacy', 'graduate'].includes(String(id))) {
+        return {
+            status: 404,
+            jsonBody: {
+                error: `Use /api/site-${id === 'merge' ? 'merge' : 'graduate-legacy'} instead of /api/sites/${id}`,
+            },
+            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+        };
+    }
 
     try {
         switch (method) {

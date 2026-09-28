@@ -44,6 +44,10 @@ const MERGE_FIELDS = [
     'siteCoordinator2Email',
     'siteCoordinator3Name',
     'siteCoordinator3Email',
+    'siteContactName',
+    'siteContactEmail',
+    'siteContactPhone',
+    'siteContactRole',
     'notes',
     'mailingAddress1',
     'mailingAddress2',
@@ -153,6 +157,7 @@ async function countBySiteId(getContainer, containerId, siteId) {
 
 async function rebindSiteId(getContainer, containerId, fromId, toId) {
     const moved = [];
+    const errors = [];
     const { resources } = await getContainer(containerId)
         .items.query(
             {
@@ -163,16 +168,20 @@ async function rebindSiteId(getContainer, containerId, fromId, toId) {
         )
         .fetchAll();
     for (const doc of resources || []) {
-        const prior = Array.isArray(doc.priorSiteIds) ? doc.priorSiteIds.slice() : [];
-        if (!prior.includes(fromId)) prior.push(String(fromId));
-        doc.siteId = String(toId);
-        doc.priorSiteIds = prior;
-        doc.updatedAt = new Date().toISOString();
-        doc._mergedFromSiteId = String(fromId);
-        await getContainer(containerId).items.upsert(doc);
-        moved.push(doc.id);
+        try {
+            const prior = Array.isArray(doc.priorSiteIds) ? doc.priorSiteIds.slice() : [];
+            if (!prior.includes(fromId)) prior.push(String(fromId));
+            doc.siteId = String(toId);
+            doc.priorSiteIds = prior;
+            doc.updatedAt = new Date().toISOString();
+            doc._mergedFromSiteId = String(fromId);
+            await getContainer(containerId).items.upsert(doc);
+            moved.push(doc.id);
+        } catch (err) {
+            errors.push({ id: doc?.id, error: err?.message || String(err) });
+        }
     }
-    return moved;
+    return { moved, errors };
 }
 
 async function rewriteStudySiteIds(getContainer, fromId, toId) {
@@ -249,7 +258,8 @@ function registerSiteMergeRoutes(app, deps) {
     app.http('sitesMerge', {
         methods: ['POST', 'OPTIONS'],
         authLevel: 'anonymous',
-        route: 'sites/merge',
+        // Use site-merge (NOT sites/merge) — sites/{id?} would otherwise treat "merge" as a site id.
+        route: 'site-merge',
         handler: async (request, context) => {
             if (request.method === 'OPTIONS') {
                 return { status: 204, headers: corsHeaders() };
@@ -393,18 +403,21 @@ function registerSiteMergeRoutes(app, deps) {
 
                 await getContainer(LIVE_SITES).items.upsert(nextPrimary);
 
-                const movedAssignments = await rebindSiteId(
+                const asgMove = await rebindSiteId(
                     getContainer,
                     ASSIGNMENTS,
                     absorbSiteId,
                     primarySiteId
                 );
-                const movedResponses = await rebindSiteId(
+                const rspMove = await rebindSiteId(
                     getContainer,
                     RESPONSES,
                     absorbSiteId,
                     primarySiteId
                 );
+                const movedAssignments = asgMove.moved || [];
+                const movedResponses = rspMove.moved || [];
+                const rebindWarnings = [...(asgMove.errors || []), ...(rspMove.errors || [])];
                 const studiesTouched = await rewriteStudySiteIds(
                     getContainer,
                     absorbSiteId,
@@ -459,6 +472,7 @@ function registerSiteMergeRoutes(app, deps) {
                         applied: true,
                         movedAssignmentIds: movedAssignments,
                         movedResponseIds: movedResponses,
+                        rebindWarnings,
                         studiesUpdated: studiesTouched,
                         primary: {
                             id: nextPrimary.id,
@@ -469,7 +483,7 @@ function registerSiteMergeRoutes(app, deps) {
                     headers: corsHeaders(),
                 };
             } catch (error) {
-                return handleError(context, error, 'sites/merge');
+                return handleError(context, error, 'site-merge');
             }
         },
     });
@@ -481,7 +495,8 @@ function registerSiteMergeRoutes(app, deps) {
     app.http('sitesGraduateLegacy', {
         methods: ['POST', 'OPTIONS'],
         authLevel: 'anonymous',
-        route: 'sites/graduate-legacy',
+        // Avoid sites/{id?} swallowing sites/graduate-legacy as id=graduate-legacy
+        route: 'site-graduate-legacy',
         handler: async (request, context) => {
             if (request.method === 'OPTIONS') {
                 return { status: 204, headers: corsHeaders() };
@@ -653,7 +668,7 @@ function registerSiteMergeRoutes(app, deps) {
                     headers: corsHeaders(),
                 };
             } catch (error) {
-                return handleError(context, error, 'sites/graduate-legacy');
+                return handleError(context, error, 'site-graduate-legacy');
             }
         },
     });
