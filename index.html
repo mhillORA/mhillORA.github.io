@@ -8712,42 +8712,152 @@
                 } catch (_) { /* ignore */ }
             };
 
-            /** Bridge so the React Lab module can read live CHAOS state without mutating production UI. */
+            /** Bridge so the React Lab module can read live CHAOS state and render the same schedule views. */
             const ensureChaosReactLabBridge = () => {
+                const cloneDate = (d) => {
+                    if (!d) return new Date();
+                    const x = d instanceof Date ? d : new Date(d);
+                    return Number.isNaN(x.getTime()) ? new Date() : new Date(x.getTime());
+                };
+                const withTempScheduleView = (viewState, fn) => {
+                    const saved = {
+                        calendarView: state.calendarView,
+                        planningGridMode: state.planningGridMode,
+                        calendarDisplayMode: state.calendarDisplayMode,
+                        atAGlanceViewMode: state.atAGlanceViewMode,
+                        crcCalendarDate: state.crcCalendarDate
+                    };
+                    try {
+                        if (viewState.calendarView != null) state.calendarView = viewState.calendarView;
+                        if (viewState.planningGridMode != null) state.planningGridMode = viewState.planningGridMode;
+                        if (viewState.calendarDisplayMode != null) state.calendarDisplayMode = viewState.calendarDisplayMode;
+                        if (viewState.atAGlanceViewMode != null) state.atAGlanceViewMode = viewState.atAGlanceViewMode;
+                        if (viewState.calendarDate != null) state.crcCalendarDate = cloneDate(viewState.calendarDate);
+                        return fn();
+                    } finally {
+                        state.calendarView = saved.calendarView;
+                        state.planningGridMode = saved.planningGridMode;
+                        state.calendarDisplayMode = saved.calendarDisplayMode;
+                        state.atAGlanceViewMode = saved.atAGlanceViewMode;
+                        state.crcCalendarDate = saved.crcCalendarDate;
+                    }
+                };
                 window.__CHAOS_REACT_LAB__ = {
                     getSnapshot: () => {
+                        const cal = cloneDate(state.crcCalendarDate);
                         const monthKey = typeof getScheduleMonthKey === 'function'
-                            ? getScheduleMonthKey(state.crcCalendarDate)
-                            : '';
-                        const [y, m] = (monthKey || '').split('-').map(Number);
-                        const monthStart = (y && m) ? `${y}-${String(m).padStart(2, '0')}-01` : null;
-                        const monthEnd = (y && m) ? (() => {
-                            const last = new Date(y, m, 0);
-                            return typeof toDateOnlyString === 'function' ? toDateOnlyString(last) : null;
-                        })() : null;
+                            ? getScheduleMonthKey(cal)
+                            : `${cal.getFullYear()}-${String(cal.getMonth() + 1).padStart(2, '0')}`;
                         const raw = (typeof getDisplayEvents === 'function' ? getDisplayEvents() : state.crc_events) || [];
-                        const events = raw.filter((e) => {
-                            if (!e || e.type !== 'Site Assignment') return false;
-                            if (typeof isCancelledShift === 'function' && isCancelledShift(e)) return false;
-                            const d = String(e.date || e.startDate || '').slice(0, 10);
-                            if (!monthStart || !monthEnd) return true;
-                            return d >= monthStart && d <= monthEnd;
-                        });
                         return {
                             monthKey,
-                            calendarDate: state.crcCalendarDate,
-                            events: events.map((e) => ({ ...e })),
-                            sites: (state.crc_sites || []).map((s) => ({ id: s.id, name: s.name })),
-                            studies: (state.studies || []).map((s) => ({ id: s.id, title: s.title || s.name, name: s.name })),
-                            crcs: (state.crcs || []).map((c) => ({ id: c.id, name: c.name })),
+                            calendarDateIso: typeof toDateOnlyString === 'function' ? toDateOnlyString(cal) : null,
+                            calendarView: state.calendarView || 'planning-grid',
+                            planningGridMode: state.planningGridMode || 'monthly',
+                            calendarDisplayMode: state.calendarDisplayMode || 'employee',
+                            atAGlanceViewMode: state.atAGlanceViewMode || 'monthly',
+                            filters: {
+                                crc: state.selectedCrcFilter || 'all',
+                                site: state.selectedSiteFilter || 'all',
+                                study: state.selectedStudyFilter || 'all',
+                                region: state.selectedRegionFilter || 'all',
+                                eventType: state.selectedEventTypeFilter || 'all',
+                                openShifts: state.selectedOpenShiftsFilter || 'all',
+                                employmentType: state.selectedEmploymentTypeFilter || 'all'
+                            },
+                            events: raw.map((e) => ({ ...e })),
+                            sites: (state.crc_sites || []).map((s) => ({
+                                id: s.id,
+                                name: s.name,
+                                city: s.city || '',
+                                state: s.state || '',
+                                color: s.color || null,
+                                principalInvestigator: s.principalInvestigator || null
+                            })),
+                            studies: (state.studies || []).map((s) => ({
+                                id: s.id,
+                                title: s.title || s.name,
+                                name: s.name,
+                                color: s.color || null
+                            })),
+                            crcs: (state.crcs || []).map((c) => ({
+                                id: c.id,
+                                name: c.name,
+                                region: c.region || '',
+                                employmentType: c.employmentType || ''
+                            })),
                             resolveStaffNames: (event) => {
                                 if (typeof getEventCRCs === 'function') {
                                     return getEventCRCs(event).map((c) => c.name).filter(Boolean);
                                 }
                                 return [];
+                            },
+                            resolveRoles: (event) => {
+                                if (typeof getAllEventRoles === 'function') return getAllEventRoles(event) || [];
+                                return [];
                             }
                         };
-                    }
+                    },
+                    /** Exact production markup for the requested view (header + body). Restores live scheduler state after. */
+                    renderScheduleMarkup: (viewState = {}) => {
+                        return withTempScheduleView(viewState, () => {
+                            let bodyHtml = '';
+                            const view = state.calendarView;
+                            const mode = state.calendarDisplayMode;
+                            const gridMode = state.planningGridMode;
+                            if (view === 'month') {
+                                if (mode === 'study' && typeof getStudyCalendarHTML === 'function') bodyHtml = getStudyCalendarHTML();
+                                else if (mode === 'site' && typeof getSiteCalendarHTML === 'function') bodyHtml = getSiteCalendarHTML();
+                                else if (mode === 'shift' && typeof getShiftViewCalendarHTML === 'function') bodyHtml = getShiftViewCalendarHTML();
+                                else if (typeof getMonthlyCalendarHTML === 'function') bodyHtml = getMonthlyCalendarHTML();
+                            } else if (view === 'week') {
+                                if (mode === 'shift' && typeof getShiftViewWeeklyHTML === 'function') bodyHtml = getShiftViewWeeklyHTML();
+                                else if (typeof getWeeklyCalendarHTML === 'function') bodyHtml = getWeeklyCalendarHTML();
+                            } else if (view === 'planning-grid') {
+                                if (mode === 'at-a-glance' && typeof getAtAGlanceViewHTML === 'function') bodyHtml = getAtAGlanceViewHTML();
+                                else if (mode === 'travel' && typeof getTravelViewHTML === 'function') bodyHtml = getTravelViewHTML();
+                                else if (gridMode === 'daily' && typeof getDailyPlanningGridHTML === 'function') bodyHtml = getDailyPlanningGridHTML();
+                                else if (gridMode === 'weekly' && typeof getWeeklyPlanningGridHTML === 'function') bodyHtml = getWeeklyPlanningGridHTML();
+                                else if (typeof getGlobalViewDetailedHTML === 'function') bodyHtml = getGlobalViewDetailedHTML();
+                            } else if (view === 'roles' && typeof getRolesViewHTML === 'function') {
+                                bodyHtml = getRolesViewHTML();
+                            } else if (view === 'total-view' && typeof getTotalViewHTML === 'function') {
+                                bodyHtml = getTotalViewHTML();
+                            } else if (typeof getGlobalViewDetailedHTML === 'function') {
+                                bodyHtml = getGlobalViewDetailedHTML();
+                            }
+                            const headerHtml = (typeof getCalendarHeaderHTML === 'function') ? getCalendarHeaderHTML() : '';
+                            return {
+                                headerHtml,
+                                bodyHtml,
+                                titleMeta: {
+                                    calendarView: state.calendarView,
+                                    planningGridMode: state.planningGridMode,
+                                    calendarDisplayMode: state.calendarDisplayMode,
+                                    calendarDateIso: typeof toDateOnlyString === 'function'
+                                        ? toDateOnlyString(state.crcCalendarDate)
+                                        : null
+                                }
+                            };
+                        });
+                    },
+                    shiftCalendarDate: (deltaDays) => {
+                        const d = cloneDate(state.crcCalendarDate);
+                        d.setDate(d.getDate() + deltaDays);
+                        return d;
+                    },
+                    shiftCalendarMonth: (deltaMonths) => {
+                        const d = cloneDate(state.crcCalendarDate);
+                        d.setMonth(d.getMonth() + deltaMonths, 1);
+                        return d;
+                    },
+                    shiftCalendarWeek: (deltaWeeks) => {
+                        const d = cloneDate(state.crcCalendarDate);
+                        d.setDate(d.getDate() + (deltaWeeks * 7));
+                        return d;
+                    },
+                    parseDateOnly: (value) => (typeof parseDateOnly === 'function' ? parseDateOnly(value) : null),
+                    toDateOnlyString: (value) => (typeof toDateOnlyString === 'function' ? toDateOnlyString(value) : null)
                 };
             };
             
@@ -10215,12 +10325,13 @@
                     _lastRenderedTab = 'reactLab';
                     mainAppContent.className = 'w-full';
                     mainAppContent.innerHTML = `
-                        <div class="w-full max-w-5xl mx-auto">
+                        <div class="w-full">
                             <div id="react-lab-root" class="min-h-[320px]"></div>
                         </div>
                     `;
                     ensureChaosReactLabBridge();
-                    import('/react-lab/app.js')
+                    const reactLabCacheBust = '20260928c';
+                    import(`/react-lab/app.js?v=${reactLabCacheBust}`)
                         .then((mod) => {
                             const root = document.getElementById('react-lab-root');
                             if (root && typeof mod.mountReactLab === 'function') mod.mountReactLab(root);
