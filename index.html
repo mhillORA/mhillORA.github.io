@@ -1715,6 +1715,7 @@
                     if (e.type === 'Travel Day' && e.parentShiftGroupId && groupIdsRemoved.has(e.parentShiftGroupId)) return false;
                     return true;
                 });
+                if (typeof invalidateSiteAssignByDateCache === 'function') invalidateSiteAssignByDateCache();
             };
             
             // --- API Service ---
@@ -5812,26 +5813,49 @@
                 return null;
             };
 
-            let _siteAssignByDateCache = { rawRef: null, map: null };
+            let _siteAssignByDateCache = { gen: -1, map: null };
+            let _siteAssignCacheGen = 0;
+            const invalidateSiteAssignByDateCache = () => {
+                _siteAssignCacheGen += 1;
+                _siteAssignByDateCache = { gen: -1, map: null };
+            };
+
+            /** Same roster rules as getEventCRCs: when roleAssignments exists, ignore stale legacy crcId (ghost bookings). */
+            const siteAssignmentListsCrc = (event, crcId) => {
+                if (!event || event.type !== 'Site Assignment' || !crcId) return false;
+                const target = normalizeCrcId(crcId);
+                if (!target || target === 'SITE_STAFF' || target === 'UNASSIGNED') return false;
+                if (event.roleAssignments != null && typeof event.roleAssignments === 'object') {
+                    return Object.values(event.roleAssignments).some((assignments) =>
+                        assignmentsIncludeCrc(assignments, target)
+                    );
+                }
+                if (normalizeCrcId(event.crcId) === target) return true;
+                if (Array.isArray(event.crcIds) && event.crcIds.some((id) => normalizeCrcId(id) === target)) return true;
+                return false;
+            };
 
             const isCRCScheduledOnDate = (crcId, date, period, excludeEventId = null, excludeGroupId = null) => {
                 if (!crcId || !date) return false;
+                const target = normalizeCrcId(crcId);
+                if (!target || target === 'SITE_STAFF' || target === 'UNASSIGNED') return false;
 
                 const normalizedDate = toDateOnlyString(parseDateFlexible(date)) || String(date).slice(0, 10);
                 if (!normalizedDate) return false;
 
-                // Index by date once per crc_events array — callers were scanning the full month per CRC.
-                if (!_siteAssignByDateCache.map || _siteAssignByDateCache.rawRef !== state.crc_events) {
+                // Rebuild when events change (in-place mutations used to leave ghosts as "already scheduled").
+                if (!_siteAssignByDateCache.map || _siteAssignByDateCache.gen !== _siteAssignCacheGen) {
                     const map = new Map();
                     (state.crc_events || []).forEach((event) => {
                         if (!event || event.type !== 'Site Assignment') return;
                         if (typeof isCancelledShift === 'function' && isCancelledShift(event)) return;
-                        const eventDate = String(event.date || event.startDate || '').slice(0, 10);
-                        if (!eventDate) return;
+                        const eventDate = toDateOnlyString(parseDateFlexible(event.date || event.startDate))
+                            || String(event.date || event.startDate || '').slice(0, 10);
+                        if (!eventDate || eventDate.length < 10) return;
                         if (!map.has(eventDate)) map.set(eventDate, []);
                         map.get(eventDate).push(event);
                     });
-                    _siteAssignByDateCache = { rawRef: state.crc_events, map };
+                    _siteAssignByDateCache = { gen: _siteAssignCacheGen, map };
                 }
                 const dayEvents = _siteAssignByDateCache.map.get(normalizedDate) || [];
 
@@ -5839,23 +5863,7 @@
                     const event = dayEvents[i];
                     if (excludeEventId && event.id === excludeEventId) continue;
                     if (excludeGroupId && event.groupId && event.groupId === excludeGroupId) continue;
-
-                    const hasCrcId = event.crcId && String(event.crcId).trim() !== '';
-                    const hasValidRoleAssignments = event.roleAssignments &&
-                        Object.keys(event.roleAssignments).length > 0 &&
-                        Object.values(event.roleAssignments).some(assignments =>
-                            Array.isArray(assignments) && assignments.some(id =>
-                                id && String(id).trim() !== '' && id !== 'UNASSIGNED' && id !== 'SITE_STAFF'
-                            )
-                        );
-                    if (!hasCrcId && !hasValidRoleAssignments) continue;
-                    if (event.crcId === crcId) return true;
-                    if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
-                        const hit = Object.values(event.roleAssignments).some(assignments =>
-                            Array.isArray(assignments) && assignments.includes(crcId)
-                        );
-                        if (hit) return true;
-                    }
+                    if (siteAssignmentListsCrc(event, target)) return true;
                 }
                 return false;
             };
@@ -5898,37 +5906,30 @@
             
             // Helper function to get conflicting appointment info for display
             const getConflictingAppointmentInfo = (crcId, date, excludeEventId = null, excludeGroupId = null) => {
-                const conflictingEvents = state.crc_events.filter(event => {
+                const normalizedDate = toDateOnlyString(parseDateFlexible(date)) || String(date || '').slice(0, 10);
+                const target = normalizeCrcId(crcId);
+                const conflictingEvents = (state.crc_events || []).filter(event => {
+                    if (!event || event.type !== 'Site Assignment') return false;
                     if (isCancelledShift(event)) return false;
                     if (excludeEventId && event.id === excludeEventId) return false;
-                    // Also exclude all events in the same group (for multi-day shifts)
                     if (excludeGroupId && event.groupId && event.groupId === excludeGroupId) return false;
-                    if (event.type !== 'Site Assignment' || event.date !== date) return false;
-                    
-                    if (event.crcId === crcId) return true;
-                    if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
-                        return Object.values(event.roleAssignments).some(assignments =>
-                            assignmentsIncludeCrc(assignments, crcId)
-                        );
-                    }
-                    return false;
+                    const eventDate = toDateOnlyString(parseDateFlexible(event.date || event.startDate))
+                        || String(event.date || event.startDate || '').slice(0, 10);
+                    if (eventDate !== normalizedDate) return false;
+                    return siteAssignmentListsCrc(event, target);
                 });
                 
                 if (conflictingEvents.length === 0) return null;
                 
-                // Get info from first conflicting event
                 const conflict = conflictingEvents[0];
                 const site = state.crc_sites.find(s => s.id === conflict.siteId);
                 const study = conflict.studyIds && conflict.studyIds.length > 0 
                     ? state.studies.find(s => s.id === conflict.studyIds[0])
                     : null;
                 
-                const siteName = site ? site.name : 'Unknown Site';
-                const studyName = study ? (study.title || study.name) : 'Unknown Study';
-                
                 return {
-                    site: siteName,
-                    study: studyName,
+                    site: site ? site.name : 'Unknown Site',
+                    study: study ? (study.title || study.name) : 'Unknown Study',
                     event: conflict
                 };
             };
@@ -7636,6 +7637,10 @@
                 const ensureArray = (key) => { state[key] = Array.isArray(state[key]) ? state[key] : []; };
                 ['crc_events', 'timeOffRequests', 'crcs', 'studies', 'crc_sites', 'roles', 'users', 'travel', 'trucks', 'truck_events', 'training_types'].forEach(ensureArray);
 
+                if (Object.prototype.hasOwnProperty.call(newState, 'crc_events') && typeof invalidateSiteAssignByDateCache === 'function') {
+                    invalidateSiteAssignByDateCache();
+                }
+
                 // DEDUPLICATION: Only when crc_events / timeOffRequests are part of this update (full passes are expensive on large schedules)
                 const dedupeEvents = Object.prototype.hasOwnProperty.call(newState, 'crc_events') && !options.skipEventDedupe;
                 const dedupeTimeOffRequests = Object.prototype.hasOwnProperty.call(newState, 'timeOffRequests');
@@ -7793,6 +7798,7 @@
         }
     }
     state.crc_events.push(newEvent);
+    if (typeof invalidateSiteAssignByDateCache === 'function') invalidateSiteAssignByDateCache();
     // Defer so we don't trigger setState in the middle of add flow (can cause duplicate renders/state issues)
     if (!options.silent && typeof markScheduleModifiedForMonth === 'function' && typeof getScheduleMonthKeyFromEvent === 'function') {
         const mk = getScheduleMonthKeyFromEvent(newEvent);
@@ -8668,42 +8674,37 @@
             // Helper function to check if an event belongs to a specific CRC (checks crcId, crcIds, and roleAssignments)
             const eventBelongsToCrc = (event, crcId) => {
                 if (!crcId || !event) return false;
+                const target = normalizeCrcId(crcId);
+                if (!target) return false;
+
+                // Site Assignment: roleAssignments is source of truth (ignore stale legacy crcId ghosts)
+                if (event.type === 'Site Assignment') {
+                    if (siteAssignmentListsCrc(event, target)) return true;
+                    // Multi-day shift: same calendar day only — do not treat sibling *dates* as carrying this cell's roster
+                    if (event.groupId) {
+                        const list = (typeof getDisplayEvents === 'function' ? getDisplayEvents() : state.crc_events) || [];
+                        const events = getSameCalendarDayGroupSiteAssignments(event, list);
+                        if (events.some(e => siteAssignmentListsCrc(e, target))) return true;
+                    }
+                    return false;
+                }
                 
                 // Check legacy crcId
-                if (event.crcId === crcId) {
+                if (normalizeCrcId(event.crcId) === target) {
                     return true;
                 }
                 
                 // Travel Day and shared travel: event.crcIds can include multiple CRCs
-                if (event.crcIds && Array.isArray(event.crcIds) && event.crcIds.includes(crcId)) {
+                if (event.crcIds && Array.isArray(event.crcIds) && event.crcIds.some(id => normalizeCrcId(id) === target)) {
                     return true;
                 }
                 
                 // Check roleAssignments (includes both regular roles and training roles)
-                // Training roles work the same way - CRC is assigned to the Training role in roleAssignments
-                // The trainingAssignments just specify what they're training for (e.g., "ICF")
                 if (event.roleAssignments && Object.keys(event.roleAssignments).length > 0) {
                     const foundInRoles = Object.values(event.roleAssignments).some(assignments =>
-                        assignmentsIncludeCrc(assignments, crcId)
+                        assignmentsIncludeCrc(assignments, target)
                     );
                     if (foundInRoles) return true;
-                }
-                
-                // Multi-day shift: same calendar day only — do not treat sibling *dates* as carrying this cell's roster
-                if (event.groupId && event.type === 'Site Assignment') {
-                    const list = (typeof getDisplayEvents === 'function' ? getDisplayEvents() : state.crc_events) || [];
-                    const events = getSameCalendarDayGroupSiteAssignments(event, list);
-                    const anyHasCrc = events.some(e => {
-                        if (e.crcId === crcId) return true;
-                        if (e.crcIds && Array.isArray(e.crcIds) && e.crcIds.includes(crcId)) return true;
-                        if (e.roleAssignments && Object.keys(e.roleAssignments).length > 0) {
-                            return Object.values(e.roleAssignments).some(assignments =>
-                                assignmentsIncludeCrc(assignments, crcId)
-                            );
-                        }
-                        return false;
-                    });
-                    if (anyHasCrc) return true;
                 }
                 
                 return false;
@@ -8952,12 +8953,17 @@
             };
 
             // Weather widget functionality
+            let _weatherFetchState = 'idle'; // idle | done | denied
             const updateWeather = async () => {
                 const weatherWidget = document.getElementById('weather-widget');
                 const weatherTemp = document.getElementById('weather-temp');
                 const weatherIcon = weatherWidget?.querySelector('i[data-lucide]');
                 
                 if (!weatherWidget || !weatherTemp) return;
+                // Don't re-prompt geolocation after dismiss — that spam slows the whole tab.
+                if (_weatherFetchState === 'denied' || _weatherFetchState === 'pending') return;
+                if (_weatherFetchState === 'done' && weatherTemp.textContent && weatherTemp.textContent !== '--°') return;
+                _weatherFetchState = 'pending';
                 
                 try {
                     // Get user's location
@@ -8967,8 +8973,8 @@
                             return;
                         }
                         navigator.geolocation.getCurrentPosition(resolve, reject, {
-                            timeout: 10000,
-                            maximumAge: 300000 // Cache for 5 minutes
+                            timeout: 4000,
+                            maximumAge: 3600000 // 1 hour
                         });
                     });
                     
@@ -9008,6 +9014,7 @@
                                 weatherIcon.setAttribute('data-lucide', iconName);
                                 lucide.createIcons();
                             }
+                            _weatherFetchState = 'done';
                         } else {
                             throw new Error('Weather API error');
                         }
@@ -9018,9 +9025,11 @@
                             weatherIcon.setAttribute('data-lucide', 'cloud');
                             lucide.createIcons();
                         }
+                        _weatherFetchState = 'done';
                     }
                 } catch (error) {
-                    // If geolocation fails, hide or show placeholder
+                    // If geolocation fails, hide or show placeholder — never re-prompt this session
+                    _weatherFetchState = 'denied';
                     weatherTemp.textContent = '--°';
                     if (weatherIcon) {
                         weatherIcon.setAttribute('data-lucide', 'cloud');
@@ -9688,9 +9697,15 @@
                             renderCRCCalendar();
                             // Reveal UI immediately — don't wait on utilization/maps/icons.
                             if (pendingInitialTabPaint) afterNextPaint(() => markInitialTabContentReady());
-                            setTimeout(() => {
+                            // Utilization is expensive — run when idle, not on the critical path.
+                            const scheduleUtil = () => {
                                 try { renderUtilization(); } catch (_) { /* ignore */ }
-                            }, 400);
+                            };
+                            if (typeof requestIdleCallback === 'function') {
+                                requestIdleCallback(scheduleUtil, { timeout: 2000 });
+                            } else {
+                                setTimeout(scheduleUtil, 800);
+                            }
                             // Scheduler tab historically kicked off dashboard maps — skip unless full mode
                             if (typeof window.chaosMapsAutoLoad === 'function' && window.chaosMapsAutoLoad()) {
                                 setTimeout(() => {
@@ -21268,6 +21283,8 @@
                 const container = document.getElementById('crcUtilization');
                 const titleEl = document.getElementById('utilization-title');
                 if (!container || !titleEl) return;
+                // Don't freeze the shift modal / open dialogs with a full util scan.
+                if (modalContainer && !modalContainer.classList.contains('hidden')) return;
 
                 if (state.crcs.length === 0) {
                     container.innerHTML = '<p class="text-sm text-gray-500 dark:text-gray-400">No CRCs to analyze.</p>';
@@ -21283,11 +21300,11 @@
                 if (state.calendarView === 'week') {
                     titleEl.textContent = `CRC Utilization (Current Week) - ${monthName}`;
                     const weeklyStats = calculateWeeklyUtilization(state.crcCalendarDate);
-                    const weekStart = new Date(now);
-                    weekStart.setDate(now.getDate() - getDaySaturdayStart(now));
-                    const weekEnd = new Date(weekStart);
-                    weekEnd.setDate(weekStart.getDate() + 6);
-                    let crcsToShow = state.crcs.filter(crc => crc.active !== false || crcHasShiftInPeriod(crc.id, weekStart, weekEnd));
+                    let crcsToShow = state.crcs.filter(crc => {
+                        if (crc.active !== false) return true;
+                        const s = weeklyStats[crc.id];
+                        return !!(s && ((s.totalHours || 0) > 0 || (s.travelHours || 0) > 0));
+                    });
                     if (matchingCrcId) {
                         crcsToShow = crcsToShow.filter(crc => crc.id === matchingCrcId);
                         const me = state.crcs.find(c => c.id === matchingCrcId);
@@ -21323,9 +21340,12 @@
                 } else {
                     titleEl.textContent = `CRC Utilization - ${monthName}`;
                     const monthlyStats = calculateMonthlyUtilization(state.crcCalendarDate);
-                    const year = now.getFullYear();
-                    const month = now.getMonth();
-                    let crcsToShow = state.crcs.filter(crc => crc.active !== false || crcHasShiftInMonth(crc.id, year, month));
+                    // Use util stats instead of a second full event scan per CRC (was multi-second).
+                    let crcsToShow = state.crcs.filter(crc => {
+                        if (crc.active !== false) return true;
+                        const s = monthlyStats[crc.id];
+                        return !!(s && ((s.productiveHours || 0) > 0 || (s.travelHours || 0) > 0));
+                    });
                     if (matchingCrcId) {
                         crcsToShow = crcsToShow.filter(crc => crc.id === matchingCrcId);
                         const me = state.crcs.find(c => c.id === matchingCrcId);
@@ -42806,12 +42826,17 @@
                 }
                 // Handle date changes for availability updates
                 if (target.name === 'startDate' || target.name === 'endDate') {
-                    console.log('Date changed:', target.name, target.value);
-                    // Add a small delay to ensure DOM is updated
-                    setTimeout(() => {
-                        handleShiftStudySiteSelection();
-                        updateTravelSelectionContainer();
-                    }, 100);
+                    // endDate-only: don't rebuild the whole role picker (that froze the modal ~1.5s).
+                    if (target.name === 'endDate') {
+                        setTimeout(() => {
+                            try { updateTravelSelectionContainer(); } catch (_) { /* ignore */ }
+                        }, 50);
+                    } else {
+                        setTimeout(() => {
+                            handleShiftStudySiteSelection();
+                            updateTravelSelectionContainer();
+                        }, 100);
+                    }
                 }
                 // Handle role assignment changes to update travel selection
                 if (target.name && target.name.startsWith('role-')) {
