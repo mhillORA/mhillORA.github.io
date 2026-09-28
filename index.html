@@ -6548,6 +6548,84 @@
                 return saved;
             };
 
+            /** Create/upsert any missing Site Assignment rows for [rangeStart, rangeEnd] in a group. Never deletes. */
+            const ensureSiteAssignmentDaysInRange = async ({ groupId, rangeStart, rangeEnd, templatePayload }) => {
+                const start = parseDateOnly(rangeStart);
+                const end = parseDateOnly(rangeEnd);
+                if (!groupId || !start || !end || end < start) return { created: [], failed: [] };
+                const existingDates = new Set(
+                    (state.crc_events || [])
+                        .filter((e) => e && e.type === 'Site Assignment' && e.groupId === groupId)
+                        .map((e) => toDateOnlyString(parseDateFlexible(e.date || e.startDate)))
+                        .filter(Boolean)
+                );
+                const created = [];
+                const failed = [];
+                for (let d = new Date(start.getTime()); d <= end; d.setDate(d.getDate() + 1)) {
+                    const dateStr = toDateOnlyString(d);
+                    if (existingDates.has(dateStr)) continue;
+                    const payload = {
+                        ...templatePayload,
+                        type: 'Site Assignment',
+                        date: dateStr,
+                        startDate: rangeStart,
+                        endDate: rangeEnd,
+                        groupId,
+                        skipTravelDayProcessing: true
+                    };
+                    delete payload.id;
+                    try {
+                        // Prefer adopting a same-identity ghost on that day (any groupId) over creating a 2nd row
+                        // that collapse/display would hide — that was the "override hid the shift" bug.
+                        const identityHits = (typeof findSiteAssignmentDuplicates === 'function')
+                            ? findSiteAssignmentDuplicates(payload)
+                            : [];
+                        let saved = null;
+                        if (identityHits.length > 0) {
+                            const keeper = identityHits.reduce((best, row) => pickRicherSiteAssignment(best, row));
+                            const mergedPayload = {
+                                ...keeper,
+                                ...payload,
+                                id: keeper.id,
+                                groupId,
+                                roleAssignments: (payload.roleAssignments && Object.keys(payload.roleAssignments).length > 0)
+                                    ? payload.roleAssignments
+                                    : (keeper.roleAssignments || payload.roleAssignments || {})
+                            };
+                            const updated = await apiService.updateEvent(keeper.id, mergedPayload);
+                            saved = (typeof mergeEventAssignmentFields === 'function')
+                                ? mergeEventAssignmentFields(updated || mergedPayload, mergedPayload)
+                                : (updated || mergedPayload);
+                            const idx = state.crc_events.findIndex((e) => e && e.id === keeper.id);
+                            if (idx !== -1) state.crc_events[idx] = saved;
+                            else addEventToState(saved);
+                            // Drop weaker same-identity extras from local state only (never cascade-delete from server here)
+                            identityHits.forEach((row) => {
+                                if (row.id && row.id !== keeper.id) {
+                                    state.crc_events = state.crc_events.filter((e) => e && e.id !== row.id);
+                                }
+                            });
+                        } else {
+                            saved = await upsertSiteAssignmentByIdentity(payload);
+                        }
+                        if (saved && saved.id) {
+                            existingDates.add(dateStr);
+                            created.push(dateStr);
+                        } else {
+                            failed.push(dateStr);
+                        }
+                    } catch (err) {
+                        console.error('ensureSiteAssignmentDaysInRange failed for', dateStr, err);
+                        failed.push(dateStr);
+                    }
+                }
+                if (created.length || failed.length) {
+                    if (typeof invalidateSiteAssignByDateCache === 'function') invalidateSiteAssignByDateCache();
+                    setState({ crc_events: [...(state.crc_events || [])] }, { skipRender: true });
+                }
+                return { created, failed };
+            };
+
             /** CRC dashboard: show cancelled visits greyed out (still excluded from utilization via isCancelledShift). */
             const getCrcDashboardEvents = () => collapseDuplicateSiteAssignments(
                 (state.crc_events_display != null ? state.crc_events_display : state.crc_events) || []
@@ -7784,15 +7862,23 @@
             return;
         }
     }
-    // CRITICAL: Never add a second Site Assignment for the same visit identity
+                // Same visit identity: keep the richer row in local state (do NOT silently drop
+    // a newly saved day — that made override/extend look like it "did nothing" / hid staff).
     if (newEvent.type === 'Site Assignment') {
         const key = getSiteAssignmentIdentityKey(newEvent);
         if (key && key !== 'sa:|||||') {
-            const already = state.crc_events.some((e) =>
+            const existingIdx = state.crc_events.findIndex((e) =>
                 e && e.id !== newEvent.id && e.type === 'Site Assignment' && getSiteAssignmentIdentityKey(e) === key
             );
-            if (already) {
-                debugWarn('CHAOS: Prevented duplicate Site Assignment for', key);
+            if (existingIdx !== -1) {
+                const keeper = (typeof pickRicherSiteAssignment === 'function')
+                    ? pickRicherSiteAssignment(state.crc_events[existingIdx], newEvent)
+                    : newEvent;
+                // Prefer the newly saved id when richer so server + UI stay aligned
+                const preferNew = keeper === newEvent
+                    || countAssignedCrcsOnEvent(newEvent) >= countAssignedCrcsOnEvent(state.crc_events[existingIdx]);
+                state.crc_events[existingIdx] = preferNew ? { ...state.crc_events[existingIdx], ...newEvent, id: newEvent.id || state.crc_events[existingIdx].id } : pickRicherSiteAssignment(state.crc_events[existingIdx], newEvent);
+                if (typeof invalidateSiteAssignByDateCache === 'function') invalidateSiteAssignByDateCache();
                 return;
             }
         }
@@ -38113,34 +38199,39 @@
                         allCrcIds.forEach(crcId => {
                             // Skip SITE_STAFF and UNASSIGNED - can be used unlimited times
                             if (!crcId || crcId === 'SITE_STAFF' || crcId === 'UNASSIGNED') return;
-                            // Pass excludeEventId and excludeGroupId to properly exclude current event and all events in same group when editing
-                            const isSchedulingConflict = isCRCScheduledOnDate(crcId, startDateStr, period, excludeEventId, existingGroupId);
-                            if (isSchedulingConflict) {
-                                const p = getUnavailabilityPeriod(crcId, startDateStr);
-                                schedulingConflicts.push({ crcId, period: p || 'Full Day' });
-                            }
-                            
-                            // Check if this CRC is already scheduled for a different site/study on this date
-                            // Exclude SITE_STAFF from site/study conflict checks (can be used unlimited times)
-                            // Also exclude events in the same group when editing
-                            if (crcId !== 'SITE_STAFF' && selectedSiteId && selectedStudyIds.length > 0) {
-                                const conflictingEvents = state.crc_events.filter(event => {
-                                    // Exclude current event and events in same group when editing
-                                    if (excludeEventId && event.id === excludeEventId) return false;
-                                    if (excludeGroupEventIds.includes(event.id)) return false;
-                                    if (event.type !== 'Site Assignment') return false;
-                                    const eventDate = toDateOnlyString(parseDateFlexible(event.date || event.startDate)) || String(event.date || '').slice(0, 10);
-                                    if (eventDate !== startDateStr) return false;
-                                    if (!siteAssignmentListsCrc(event, crcId)) return false;
-                                    return (event.siteId !== selectedSiteId || !event.studyIds || !event.studyIds.some(sid => selectedStudyIds.includes(sid)));
-                                });
-                                
-                                if (conflictingEvents.length > 0) {
-                                    const conflictEvent = conflictingEvents[0];
-                                    const conflictSite = state.crc_sites.find(s => s.id === conflictEvent.siteId);
-                                    const conflictSiteName = conflictSite ? conflictSite.name : 'another site';
-                                    siteStudyConflicts.push({ crcId, siteName: conflictSiteName });
+                            // Check EVERY day in the form range (not just start) — extending 28→29 must
+                            // surface conflicts on the 29th, and override must still be allowed to proceed.
+                            const rangeCursor = new Date(startDateObj);
+                            while (rangeCursor <= endDateObj) {
+                                const dayStr = toDateOnlyString(rangeCursor);
+                                const isSchedulingConflict = isCRCScheduledOnDate(crcId, dayStr, period, excludeEventId, existingGroupId);
+                                if (isSchedulingConflict) {
+                                    const p = getUnavailabilityPeriod(crcId, dayStr);
+                                    if (!schedulingConflicts.some((c) => c.crcId === crcId && c.date === dayStr)) {
+                                        schedulingConflicts.push({ crcId, period: p || 'Full Day', date: dayStr });
+                                    }
                                 }
+                                // Check if this CRC is already scheduled for a different site/study on this date
+                                if (crcId !== 'SITE_STAFF' && selectedSiteId && selectedStudyIds.length > 0) {
+                                    const conflictingEvents = state.crc_events.filter(event => {
+                                        if (excludeEventId && event.id === excludeEventId) return false;
+                                        if (excludeGroupEventIds.includes(event.id)) return false;
+                                        if (event.type !== 'Site Assignment') return false;
+                                        const eventDate = toDateOnlyString(parseDateFlexible(event.date || event.startDate)) || String(event.date || '').slice(0, 10);
+                                        if (eventDate !== dayStr) return false;
+                                        if (!siteAssignmentListsCrc(event, crcId)) return false;
+                                        return (event.siteId !== selectedSiteId || !event.studyIds || !event.studyIds.some(sid => selectedStudyIds.includes(sid)));
+                                    });
+                                    if (conflictingEvents.length > 0) {
+                                        const conflictEvent = conflictingEvents[0];
+                                        const conflictSite = state.crc_sites.find(s => s.id === conflictEvent.siteId);
+                                        const conflictSiteName = conflictSite ? conflictSite.name : 'another site';
+                                        if (!siteStudyConflicts.some((c) => c.crcId === crcId && c.date === dayStr)) {
+                                            siteStudyConflicts.push({ crcId, siteName: conflictSiteName, date: dayStr });
+                                        }
+                                    }
+                                }
+                                rangeCursor.setDate(rangeCursor.getDate() + 1);
                             }
                         });
                         
@@ -38960,9 +39051,17 @@
                                         && !!newEndDateStr && !!seriesMaxDay
                                         && newEndDateStr > seriesMaxDay
                                         && newStartDateStr === oldStartDateStr;
+                                    // ANY end-date extension (single or multi) must append days — never delete/rewrite.
+                                    const onlyExtendingEnd = !!(
+                                        newStartDateStr && newEndDateStr
+                                        && newEndDateStr > (seriesMaxDay || oldEndDateStr || newStartDateStr)
+                                        && (newStartDateStr === oldStartDateStr || (isGroupedSeriesRow && !applyToAllDaysEarly && newStartDateStr === oldStartDateStr))
+                                    );
+                                    const shouldAppendDays = !!(changedToMultiDay || extendingSeriesForward || onlyExtendingEnd);
                                     
-                                    // If it's a group event and the date range has changed, we need to handle the group
-                                    if (isGroupEvent && dateRangeChanged && mayRewriteWholeGroup) {
+                                    // Full rewrite only when shifting an existing multi-day range — NOT for single→multi expand
+                                    // (that used to delete/recreate and often looked like override did nothing).
+                                    if (isGroupEvent && dateRangeChanged && mayRewriteWholeGroup && !changedToMultiDay && !changedFromMultiDay && !shouldAppendDays) {
                                         // Date range changed for a group event - need to handle the entire group
                                         // Get all events in the group (exclude Travel Days)
                                         const groupEvents = state.crc_events.filter(e => 
@@ -39163,7 +39262,7 @@
                                         renderContentPreservingScroll();
                                         showNotification(`Shift updated successfully! ${createdEvents.length} day(s) scheduled.`, 'success');
                                         closeModal();
-                                    } else if (changedToMultiDay || extendingSeriesForward) {
+                                    } else if (shouldAppendDays || changedToMultiDay || extendingSeriesForward) {
                                         // Expand range: either single→multi, or append days onto an existing series.
                                         // Preserve shift type when editing so we never turn a shift into travel
                                         const typeForMultiDay = isEditing && existingEvent ? existingEvent.type : data.eventType;
@@ -39198,15 +39297,19 @@
                                             }
                                         }
                                         
-                                        // Keep existing group when appending days; new group when converting single→multi
-                                        const newGroupId = extendingSeriesForward
+                                        // Keep existing group when appending/extending; new group when converting lone single→multi
+                                        const newGroupId = (extendingSeriesForward || onlyExtendingEnd || (isGroupEvent && existingGroupId))
                                             ? (existingGroupId || existingEvent.groupId || crypto.randomUUID())
                                             : crypto.randomUUID();
                                         const existingSeriesDates = new Set(
-                                            (extendingSeriesForward ? groupSeriesRows : [])
+                                            ((extendingSeriesForward || onlyExtendingEnd) ? groupSeriesRows : (isGroupEvent ? groupSeriesRows : []))
                                                 .map(e => toDateOnlyString(parseDateFlexible(e.date || e.startDate)))
                                                 .filter(Boolean)
                                         );
+                                        if (existingEvent) {
+                                            const rowD = toDateOnlyString(parseDateFlexible(existingEvent.date || existingEvent.startDate));
+                                            if (rowD) existingSeriesDates.add(rowD);
+                                        }
                                         
                                         // Update the existing event to be part of the group
                                         // Collect travel day preferences from form
@@ -39272,6 +39375,9 @@
                                         }
                                         
                                         const rowDateStr = toDateOnlyString(parseDateFlexible(existingEvent.date || existingEvent.startDate)) || newStartDateStr;
+                                        const seriesStartForPayload = (extendingSeriesForward || onlyExtendingEnd)
+                                            ? (seriesSortedDays[0] || rowDateStr)
+                                            : newStartDateStr;
                                         const updatePayload = {
                                             ...baseEventData,
                                             type: typeForMultiDay,
@@ -39283,8 +39389,8 @@
                                             trainingAssignments: (Object.keys(singleShiftTrainingAssignments).length > 0 ? singleShiftTrainingAssignments : (Object.keys(finalTrainingAssignments || {}).length > 0 ? finalTrainingAssignments : undefined)),
                                             roleQuantityOverrides: finalRoleQuantityOverrides,
                                             groupNumber: groupNumberValue,
-                                            date: extendingSeriesForward ? rowDateStr : newStartDateStr,
-                                            startDate: extendingSeriesForward ? (seriesSortedDays[0] || rowDateStr) : newStartDateStr,
+                                            date: (extendingSeriesForward || onlyExtendingEnd) ? rowDateStr : newStartDateStr,
+                                            startDate: seriesStartForPayload,
                                             endDate: newEndDateStr,
                                             groupId: newGroupId,
                                             // CRITICAL: Always preserve travelDayPreferences, even if empty, to maintain checkbox state
@@ -39308,50 +39414,66 @@
                                         }
                                         
                                         // Create missing days in the new range (skip days that already exist in the series)
-                                        const dayCursor = new Date(extendingSeriesForward
-                                            ? (parseDateOnly(seriesMaxDay) || startDateObj)
-                                            : startDateObj);
-                                        dayCursor.setDate(dayCursor.getDate() + 1);
-                                        const createdEvents = [];
-                                        const failedDates = [];
-                                        
-                                        while (dayCursor <= endDateObj) {
-                                            const dateStr = toDateOnlyString(dayCursor);
-                                            if (existingSeriesDates.has(dateStr) || dateStr === updatePayload.date) {
-                                                dayCursor.setDate(dayCursor.getDate() + 1);
-                                                continue;
-                                            }
-                                            const eventPayload = {
-                                                ...baseEventData,
-                                                type: typeForMultiDay,
-                                                crcId: isTravelDayEdit ? travelDayCrcId : null, // Match type: only set for Travel Day
-                                                roles: [], // Legacy field - use roleAssignments instead
-                                                // CRITICAL: Always include roleAssignments, even if empty (for Open Shifts)
-                                    // The API will allow Site Assignment events with empty roleAssignments as Open Shifts
-                                    roleAssignments: finalRoleAssignments || {},
-                                                trainingAssignments: finalTrainingAssignments,
-                                                trainingModes: finalTrainingModes,
-                                                roleQuantityOverrides: finalRoleQuantityOverrides,
-                                                groupNumber: groupNumberValue,
-                                                date: dateStr,
-                                                startDate: updatePayload.startDate,
-                                                endDate: newEndDateStr,
+                                        // Use ensure/upsert so a ghost row on the new day gets the roster instead of being
+                                        // silently dropped from local state (which looked like override hid the shift).
+                                        const ensureFrom = (extendingSeriesForward || onlyExtendingEnd)
+                                            ? (seriesMaxDay || rowDateStr || newStartDateStr)
+                                            : newStartDateStr;
+                                        const ensureTemplate = {
+                                            ...baseEventData,
+                                            type: typeForMultiDay,
+                                            crcId: isTravelDayEdit ? travelDayCrcId : null,
+                                            roles: [],
+                                            roleAssignments: finalRoleAssignments || {},
+                                            trainingAssignments: finalTrainingAssignments,
+                                            trainingModes: finalTrainingModes,
+                                            roleQuantityOverrides: finalRoleQuantityOverrides,
+                                            groupNumber: groupNumberValue,
+                                            groupId: newGroupId,
+                                            skipTravelDayProcessing: true
+                                        };
+                                        let createdEvents = [];
+                                        let failedDates = [];
+                                        if (typeForMultiDay === 'Site Assignment' && typeof ensureSiteAssignmentDaysInRange === 'function') {
+                                            const ensured = await ensureSiteAssignmentDaysInRange({
                                                 groupId: newGroupId,
-                                                skipTravelDayProcessing: true
-                                            };
-                                            
-                                            try {
-                                                const created = await apiService.createEvent(eventPayload);
-                                                const saved = requireCreatedEvent(created, 'shift');
-                                                const merged = typeof mergeEventAssignmentFields === 'function' ? mergeEventAssignmentFields(saved, eventPayload) : saved;
-                                                createdEvents.push(merged);
-                                                state.crc_events.push(merged);
-                                            } catch (error) {
-                                                console.error(`Error creating event for date ${dateStr}:`, error);
-                                                failedDates.push(dateStr);
+                                                rangeStart: seriesStartForPayload || newStartDateStr,
+                                                rangeEnd: newEndDateStr,
+                                                templatePayload: ensureTemplate
+                                            });
+                                            createdEvents = (ensured.created || []).map((dateStr) => ({ date: dateStr }));
+                                            failedDates = ensured.failed || [];
+                                        } else {
+                                            const dayCursor = new Date(parseDateOnly(ensureFrom) || startDateObj);
+                                            if (!(extendingSeriesForward || onlyExtendingEnd)) {
+                                                // start at start; loop still skips existing
+                                            } else {
+                                                dayCursor.setDate(dayCursor.getDate() + 1);
                                             }
-                                            
-                                            dayCursor.setDate(dayCursor.getDate() + 1);
+                                            while (dayCursor <= endDateObj) {
+                                                const dateStr = toDateOnlyString(dayCursor);
+                                                if (existingSeriesDates.has(dateStr) || dateStr === updatePayload.date) {
+                                                    dayCursor.setDate(dayCursor.getDate() + 1);
+                                                    continue;
+                                                }
+                                                const eventPayload = {
+                                                    ...ensureTemplate,
+                                                    date: dateStr,
+                                                    startDate: updatePayload.startDate,
+                                                    endDate: newEndDateStr
+                                                };
+                                                try {
+                                                    const created = await apiService.createEvent(eventPayload);
+                                                    const saved = requireCreatedEvent(created, 'shift');
+                                                    const merged = typeof mergeEventAssignmentFields === 'function' ? mergeEventAssignmentFields(saved, eventPayload) : saved;
+                                                    createdEvents.push(merged);
+                                                    addEventToState(merged);
+                                                } catch (error) {
+                                                    console.error(`Error creating event for date ${dateStr}:`, error);
+                                                    failedDates.push(dateStr);
+                                                }
+                                                dayCursor.setDate(dayCursor.getDate() + 1);
+                                            }
                                         }
 
                                         if (failedDates.length > 0) {
@@ -39367,7 +39489,7 @@
                                         setState({ crc_events: [...state.crc_events] });
                                         // Preserve scroll position before refreshing
                                         renderContentPreservingScroll();
-                                        const totalDays = (extendingSeriesForward ? existingSeriesDates.size : 1) + createdEvents.length;
+                                        const totalDays = Math.max(existingSeriesDates.size, 1) + createdEvents.length;
                                         showNotification(
                                             createdEvents.length
                                                 ? `Shift updated — added ${createdEvents.length} day(s). Now ${totalDays} day(s) in this series.`
@@ -39686,10 +39808,12 @@
                                         const payloadType = (isGroupEvent && existingGroupId)
                                             ? 'Site Assignment'
                                             : (isEditing && existingEvent ? existingEvent.type : data.eventType);
-                                        // Per-day grouped edits: force endDate = this day so denormalized series endDate cannot poison later saves.
+                                        const requestedEndStr = toDateOnlyString(endDateObj) || startDateStr;
+                                        // Per-day grouped edits: keep THIS row's date, but still honor an extended end
+                                        // by creating sibling days below (ensureSiteAssignmentDaysInRange).
                                         const saveEndDateStr = (isGroupEvent && existingGroupId && !applyToAllDays)
                                             ? startDateStr
-                                            : toDateOnlyString(endDateObj);
+                                            : requestedEndStr;
                                         const updatePayload = {
                                             ...baseEventData,
                                             // CRITICAL: Preserve the event ID and type to ensure it's an UPDATE, not a delete
@@ -40286,9 +40410,70 @@
                                             showNotification('Shift update did not save. The modal will stay open so you can retry.', 'error');
                                             return;
                                         }
+                                        // Safety net: if the form end date stretches past this row, create sibling days.
+                                        // Covers the path that used to only write endDate onto day 28 and hide the 29th.
+                                        let ensuredExtraDays = [];
+                                        if (
+                                            payloadType === 'Site Assignment'
+                                            && requestedEndStr
+                                            && startDateStr
+                                            && requestedEndStr > startDateStr
+                                            && typeof ensureSiteAssignmentDaysInRange === 'function'
+                                        ) {
+                                            let gid = updatedEvent.groupId || existingGroupId || existingEvent?.groupId || null;
+                                            if (!gid) {
+                                                gid = crypto.randomUUID();
+                                                try {
+                                                    const withGroup = await apiService.updateEvent(updatedEvent.id, {
+                                                        ...updatedEvent,
+                                                        groupId: gid,
+                                                        startDate: startDateStr,
+                                                        endDate: requestedEndStr,
+                                                        skipTravelDayProcessing: true
+                                                    });
+                                                    updatedEvent = (typeof mergeEventAssignmentFields === 'function')
+                                                        ? mergeEventAssignmentFields(withGroup || updatedEvent, { ...updatedEvent, groupId: gid })
+                                                        : { ...updatedEvent, ...(withGroup || {}), groupId: gid };
+                                                    const idxG = state.crc_events.findIndex((e) => e && e.id === updatedEvent.id);
+                                                    if (idxG !== -1) state.crc_events[idxG] = updatedEvent;
+                                                } catch (gErr) {
+                                                    console.error('Failed to attach groupId before ensure days', gErr);
+                                                }
+                                            }
+                                            if (gid) {
+                                                const ensured = await ensureSiteAssignmentDaysInRange({
+                                                    groupId: gid,
+                                                    rangeStart: startDateStr,
+                                                    rangeEnd: requestedEndStr,
+                                                    templatePayload: {
+                                                        ...updatePayload,
+                                                        groupId: gid,
+                                                        roleAssignments: finalRoleAssignments || updatedEvent.roleAssignments || {},
+                                                        trainingAssignments: updatePayload.trainingAssignments,
+                                                        roleQuantityOverrides: updatePayload.roleQuantityOverrides,
+                                                        skipTravelDayProcessing: true
+                                                    }
+                                                });
+                                                ensuredExtraDays = ensured.created || [];
+                                                if ((ensured.failed || []).length) {
+                                                    setState({ crc_events: [...state.crc_events] }, { skipRender: false });
+                                                    renderContentPreservingScroll();
+                                                    showNotification(
+                                                        `Shift saved, but could not create day(s): ${ensured.failed.join(', ')}. Modal stays open.`,
+                                                        'error'
+                                                    );
+                                                    return;
+                                                }
+                                            }
+                                        }
                                         setState({ crc_events: [...state.crc_events] }, { skipRender: false });
                                         renderContentPreservingScroll();
-                                        showNotification('Shift updated successfully!', 'success');
+                                        showNotification(
+                                            ensuredExtraDays.length
+                                                ? `Shift updated — added ${ensuredExtraDays.length} day(s): ${ensuredExtraDays.join(', ')}.`
+                                                : 'Shift updated successfully!',
+                                            'success'
+                                        );
                                         closeModal();
                                         // If manager just accepted a volunteer, prompt for travel
                                         const volunteerCrcIds = (existingEvent?.volunteerApplications && Array.isArray(existingEvent.volunteerApplications))
@@ -41180,13 +41365,13 @@
                             if (filteredSchedulingConflicts.length) {
                                 lines.push('Scheduling conflicts: ' + filteredSchedulingConflicts.map(c => {
                                     const crcName = state.crcs.find(x => x.id === c.crcId)?.name || c.crcId;
-                                    return `${crcName} (${c.period || 'Full Day'})`;
+                                    return `${crcName}${c.date ? ' on ' + c.date : ''} (${c.period || 'Full Day'})`;
                                 }).join(', '));
                             }
                             if (filteredSiteStudyConflicts.length) {
                                 lines.push('Site/study conflicts: ' + filteredSiteStudyConflicts.map(c => {
                                     const crcName = state.crcs.find(x => x.id === c.crcId)?.name || c.crcId;
-                                    return `${crcName} (already at ${c.siteName})`;
+                                    return `${crcName}${c.date ? ' on ' + c.date : ''} (already at ${c.siteName})`;
                                 }).join(', '));
                             }
                             if (duplicateRoleAssignments.length) {
