@@ -1632,11 +1632,27 @@
 
             const sanitizeEventsFromApi = (events, artemisStudyIdsSet) => {
                 const seenEventIds = new Set();
+                const normalizeEventDates = (event) => {
+                    if (!event || typeof event !== 'object') return event;
+                    const next = { ...event };
+                    const d = toDateOnlyString(parseDateFlexible(next.date || next.startDate))
+                        || String(next.date || '').slice(0, 10);
+                    if (d && /^\d{4}-\d{2}-\d{2}$/.test(d)) next.date = d;
+                    if (next.startDate) {
+                        const s = toDateOnlyString(parseDateFlexible(next.startDate)) || String(next.startDate).slice(0, 10);
+                        if (s && /^\d{4}-\d{2}-\d{2}$/.test(s)) next.startDate = s;
+                    }
+                    if (next.endDate) {
+                        const e = toDateOnlyString(parseDateFlexible(next.endDate)) || String(next.endDate).slice(0, 10);
+                        if (e && /^\d{4}-\d{2}-\d{2}$/.test(e)) next.endDate = e;
+                    }
+                    return next;
+                };
                 return Array.isArray(events) ? events.reduce((acc, event) => {
                     if (event.id && seenEventIds.has(event.id)) return acc;
                     if (event.id) seenEventIds.add(event.id);
                     if (event.type === 'Travel Day') {
-                        const normalizedEvent = { ...event };
+                        const normalizedEvent = normalizeEventDates({ ...event });
                         if (normalizedEvent.date) {
                             normalizedEvent.startDate = normalizedEvent.date;
                             normalizedEvent.endDate = normalizedEvent.date;
@@ -1652,17 +1668,25 @@
                         if (filteredIds.length === 0) {
                             // Keep saved Site Assignments even if the study is closed/missing
                             // from ARTEMIS — dropping them made weeks of schedule vanish.
-                            acc.push(event);
+                            acc.push(normalizeEventDates(event));
                             return acc;
                         }
                         if (filteredIds.length !== event.studyIds.length) {
-                            acc.push({ ...event, studyIds: filteredIds });
+                            acc.push(normalizeEventDates({ ...event, studyIds: filteredIds }));
                             return acc;
                         }
                     }
-                    acc.push(event);
+                    acc.push(normalizeEventDates(event));
                     return acc;
                 }, []) : [];
+            };
+
+            /** Calendar grids use strict date equality — always compare YYYY-MM-DD. */
+            const eventFallsOnDate = (event, dateStr) => {
+                if (!event || !dateStr) return false;
+                const d = toDateOnlyString(parseDateFlexible(event.date || event.startDate))
+                    || String(event.date || event.startDate || '').slice(0, 10);
+                return d === dateStr;
             };
 
             const mergeEventsById = (existing, incoming) => {
@@ -6602,22 +6626,28 @@
                 return saved;
             };
 
-            /** Create/upsert any missing Site Assignment rows for [rangeStart, rangeEnd] in a group. Never deletes. */
+            /** Create/upsert any missing Site Assignment rows for [rangeStart, rangeEnd] in a group. Never deletes.
+             *  Also merges roster onto existing same-group days that are empty shells (so the day actually shows staff). */
             const ensureSiteAssignmentDaysInRange = async ({ groupId, rangeStart, rangeEnd, templatePayload }) => {
                 const start = parseDateOnly(rangeStart);
                 const end = parseDateOnly(rangeEnd);
-                if (!groupId || !start || !end || end < start) return { created: [], failed: [] };
-                const existingDates = new Set(
-                    (state.crc_events || [])
-                        .filter((e) => e && e.type === 'Site Assignment' && e.groupId === groupId)
-                        .map((e) => toDateOnlyString(parseDateFlexible(e.date || e.startDate)))
-                        .filter(Boolean)
-                );
+                if (!groupId || !start || !end || end < start) {
+                    console.warn('[CHAOS ensureDays] skipped — missing groupId or invalid range', { groupId, rangeStart, rangeEnd });
+                    return { created: [], failed: [], merged: [] };
+                }
+                const templateRoles = (templatePayload && templatePayload.roleAssignments && typeof templatePayload.roleAssignments === 'object')
+                    ? templatePayload.roleAssignments
+                    : {};
+                const templateHasStaff = countAssignedCrcsOnEvent({ type: 'Site Assignment', roleAssignments: templateRoles }) > 0;
                 const created = [];
                 const failed = [];
+                const merged = [];
                 for (let d = new Date(start.getTime()); d <= end; d.setDate(d.getDate() + 1)) {
                     const dateStr = toDateOnlyString(d);
-                    if (existingDates.has(dateStr)) continue;
+                    const sameGroupRows = (state.crc_events || []).filter((e) =>
+                        e && e.type === 'Site Assignment' && e.groupId === groupId
+                        && (toDateOnlyString(parseDateFlexible(e.date || e.startDate)) === dateStr)
+                    );
                     const payload = {
                         ...templatePayload,
                         type: 'Site Assignment',
@@ -6625,12 +6655,37 @@
                         startDate: rangeStart,
                         endDate: rangeEnd,
                         groupId,
+                        roleAssignments: templateRoles,
                         skipTravelDayProcessing: true
                     };
                     delete payload.id;
                     try {
+                        if (sameGroupRows.length > 0) {
+                            // Day exists — if it's an empty shell and template has staff, push roster onto it.
+                            const keeper = sameGroupRows.reduce((best, row) => pickRicherSiteAssignment(best, row));
+                            const keeperStaff = countAssignedCrcsOnEvent(keeper);
+                            if (templateHasStaff && keeperStaff === 0) {
+                                const mergedPayload = {
+                                    ...keeper,
+                                    ...payload,
+                                    id: keeper.id,
+                                    groupId,
+                                    roleAssignments: templateRoles,
+                                    date: dateStr
+                                };
+                                const updated = await apiService.updateEvent(keeper.id, mergedPayload);
+                                const saved = (typeof mergeEventAssignmentFields === 'function')
+                                    ? mergeEventAssignmentFields(updated || mergedPayload, mergedPayload)
+                                    : (updated || mergedPayload);
+                                const idx = state.crc_events.findIndex((e) => e && e.id === keeper.id);
+                                if (idx !== -1) state.crc_events[idx] = saved;
+                                else addEventToState(saved);
+                                merged.push(dateStr);
+                                console.log('[CHAOS ensureDays] merged roster onto empty day', dateStr, keeper.id);
+                            }
+                            continue;
+                        }
                         // Prefer adopting a same-identity ghost on that day (any groupId) over creating a 2nd row
-                        // that collapse/display would hide — that was the "override hid the shift" bug.
                         const identityHits = (typeof findSiteAssignmentDuplicates === 'function')
                             ? findSiteAssignmentDuplicates(payload)
                             : [];
@@ -6642,9 +6697,9 @@
                                 ...payload,
                                 id: keeper.id,
                                 groupId,
-                                roleAssignments: (payload.roleAssignments && Object.keys(payload.roleAssignments).length > 0)
-                                    ? payload.roleAssignments
-                                    : (keeper.roleAssignments || payload.roleAssignments || {})
+                                roleAssignments: (templateHasStaff)
+                                    ? templateRoles
+                                    : (keeper.roleAssignments || templateRoles || {})
                             };
                             const updated = await apiService.updateEvent(keeper.id, mergedPayload);
                             saved = (typeof mergeEventAssignmentFields === 'function')
@@ -6653,31 +6708,38 @@
                             const idx = state.crc_events.findIndex((e) => e && e.id === keeper.id);
                             if (idx !== -1) state.crc_events[idx] = saved;
                             else addEventToState(saved);
-                            // Drop weaker same-identity extras from local state only (never cascade-delete from server here)
                             identityHits.forEach((row) => {
                                 if (row.id && row.id !== keeper.id) {
                                     state.crc_events = state.crc_events.filter((e) => e && e.id !== row.id);
                                 }
                             });
+                            created.push(dateStr);
+                            console.log('[CHAOS ensureDays] adopted ghost for', dateStr, keeper.id);
                         } else {
                             saved = await upsertSiteAssignmentByIdentity(payload);
-                        }
-                        if (saved && saved.id) {
-                            existingDates.add(dateStr);
-                            created.push(dateStr);
-                        } else {
-                            failed.push(dateStr);
+                            if (saved && saved.id) {
+                                // Force YYYY-MM-DD so weekly/monthly grids (e.date === dateStr) see it
+                                if (saved.date !== dateStr) {
+                                    saved = { ...saved, date: dateStr, startDate: rangeStart, endDate: rangeEnd };
+                                    const idx = state.crc_events.findIndex((e) => e && e.id === saved.id);
+                                    if (idx !== -1) state.crc_events[idx] = saved;
+                                }
+                                created.push(dateStr);
+                                console.log('[CHAOS ensureDays] created', dateStr, saved.id);
+                            } else {
+                                failed.push(dateStr);
+                            }
                         }
                     } catch (err) {
                         console.error('ensureSiteAssignmentDaysInRange failed for', dateStr, err);
                         failed.push(dateStr);
                     }
                 }
-                if (created.length || failed.length) {
+                if (created.length || failed.length || merged.length) {
                     if (typeof invalidateSiteAssignByDateCache === 'function') invalidateSiteAssignByDateCache();
                     setState({ crc_events: [...(state.crc_events || [])] }, { skipRender: true });
                 }
-                return { created, failed };
+                return { created, failed, merged };
             };
 
             /** CRC dashboard: show cancelled visits greyed out (still excluded from utilization via isCancelledShift). */
@@ -17202,7 +17264,7 @@
                     const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
                     const isToday = new Date().toDateString() === new Date(year, month, day).toDateString();
                     const dayClass = isToday ? 'bg-blue-50 dark:bg-blue-900/30' : 'bg-white dark:bg-gray-800';
-                    const todaysEvents = getDisplayEvents().filter(e => e.date === dateStr);
+                    const todaysEvents = getDisplayEvents().filter(e => (typeof eventFallsOnDate === 'function' ? eventFallsOnDate(e, dateStr) : e.date === dateStr));
                     
                     const uniqueIds = idField === 'studyIds'
                         ? [...new Set(todaysEvents.flatMap(e => e.studyIds || []))]
@@ -19511,7 +19573,7 @@
                 const dateStr = toDateOnlyString(day);
                 
                 // Filter events for the single day
-                let filteredEvents = getDisplayEvents().filter(e => e.date === dateStr);
+                let filteredEvents = getDisplayEvents().filter(e => (typeof eventFallsOnDate === 'function' ? eventFallsOnDate(e, dateStr) : e.date === dateStr));
                 // Exclude Time Off / PTO – they belong on the time off calendar, not the planning grid
                 filteredEvents = filteredEvents.filter(e =>
                     e.type !== 'Time Off' && e.type !== 'Paid Time Off' && e.type !== 'PTO' && e.type !== 'Unavailable' && e.type !== 'Sick Time'
@@ -27026,6 +27088,8 @@
                             <div>
                                 <label class="block text-sm font-medium dark:text-gray-300 mb-1">End Date</label>
                                 <input type="date" name="endDate" ${readOnly ? 'disabled readonly class="w-full p-2 border dark:border-gray-600 rounded bg-gray-100 dark:bg-gray-800 dark:text-gray-400 cursor-not-allowed"' : 'class="w-full p-2 border dark:border-gray-600 rounded bg-white dark:bg-gray-700 dark:text-white"'} value="${endDateValue}">
+                                ${!readOnly ? `<button type="button" data-action="extend-shift-end-one-day" class="mt-1 text-xs text-blue-600 dark:text-blue-400 hover:underline">+ Add next calendar day</button>
+                                <p class="text-[11px] text-gray-500 dark:text-gray-400 mt-0.5">End later than start creates a real row on each day (not just metadata).</p>` : ''}
                             </div>
                         </div>
                         ${isEditing && event?.groupId && !readOnly && (isMultiDayEvent || isGroupSeriesMultiDay) ? `
@@ -39092,17 +39156,23 @@
                                         oldEndDateStr = toDateOnlyString(oldEndDateObj || oldStartDateObj);
                                     }
                                     const newStartDateStr = toDateOnlyString(startDateObj);
-                                    const newEndDateStr = toDateOnlyString(endDateObj);
+                                    // Prefer live DOM values — FormData can be stale if date inputs changed after collection.
+                                    const liveEndRaw = form.querySelector('input[name="endDate"]')?.value || data.endDate;
+                                    const liveStartRaw = form.querySelector('input[name="startDate"]')?.value || data.startDate;
+                                    const liveEndObj = liveEndRaw ? parseDateOnly(liveEndRaw) : endDateObj;
+                                    const liveStartObj = liveStartRaw ? parseDateOnly(liveStartRaw) : startDateObj;
+                                    const newEndDateStr = toDateOnlyString(liveEndObj || endDateObj);
+                                    const effectiveStartStr = toDateOnlyString(liveStartObj || startDateObj) || newStartDateStr;
                                     
                                     // Check if date range has changed
                                     const dateRangeChanged = (
-                                        newStartDateStr !== oldStartDateStr ||
+                                        effectiveStartStr !== oldStartDateStr ||
                                         newEndDateStr !== oldEndDateStr
                                     );
                                     
                                     // Check if changing from single-day to multi-day (or vice versa)
                                     const wasSingleDay = oldStartDateStr === oldEndDateStr;
-                                    const isNowMultiDay = newStartDateStr !== newEndDateStr;
+                                    const isNowMultiDay = effectiveStartStr !== newEndDateStr;
                                     // HARD RULE: only multi-day *series* (2+ rows) need Apply-to-all to rewrite.
                                     // A single day that still has a groupId MUST be allowed to expand 28→29.
                                     const mayRewriteWholeGroup = !isGroupedMultiDaySeries || applyToAllDaysEarly;
@@ -39119,14 +39189,16 @@
                                     const extendingSeriesForward = isGroupedMultiDaySeries && !applyToAllDaysEarly
                                         && !!newEndDateStr && !!seriesMaxDay
                                         && newEndDateStr > seriesMaxDay
-                                        && newStartDateStr === oldStartDateStr;
-                                    // ANY end-date extension (single or multi) must append days — never delete/rewrite.
-                                    const onlyExtendingEnd = !!(
-                                        newStartDateStr && newEndDateStr
-                                        && newEndDateStr > (seriesMaxDay || oldEndDateStr || newStartDateStr)
-                                        && (newStartDateStr === oldStartDateStr || (isGroupedSeriesRow && !applyToAllDaysEarly && newStartDateStr === oldStartDateStr))
-                                    );
-                                    const shouldAppendDays = !!(changedToMultiDay || extendingSeriesForward || onlyExtendingEnd);
+                                        && effectiveStartStr === oldStartDateStr;
+                                    // HARD RULE: any form where End > Start MUST create the missing calendar days.
+                                    // This is the Ankita 28→29 path — previously end date was saved only as metadata.
+                                    const shouldAppendDays = !!(newEndDateStr && effectiveStartStr && newEndDateStr > effectiveStartStr);
+                                    console.log('[CHAOS date-save]', {
+                                        oldStartDateStr, oldEndDateStr,
+                                        effectiveStartStr, newEndDateStr,
+                                        shouldAppendDays, dateRangeChanged,
+                                        eventId, existingGroupId
+                                    });
                                     
                                     // Full rewrite only when shifting an existing multi-day range — NOT for single→multi expand
                                     // (that used to delete/recreate and often looked like override did nothing).
@@ -39367,11 +39439,11 @@
                                         }
                                         
                                         // Keep existing group when appending/extending; new group when converting lone single→multi
-                                        const newGroupId = (extendingSeriesForward || onlyExtendingEnd || (isGroupEvent && existingGroupId))
+                                        const newGroupId = (shouldAppendDays || (isGroupEvent && existingGroupId))
                                             ? (existingGroupId || existingEvent.groupId || crypto.randomUUID())
                                             : crypto.randomUUID();
                                         const existingSeriesDates = new Set(
-                                            ((extendingSeriesForward || onlyExtendingEnd) ? groupSeriesRows : (isGroupEvent ? groupSeriesRows : []))
+                                            (shouldAppendDays ? groupSeriesRows : (isGroupEvent ? groupSeriesRows : []))
                                                 .map(e => toDateOnlyString(parseDateFlexible(e.date || e.startDate)))
                                                 .filter(Boolean)
                                         );
@@ -39415,8 +39487,8 @@
                                             
                                             if (startTravelDateInput && startTravelDateInput.value) {
                                                 startTravelDateStr = startTravelDateInput.value;
-                                            } else if (newStartDateStr) {
-                                                const startDateObj = parseDateOnly(newStartDateStr);
+                                            } else if (effectiveStartStr) {
+                                                const startDateObj = parseDateOnly(effectiveStartStr);
                                                 if (startDateObj) {
                                                     const startTravelDate = new Date(startDateObj);
                                                     startTravelDate.setDate(startTravelDate.getDate() - 1);
@@ -39443,10 +39515,10 @@
                                             };
                                         }
                                         
-                                        const rowDateStr = toDateOnlyString(parseDateFlexible(existingEvent.date || existingEvent.startDate)) || newStartDateStr;
-                                        const seriesStartForPayload = (extendingSeriesForward || onlyExtendingEnd)
+                                        const rowDateStr = toDateOnlyString(parseDateFlexible(existingEvent.date || existingEvent.startDate)) || effectiveStartStr;
+                                        const seriesStartForPayload = shouldAppendDays
                                             ? (seriesSortedDays[0] || rowDateStr)
-                                            : newStartDateStr;
+                                            : effectiveStartStr;
                                         const updatePayload = {
                                             ...baseEventData,
                                             type: typeForMultiDay,
@@ -39458,7 +39530,7 @@
                                             trainingAssignments: (Object.keys(singleShiftTrainingAssignments).length > 0 ? singleShiftTrainingAssignments : (Object.keys(finalTrainingAssignments || {}).length > 0 ? finalTrainingAssignments : undefined)),
                                             roleQuantityOverrides: finalRoleQuantityOverrides,
                                             groupNumber: groupNumberValue,
-                                            date: (extendingSeriesForward || onlyExtendingEnd) ? rowDateStr : newStartDateStr,
+                                            date: shouldAppendDays ? rowDateStr : effectiveStartStr,
                                             startDate: seriesStartForPayload,
                                             endDate: newEndDateStr,
                                             groupId: newGroupId,
@@ -39485,9 +39557,9 @@
                                         // Create missing days in the new range (skip days that already exist in the series)
                                         // Use ensure/upsert so a ghost row on the new day gets the roster instead of being
                                         // silently dropped from local state (which looked like override hid the shift).
-                                        const ensureFrom = (extendingSeriesForward || onlyExtendingEnd)
-                                            ? (seriesMaxDay || rowDateStr || newStartDateStr)
-                                            : newStartDateStr;
+                                        const ensureFrom = shouldAppendDays
+                                            ? (seriesMaxDay || rowDateStr || effectiveStartStr)
+                                            : effectiveStartStr;
                                         const ensureTemplate = {
                                             ...baseEventData,
                                             type: typeForMultiDay,
@@ -39503,23 +39575,25 @@
                                         };
                                         let createdEvents = [];
                                         let failedDates = [];
+                                        let mergedDates = [];
                                         if (typeForMultiDay === 'Site Assignment' && typeof ensureSiteAssignmentDaysInRange === 'function') {
                                             const ensured = await ensureSiteAssignmentDaysInRange({
                                                 groupId: newGroupId,
-                                                rangeStart: seriesStartForPayload || newStartDateStr,
+                                                rangeStart: seriesStartForPayload || effectiveStartStr,
                                                 rangeEnd: newEndDateStr,
                                                 templatePayload: ensureTemplate
                                             });
                                             createdEvents = (ensured.created || []).map((dateStr) => ({ date: dateStr }));
                                             failedDates = ensured.failed || [];
+                                            mergedDates = ensured.merged || [];
                                         } else {
                                             const dayCursor = new Date(parseDateOnly(ensureFrom) || startDateObj);
-                                            if (!(extendingSeriesForward || onlyExtendingEnd)) {
+                                            if (!shouldAppendDays) {
                                                 // start at start; loop still skips existing
                                             } else {
                                                 dayCursor.setDate(dayCursor.getDate() + 1);
                                             }
-                                            while (dayCursor <= endDateObj) {
+                                            while (dayCursor <= (liveEndObj || endDateObj)) {
                                                 const dateStr = toDateOnlyString(dayCursor);
                                                 if (existingSeriesDates.has(dateStr) || dateStr === updatePayload.date) {
                                                     dayCursor.setDate(dayCursor.getDate() + 1);
@@ -39535,8 +39609,8 @@
                                                     const created = await apiService.createEvent(eventPayload);
                                                     const saved = requireCreatedEvent(created, 'shift');
                                                     const merged = typeof mergeEventAssignmentFields === 'function' ? mergeEventAssignmentFields(saved, eventPayload) : saved;
-                                                    createdEvents.push(merged);
-                                                    addEventToState(merged);
+                                                    createdEvents.push({ ...merged, date: dateStr });
+                                                    addEventToState({ ...merged, date: dateStr });
                                                 } catch (error) {
                                                     console.error(`Error creating event for date ${dateStr}:`, error);
                                                     failedDates.push(dateStr);
@@ -39558,14 +39632,16 @@
                                         setState({ crc_events: [...state.crc_events] });
                                         // Preserve scroll position before refreshing
                                         renderContentPreservingScroll();
+                                        const addedCount = createdEvents.length + mergedDates.length;
                                         const totalDays = Math.max(existingSeriesDates.size, 1) + createdEvents.length;
                                         showNotification(
-                                            createdEvents.length
-                                                ? `Shift updated — added ${createdEvents.length} day(s). Now ${totalDays} day(s) in this series.`
+                                            addedCount
+                                                ? `Shift updated — ${createdEvents.length ? 'added ' + createdEvents.map(e => e.date).join(', ') : ''}${mergedDates.length ? (createdEvents.length ? '; ' : '') + 'filled ' + mergedDates.join(', ') : ''}. Now ${totalDays} day(s) in this series.`
                                                 : 'Shift updated successfully!',
                                             'success'
                                         );
                                         closeModal();
+                                        return;
                                     } else if (changedFromMultiDay && isGroupEvent) {
                                         // Changing from multi-day to single-day - delete other events in the group
                                         const groupEvents = state.crc_events.filter(e => 
