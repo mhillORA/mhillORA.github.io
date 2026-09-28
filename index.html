@@ -8463,6 +8463,11 @@
                 if (tabId === 'travelOnly') return canAccessTab('travel');
                 // CRC View tab: only Manager and Admin (so they can preview CRC experience without getting stuck)
                 if (tabId === 'crcPreview') return !!(state.currentUser && (isAdminUser() || getEffectivePermissionLevel() === 'Manager'));
+                // React Lab: Manager/Admin only, and only when explicitly enabled in this browser
+                if (tabId === 'reactLab') {
+                    if (!(state.currentUser && (isAdminUser() || getEffectivePermissionLevel() === 'Manager'))) return false;
+                    try { return localStorage.getItem('chaos_react_lab') === '1'; } catch (_) { return false; }
+                }
                 
                 const permissions = getUserPermissions();
                 if (!permissions) return false;
@@ -8489,6 +8494,56 @@
                 // Check permission set
                 if (permissions.tabs === 'all') return true;
                 return Array.isArray(permissions.tabs) && permissions.tabs.includes(tabId);
+            };
+
+            const isReactLabEnabledInBrowser = () => {
+                try { return localStorage.getItem('chaos_react_lab') === '1'; } catch (_) { return false; }
+            };
+
+            const setReactLabEnabledInBrowser = (enabled) => {
+                try {
+                    if (enabled) localStorage.setItem('chaos_react_lab', '1');
+                    else localStorage.removeItem('chaos_react_lab');
+                } catch (_) { /* ignore */ }
+            };
+
+            /** Bridge so the React Lab module can read live CHAOS state without mutating production UI. */
+            const ensureChaosReactLabBridge = () => {
+                window.__CHAOS_REACT_LAB__ = {
+                    getSnapshot: () => {
+                        const monthKey = typeof getScheduleMonthKey === 'function'
+                            ? getScheduleMonthKey(state.crcCalendarDate)
+                            : '';
+                        const [y, m] = (monthKey || '').split('-').map(Number);
+                        const monthStart = (y && m) ? `${y}-${String(m).padStart(2, '0')}-01` : null;
+                        const monthEnd = (y && m) ? (() => {
+                            const last = new Date(y, m, 0);
+                            return typeof toDateOnlyString === 'function' ? toDateOnlyString(last) : null;
+                        })() : null;
+                        const raw = (typeof getDisplayEvents === 'function' ? getDisplayEvents() : state.crc_events) || [];
+                        const events = raw.filter((e) => {
+                            if (!e || e.type !== 'Site Assignment') return false;
+                            if (typeof isCancelledShift === 'function' && isCancelledShift(e)) return false;
+                            const d = String(e.date || e.startDate || '').slice(0, 10);
+                            if (!monthStart || !monthEnd) return true;
+                            return d >= monthStart && d <= monthEnd;
+                        });
+                        return {
+                            monthKey,
+                            calendarDate: state.crcCalendarDate,
+                            events: events.map((e) => ({ ...e })),
+                            sites: (state.crc_sites || []).map((s) => ({ id: s.id, name: s.name })),
+                            studies: (state.studies || []).map((s) => ({ id: s.id, title: s.title || s.name, name: s.name })),
+                            crcs: (state.crcs || []).map((c) => ({ id: c.id, name: c.name })),
+                            resolveStaffNames: (event) => {
+                                if (typeof getEventCRCs === 'function') {
+                                    return getEventCRCs(event).map((c) => c.name).filter(Boolean);
+                                }
+                                return [];
+                            }
+                        };
+                    }
+                };
             };
             
             const canAccessStudy = (studyId) => {
@@ -9092,6 +9147,7 @@
                     tabs.push({ id: 'users', label: 'Users' });
                     tabs.push({ id: 'allSchedule', label: 'Backend - Admin Only' });
                     tabs.push({ id: 'crcPreview', label: 'CRC View' });
+                    if (canAccessTab('reactLab')) tabs.push({ id: 'reactLab', label: 'React Lab' });
                 } else {
                     // For CRC users, customize their tab access
                     if (state.currentUser && getEffectivePermissionLevel() === 'CRC') {
@@ -9112,6 +9168,7 @@
                         tabs.push({ id: 'users', label: 'Users' });
                         tabs.push({ id: 'allSchedule', label: 'Backend - Admin Only' });
                         tabs.push({ id: 'crcPreview', label: 'CRC View' });
+                        if (canAccessTab('reactLab')) tabs.push({ id: 'reactLab', label: 'React Lab' });
                     }
                 }
                 
@@ -9945,6 +10002,31 @@
                     mainAppContent.innerHTML = getUnfilledShiftsHTML();
                     mainAppContent.className = 'w-full';
                     renderUnfilledShiftsContent();
+                } else if (state.activeTab === 'reactLab') {
+                    if (!(isAdminUser() || getEffectivePermissionLevel() === 'Manager') || !canAccessTab('reactLab')) {
+                        setState({ activeTab: 'scheduler' });
+                        return;
+                    }
+                    _lastRenderedTab = 'reactLab';
+                    mainAppContent.className = 'w-full';
+                    mainAppContent.innerHTML = `
+                        <div class="w-full max-w-5xl mx-auto">
+                            <div id="react-lab-root" class="min-h-[320px]"></div>
+                        </div>
+                    `;
+                    ensureChaosReactLabBridge();
+                    import('/react-lab/app.js')
+                        .then((mod) => {
+                            const root = document.getElementById('react-lab-root');
+                            if (root && typeof mod.mountReactLab === 'function') mod.mountReactLab(root);
+                        })
+                        .catch((err) => {
+                            console.error('React Lab failed to load:', err);
+                            const root = document.getElementById('react-lab-root');
+                            if (root) {
+                                root.innerHTML = `<div class="p-4 rounded-md bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-300 text-sm">Failed to load React Lab: ${String(err?.message || err)}</div>`;
+                            }
+                        });
                 }
                 if (pendingInitialTabPaint && !tabNeedsSchedulePaintBeforeReveal()) {
                     afterNextPaint(() => markInitialTabContentReady());
@@ -11715,6 +11797,16 @@
             document.addEventListener('keydown', (e) => {
                 if (e.key === 'Escape' && modalContainer && !modalContainer.classList.contains('hidden')) {
                     closeModal();
+                }
+                // Ctrl+Shift+L — toggle React Lab (Manager/Admin only)
+                if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'L' || e.key === 'l')) {
+                    if (!(state.currentUser && (isAdminUser() || getEffectivePermissionLevel() === 'Manager'))) return;
+                    e.preventDefault();
+                    const next = !isReactLabEnabledInBrowser();
+                    setReactLabEnabledInBrowser(next);
+                    showNotification(next ? 'React Lab enabled — find it in the Menu.' : 'React Lab hidden.', 'success');
+                    if (typeof renderNav === 'function') renderNav();
+                    if (next) setState({ activeTab: 'reactLab' });
                 }
             });
 
@@ -24104,7 +24196,16 @@
                                 </div>
                             </form>
                         </div>
-                        ${isManager ? `
+                        ${isManager || (typeof isAdminUser === 'function' && isAdminUser()) ? `
+                            <div class="border-t dark:border-gray-700 pt-6">
+                                <h3 class="text-lg font-semibold dark:text-white mb-4">React Lab (experimental)</h3>
+                                <p class="text-sm text-gray-600 dark:text-gray-400 mb-3">Hidden sandbox that re-renders the current month’s schedule in React. Production scheduler is unchanged. This browser only.</p>
+                                <label class="flex items-center gap-2 text-sm text-gray-800 dark:text-gray-200 cursor-pointer">
+                                    <input type="checkbox" id="chaos-react-lab-toggle" class="rounded border-gray-300" ${isReactLabEnabledInBrowser() ? 'checked' : ''}>
+                                    Show <strong>React Lab</strong> in the menu
+                                </label>
+                                <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">Shortcut: Ctrl+Shift+L</p>
+                            </div>
                             <div class="border-t dark:border-gray-700 pt-6">
                                 <h3 class="text-lg font-semibold dark:text-white mb-4">Azure Maps usage</h3>
                                 <p class="text-sm text-gray-600 dark:text-gray-400 mb-3">Controls interactive map tiles and driving-route API calls (biggest cost drivers). Geocoding still runs when needed and is cached.</p>
@@ -32676,6 +32777,19 @@
                                     }
                                 });
                             }
+                            const reactLabToggle = document.getElementById('chaos-react-lab-toggle');
+                            if (reactLabToggle) {
+                                reactLabToggle.addEventListener('change', () => {
+                                    setReactLabEnabledInBrowser(!!reactLabToggle.checked);
+                                    showNotification(
+                                        reactLabToggle.checked
+                                            ? 'React Lab enabled — open it from the Menu.'
+                                            : 'React Lab hidden from the Menu.',
+                                        'success'
+                                    );
+                                    if (typeof renderNav === 'function') renderNav();
+                                });
+                            }
                         }, 100);
                         break;
                     }
@@ -37953,8 +38067,16 @@
                                     // Skip SITE_STAFF and UNASSIGNED - can be used unlimited times
                                     if (!crcId || crcId === 'SITE_STAFF' || crcId === 'UNASSIGNED') return;
                                     const existingEvents = state.crc_events.filter(event => {
-                                        if (!event || event.crcId !== crcId) return false;
-                                        if (event.date !== dateStr) return false;
+                                        if (!event) return false;
+                                        if (event.date !== dateStr && String(event.date || '').slice(0, 10) !== dateStr) {
+                                            const ed = toDateOnlyString(parseDateFlexible(event.date || event.startDate));
+                                            if (ed !== dateStr) return false;
+                                        }
+                                        // Match how the calendar shows staff (roleAssignments), not stale crcId ghosts
+                                        const onShift = (event.type === 'Site Assignment')
+                                            ? (typeof siteAssignmentListsCrc === 'function' && siteAssignmentListsCrc(event, crcId))
+                                            : (event.crcId === crcId || (Array.isArray(event.crcIds) && event.crcIds.includes(crcId)));
+                                        if (!onShift) return false;
                                         // For Travel Day events, only check conflicts with Site Assignment and Open Shift (allow same day as shifts)
                                         if (eventType === 'Travel Day') {
                                             if (!['Site Assignment', 'Open Shift'].includes(event.type)) return false;
@@ -38006,11 +38128,11 @@
                                     // Exclude current event and events in same group when editing
                                     if (excludeEventId && event.id === excludeEventId) return false;
                                     if (excludeGroupEventIds.includes(event.id)) return false;
-                                    
-                                    return event.crcId === crcId &&
-                                        event.date === startDateStr &&
-                                        event.type === 'Site Assignment' &&
-                                        (event.siteId !== selectedSiteId || !event.studyIds || !event.studyIds.some(sid => selectedStudyIds.includes(sid)));
+                                    if (event.type !== 'Site Assignment') return false;
+                                    const eventDate = toDateOnlyString(parseDateFlexible(event.date || event.startDate)) || String(event.date || '').slice(0, 10);
+                                    if (eventDate !== startDateStr) return false;
+                                    if (!siteAssignmentListsCrc(event, crcId)) return false;
+                                    return (event.siteId !== selectedSiteId || !event.studyIds || !event.studyIds.some(sid => selectedStudyIds.includes(sid)));
                                 });
                                 
                                 if (conflictingEvents.length > 0) {
@@ -38821,11 +38943,23 @@
                                     // Check if changing from single-day to multi-day (or vice versa)
                                     const wasSingleDay = oldStartDateStr === oldEndDateStr;
                                     const isNowMultiDay = newStartDateStr !== newEndDateStr;
-                                    // HARD RULE: grouped one-row-per-day shifts never cascade-delete
-                                    // sibling days unless Apply to all days is checked.
-                                    const mayRewriteWholeGroup = !isGroupedSeriesRow || applyToAllDaysEarly;
+                                    // HARD RULE: only multi-day *series* (2+ rows) need Apply-to-all to rewrite.
+                                    // A single day that still has a groupId MUST be allowed to expand 28→29.
+                                    const mayRewriteWholeGroup = !isGroupedMultiDaySeries || applyToAllDaysEarly;
                                     const changedToMultiDay = wasSingleDay && isNowMultiDay && mayRewriteWholeGroup;
                                     const changedFromMultiDay = !wasSingleDay && !isNowMultiDay && mayRewriteWholeGroup;
+
+                                    // Extending a multi-day series without Apply-to-all: append missing days after
+                                    // the series max (do not rewrite / delete existing days).
+                                    const seriesSortedDays = (groupSeriesRows || [])
+                                        .map(e => toDateOnlyString(parseDateFlexible(e.date || e.startDate)))
+                                        .filter(Boolean)
+                                        .sort();
+                                    const seriesMaxDay = seriesSortedDays.length ? seriesSortedDays[seriesSortedDays.length - 1] : oldEndDateStr;
+                                    const extendingSeriesForward = isGroupedMultiDaySeries && !applyToAllDaysEarly
+                                        && !!newEndDateStr && !!seriesMaxDay
+                                        && newEndDateStr > seriesMaxDay
+                                        && newStartDateStr === oldStartDateStr;
                                     
                                     // If it's a group event and the date range has changed, we need to handle the group
                                     if (isGroupEvent && dateRangeChanged && mayRewriteWholeGroup) {
@@ -39029,8 +39163,8 @@
                                         renderContentPreservingScroll();
                                         showNotification(`Shift updated successfully! ${createdEvents.length} day(s) scheduled.`, 'success');
                                         closeModal();
-                                    } else if (changedToMultiDay) {
-                                        // Changing from single-day to multi-day - create additional events
+                                    } else if (changedToMultiDay || extendingSeriesForward) {
+                                        // Expand range: either single→multi, or append days onto an existing series.
                                         // Preserve shift type when editing so we never turn a shift into travel
                                         const typeForMultiDay = isEditing && existingEvent ? existingEvent.type : data.eventType;
                                         const roles = crcIds.length > 0 ? formData.getAll(`roles-${crcIds[0]}`) : [];
@@ -39064,8 +39198,15 @@
                                             }
                                         }
                                         
-                                        // Create a new groupId for the multi-day event
-                                        const newGroupId = crypto.randomUUID();
+                                        // Keep existing group when appending days; new group when converting single→multi
+                                        const newGroupId = extendingSeriesForward
+                                            ? (existingGroupId || existingEvent.groupId || crypto.randomUUID())
+                                            : crypto.randomUUID();
+                                        const existingSeriesDates = new Set(
+                                            (extendingSeriesForward ? groupSeriesRows : [])
+                                                .map(e => toDateOnlyString(parseDateFlexible(e.date || e.startDate)))
+                                                .filter(Boolean)
+                                        );
                                         
                                         // Update the existing event to be part of the group
                                         // Collect travel day preferences from form
@@ -39130,6 +39271,7 @@
                                             };
                                         }
                                         
+                                        const rowDateStr = toDateOnlyString(parseDateFlexible(existingEvent.date || existingEvent.startDate)) || newStartDateStr;
                                         const updatePayload = {
                                             ...baseEventData,
                                             type: typeForMultiDay,
@@ -39141,8 +39283,8 @@
                                             trainingAssignments: (Object.keys(singleShiftTrainingAssignments).length > 0 ? singleShiftTrainingAssignments : (Object.keys(finalTrainingAssignments || {}).length > 0 ? finalTrainingAssignments : undefined)),
                                             roleQuantityOverrides: finalRoleQuantityOverrides,
                                             groupNumber: groupNumberValue,
-                                            date: newStartDateStr,
-                                            startDate: newStartDateStr,
+                                            date: extendingSeriesForward ? rowDateStr : newStartDateStr,
+                                            startDate: extendingSeriesForward ? (seriesSortedDays[0] || rowDateStr) : newStartDateStr,
                                             endDate: newEndDateStr,
                                             groupId: newGroupId,
                                             // CRITICAL: Always preserve travelDayPreferences, even if empty, to maintain checkbox state
@@ -39165,14 +39307,20 @@
                                             state.crc_events[eventIndex] = updatedEvent;
                                         }
                                         
-                                        // Create events for additional days (skip the first day since we already updated it)
-                                        const dayCursor = new Date(startDateObj);
-                                        dayCursor.setDate(dayCursor.getDate() + 1); // Start from the second day
+                                        // Create missing days in the new range (skip days that already exist in the series)
+                                        const dayCursor = new Date(extendingSeriesForward
+                                            ? (parseDateOnly(seriesMaxDay) || startDateObj)
+                                            : startDateObj);
+                                        dayCursor.setDate(dayCursor.getDate() + 1);
                                         const createdEvents = [];
                                         const failedDates = [];
                                         
                                         while (dayCursor <= endDateObj) {
                                             const dateStr = toDateOnlyString(dayCursor);
+                                            if (existingSeriesDates.has(dateStr) || dateStr === updatePayload.date) {
+                                                dayCursor.setDate(dayCursor.getDate() + 1);
+                                                continue;
+                                            }
                                             const eventPayload = {
                                                 ...baseEventData,
                                                 type: typeForMultiDay,
@@ -39186,7 +39334,7 @@
                                                 roleQuantityOverrides: finalRoleQuantityOverrides,
                                                 groupNumber: groupNumberValue,
                                                 date: dateStr,
-                                                startDate: newStartDateStr,
+                                                startDate: updatePayload.startDate,
                                                 endDate: newEndDateStr,
                                                 groupId: newGroupId,
                                                 skipTravelDayProcessing: true
@@ -39210,7 +39358,7 @@
                                             setState({ crc_events: [...state.crc_events] });
                                             renderContentPreservingScroll();
                                             showNotification(
-                                                `The first day and ${createdEvents.length} additional day(s) saved, but these dates failed: ${failedDates.join(', ')}. Modal stays open so you can retry.`,
+                                                `Saved the edited day and ${createdEvents.length} additional day(s), but these dates failed: ${failedDates.join(', ')}. Modal stays open so you can retry.`,
                                                 'error'
                                             );
                                             return;
@@ -39219,7 +39367,13 @@
                                         setState({ crc_events: [...state.crc_events] });
                                         // Preserve scroll position before refreshing
                                         renderContentPreservingScroll();
-                                        showNotification(`Shift updated successfully! Now scheduled for ${createdEvents.length + 1} day(s).`, 'success');
+                                        const totalDays = (extendingSeriesForward ? existingSeriesDates.size : 1) + createdEvents.length;
+                                        showNotification(
+                                            createdEvents.length
+                                                ? `Shift updated — added ${createdEvents.length} day(s). Now ${totalDays} day(s) in this series.`
+                                                : 'Shift updated successfully!',
+                                            'success'
+                                        );
                                         closeModal();
                                     } else if (changedFromMultiDay && isGroupEvent) {
                                         // Changing from multi-day to single-day - delete other events in the group
@@ -41021,47 +41175,40 @@
                         };
                         
                         if (needsOverride) {
-                            openModal(`
-                                <h3 class="text-xl font-bold text-yellow-500 mb-4">Override Required</h3>
-                                <div class="space-y-2 dark:text-gray-300 mb-4">
-                                    ${filteredSchedulingConflicts.length ? `<div><strong>Scheduling Conflicts:</strong> ${filteredSchedulingConflicts.map(c => {
-                                        const crcName = state.crcs.find(x=>x.id===c.crcId)?.name || c.crcId;
-                                        const periodText = c.period ? (c.period === 'Full Day' ? 'Full Day' : c.period) : 'Unavailable';
-                                        return `${crcName} (${periodText})`;
-                                    }).join(', ')}</div>` : ''}
-                                    ${filteredSiteStudyConflicts.length ? `<div><strong>Site/Study Conflicts:</strong> ${filteredSiteStudyConflicts.map(c => {
-                                        const crcName = state.crcs.find(x=>x.id===c.crcId)?.name || c.crcId;
-                                        return `${crcName} (already at ${c.siteName})`;
-                                    }).join(', ')}</div>` : ''}
-                                    ${duplicateRoleAssignments.length ? `<div><strong>Duplicate Role Assignments:</strong> ${duplicateRoleAssignments.map(c => {
-                                        const crcName = state.crcs.find(x=>x.id===c.crcId)?.name || c.crcId;
-                                        const roleCounts = c.roles.reduce((acc, role) => {
-                                            acc[role] = (acc[role] || 0) + 1;
-                                            return acc;
-                                        }, {});
-                                        const roleSummary = Object.entries(roleCounts).map(([roleName, count]) => `${roleName}${count > 1 ? ` x${count}` : ''}`).join(', ');
-                                        return `${crcName} (${roleSummary})`;
-                                    }).join('; ')}</div>` : ''}
-                                    ${filteredDuplicateDayAssignments.length ? `<div><strong>Existing Assignments:</strong> ${filteredDuplicateDayAssignments.map(c => {
-                                        const crcName = state.crcs.find(x=>x.id===c.crcId)?.name || c.crcId;
-                                        const formattedDate = new Date(c.date + 'T00:00:00').toLocaleDateString();
-                                        const eventSummary = c.events.map(ev => {
-                                            const siteName = state.crc_sites.find(s => s.id === ev.siteId)?.name;
-                                            const rolesText = (ev.roles && ev.roles.length) ? ` (${ev.roles.join(', ')})` : '';
-                                            return `${ev.type}${siteName ? ` at ${siteName}` : ''}${rolesText}`;
-                                        }).join('; ');
-                                        return `${crcName} on ${formattedDate}: ${eventSummary}`;
-                                    }).join(' | ')}</div>` : ''}
-                                </div>
-                                <p class="dark:text-gray-300 mb-6">These staff members have conflicts. Proceed and override these conflicts?</p>
-                                <div class="flex justify-end gap-4">
-                                    <button data-action="close-modal" class="py-2 px-4 rounded-md bg-gray-200 dark:bg-gray-600">Cancel</button>
-                                    <button id="confirm-override-btn" class="py-2 px-4 rounded-md bg-yellow-600 text-white hover:bg-yellow-700">Confirm & Schedule</button>
-                                </div>
-                            `);
-                            document.getElementById('confirm-override-btn').onclick = () => processSubmit(true);
+                            // Do NOT openModal() here — that destroys #crc-event-form and made Confirm a no-op.
+                            const lines = [];
+                            if (filteredSchedulingConflicts.length) {
+                                lines.push('Scheduling conflicts: ' + filteredSchedulingConflicts.map(c => {
+                                    const crcName = state.crcs.find(x => x.id === c.crcId)?.name || c.crcId;
+                                    return `${crcName} (${c.period || 'Full Day'})`;
+                                }).join(', '));
+                            }
+                            if (filteredSiteStudyConflicts.length) {
+                                lines.push('Site/study conflicts: ' + filteredSiteStudyConflicts.map(c => {
+                                    const crcName = state.crcs.find(x => x.id === c.crcId)?.name || c.crcId;
+                                    return `${crcName} (already at ${c.siteName})`;
+                                }).join(', '));
+                            }
+                            if (duplicateRoleAssignments.length) {
+                                lines.push('Duplicate role assignments: ' + duplicateRoleAssignments.map(c => {
+                                    const crcName = state.crcs.find(x => x.id === c.crcId)?.name || c.crcId;
+                                    return crcName;
+                                }).join(', '));
+                            }
+                            if (filteredDuplicateDayAssignments.length) {
+                                lines.push('Existing assignments: ' + filteredDuplicateDayAssignments.map(c => {
+                                    const crcName = state.crcs.find(x => x.id === c.crcId)?.name || c.crcId;
+                                    return `${crcName} on ${c.date}`;
+                                }).join(', '));
+                            }
+                            const proceed = window.confirm(
+                                `Override required\n\n${lines.join('\n')}\n\nProceed and override these conflicts?`
+                            );
+                            if (proceed) {
+                                await processSubmit(true);
+                            }
                         } else {
-                            processSubmit(false);
+                            await processSubmit(false);
                         }
                         break;
                     }
