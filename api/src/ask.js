@@ -1159,15 +1159,18 @@ async function fromProjectContext(question, projectNumber) {
   const wantSites = /(site|investigator)/.test(t) && (sites.length || investigators.length);
   const wantClinical = /(enroll|study|psm|screen fail|indication|lifecycle)/.test(t) && studies.length;
   const wantIntel =
-    /(bva|% complete|percent complete|realization|inv fee|investigator fee|ptc|budgeted hours|study intel)/.test(
+    /(bva|% complete|percent complete|realization|inv fee|investigator fee|ptc|oopc|budgeted hours|study intel)/.test(
       t
     ) && studyIntel.length;
+  const wantPayment =
+    /(payment position|forecast|eac|earned vs billed|remaining to bill|pricing pool)/.test(t);
   const wantGm = /(\bgm\b|gross margin|change order|profitability|budgeted gm)/.test(t) && jobs.length;
-  const focused = wantSites || wantClinical || wantIntel || wantGm;
+  const focused = wantSites || wantClinical || wantIntel || wantGm || wantPayment;
 
   if (depth === "short") return buildStudyShort(question, projectNumber, bundle);
-  if (depth === "dossier" || depth === "long" || !focused) {
-    return buildStudyDossier(question, projectNumber, bundle, depth || "dossier");
+  // Forecast / payment / full packs always use the dossier (includes PTC/OOPC EAC tables)
+  if (depth === "dossier" || depth === "long" || wantPayment || !focused) {
+    return buildStudyDossier(question, projectNumber, bundle, depth || (wantPayment ? "long" : "dossier"));
   }
 
   if (wantSites && (investigators.length || sites.length) && /investigator|\bpi\b/.test(t)) {
