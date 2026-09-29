@@ -752,13 +752,84 @@ async function getBriefing() {
 async function fromProjectContext(question, projectNumber) {
   const bundle = await getProjectBundle(projectNumber);
   const jobs = bundle.jobs || [];
+  const studyIntel = bundle.studyIntel || [];
   const studies = bundle.studies || [];
   const sites = bundle.sites || [];
-  if (!jobs.length && !studies.length) return null;
+  if (!jobs.length && !studies.length && !studyIntel.length) return null;
 
   const t = String(question || "").toLowerCase();
   const wantSites = /(site|investigator)/.test(t) && sites.length;
   const wantClinical = /(enroll|study|psm|screen fail|indication|lifecycle)/.test(t) && studies.length;
+  const wantIntel =
+    /(bva|% complete|percent complete|realization|inv fee|investigator fee|ptc|budgeted hours|study intel)/.test(
+      t
+    ) && studyIntel.length;
+
+  if (wantIntel || (!wantSites && !wantClinical && studyIntel.length && !jobs.length)) {
+    const row = studyIntel[0];
+    return stamp(
+      {
+        q: question,
+        needs: ["nsstudy", "ora"],
+        icon: "chart",
+        summary: `${row.project_number} · ${row.project_name || "study"} · budgeted ${
+          row.total_budgeted != null ? row.total_budgeted : "—"
+        } hrs · actual ${row.total_actual != null ? row.total_actual : "—"} · % complete ${
+          row.percent_complete != null ? Math.round(row.percent_complete * 100) + "%" : "—"
+        }. ${bundle.join.note}`,
+        chartTitle: `Study intel · ${projectNumber}`,
+        chartNote: "ora_ns_study · YY-DEPT-SEQ · read-only",
+        chartType: "bar",
+        bars: [
+          {
+            label: "Budgeted hrs",
+            pct: 100,
+            value: row.total_budgeted != null ? String(row.total_budgeted) : "—",
+            color: "#052c49"
+          },
+          {
+            label: "Actual hrs",
+            pct:
+              row.total_budgeted && row.total_actual != null
+                ? Math.min(100, Math.round((row.total_actual / row.total_budgeted) * 100))
+                : 50,
+            value: row.total_actual != null ? String(row.total_actual) : "—",
+            color: "#ed1c24"
+          }
+        ],
+        tableTitle: "NetSuite study intel",
+        grid: "1fr 1fr 1fr 1fr",
+        cols: ["Metric", "Value", "Inv fee budget", "PTC budget"],
+        rows: [
+          [
+            "% complete",
+            row.percent_complete != null ? `${Math.round(row.percent_complete * 100)}%` : "—",
+            row.inv_fee_budget != null ? String(row.inv_fee_budget) : "—",
+            row.ptc_budget != null ? String(row.ptc_budget) : "—"
+          ],
+          [
+            "Realization",
+            row.realization_rate != null ? `${Math.round(row.realization_rate * 100)}%` : "—",
+            "—",
+            "—"
+          ]
+        ],
+        caveat: bundle.join.note,
+        trace: [
+          `Read ora_ns_study for project_number = ${projectNumber} (YY-DEPT-SEQ).`,
+          `Joined to ora_veeva_study.study_number when present. Did not write.`
+        ],
+        query: `ora_ns_study + veeva join (${projectNumber})`,
+        confidence: studies.length ? "high" : "medium",
+        followUps: [
+          `What is GM on ${projectNumber}?`,
+          `Show sites for ${projectNumber}`,
+          `Enrollment on ${projectNumber}`
+        ]
+      },
+      asOfMeta(studyIntel)
+    );
+  }
 
   if (wantSites) {
     const known = sites.filter((s) => s.enrolled != null);

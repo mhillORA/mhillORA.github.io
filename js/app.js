@@ -12,9 +12,13 @@
       imednet: false,
       medidata: false,
       insightsrm: false,
-      netsuite: true
+      netsuite: true,
+      nsstudy: true
     },
     briefing: null,
+    syncStatus: null,
+    syncStatusError: "",
+    syncStatusBusy: false,
     finance: null,
     pipeline: null,
     scopeBoost: [],
@@ -99,6 +103,7 @@
   function guessKey(text) {
     const t = (text || "").toLowerCase();
     if (/\b(netsuite|profitability|gross margin|\bgm\b|budgeted gm|change order|billable)\b/.test(t)) return "netsuite";
+    if (/\b(study intel|ora_ns_study|investigator fee|inv fee|ptc budget|bva|% complete)\b/.test(t)) return "nsstudy";
     if (/\b(pipeline|opportunit|net revenue|open deals|\bsalesforce\b|\bsf\b|ora net)\b/.test(t)) return "pipeline";
     if (/\b(sites?|investigator|scorecard|site psm)\b/.test(t) && !/\bvisits?\b/.test(t)) return "sites";
     const competitive = ["competitor", "sponsor", "registry", "market", "poland", "cac", "bid", "trialhub", "ct.gov"];
@@ -111,7 +116,8 @@
   /** Purpose sets defaults; question intent can pull in other loaded packs (e.g. GM → NetSuite on ClinOps). */
   function intentSourceIds(question) {
     const key = guessKey(question);
-    if (key === "netsuite") return ["netsuite", "ora"];
+    if (key === "netsuite") return ["netsuite", "nsstudy", "ora"];
+    if (key === "nsstudy") return ["nsstudy", "netsuite", "ora", "veeva"];
     if (key === "pipeline") return ["salesforce"];
     if (key === "staffing") return ["insightsrm"];
     if (key === "competitive") return ["ctgov", "trialhub"];
@@ -233,6 +239,7 @@
       save("odl.purpose", "staffing");
       loadRmPeople();
     }
+    if (key === "sources") loadSyncStatus();
     render();
   }
 
@@ -394,6 +401,7 @@
     if (state.phase === "project" && state.project) {
       const ids = [];
       if (state.project.jobs && state.project.jobs.length) ids.push("netsuite");
+      if (state.project.studyIntel && state.project.studyIntel.length) ids.push("nsstudy");
       if ((state.project.studies && state.project.studies.length) || (state.project.sites && state.project.sites.length)) {
         ids.push("ora");
       }
@@ -948,9 +956,10 @@
     }
 
     const p = state.project;
-    const job = p.jobs && p.jobs[0];
+    const job = (p.jobs && p.jobs[0]) || (p.studyIntel && p.studyIntel[0]);
     const title = job ? job.project_name : p.project_number;
     const jobs = p.jobs || [];
+    const studyIntel = p.studyIntel || [];
     const studies = p.studies || [];
     const sites = p.sites || [];
 
@@ -966,6 +975,36 @@
         </div>`
       )
       .join("");
+
+    const intel = studyIntel[0];
+    const intelBlock = intel
+      ? `<div class="block">
+          <span class="block-title">NetSuite study intel (ora_ns_study) · YY-DEPT-SEQ</span>
+          <div class="detail-grid">
+            <div class="detail-card"><div class="detail-label">Budgeted hrs</div><div class="detail-value">${
+              intel.total_budgeted == null ? "—" : intel.total_budgeted
+            }</div></div>
+            <div class="detail-card"><div class="detail-label">Actual hrs</div><div class="detail-value">${
+              intel.total_actual == null ? "—" : intel.total_actual
+            }</div></div>
+            <div class="detail-card"><div class="detail-label">% complete</div><div class="detail-value">${fmtPct(
+              intel.percent_complete
+            )}</div></div>
+            <div class="detail-card"><div class="detail-label">Realization</div><div class="detail-value">${fmtPct(
+              intel.realization_rate
+            )}</div></div>
+            <div class="detail-card"><div class="detail-label">Inv fee budget</div><div class="detail-value">${
+              intel.inv_fee_budget == null ? "—" : intel.inv_fee_budget
+            }</div></div>
+            <div class="detail-card"><div class="detail-label">PTC budget</div><div class="detail-value">${
+              intel.ptc_budget == null ? "—" : intel.ptc_budget
+            }</div></div>
+          </div>
+        </div>`
+      : `<div class="block">
+          <span class="block-title">NetSuite study intel (ora_ns_study)</span>
+          <p class="empty">No ora_ns_study doc yet — netsuite-pull-job must POST study upsert after Excel build.</p>
+        </div>`;
 
     const studyRows = studies.length
       ? studies
@@ -1020,6 +1059,7 @@
           <div class="detail-card"><div class="detail-label">Cost / billable hr</div><div class="detail-value">${fmtMoney(job && job.cost_per_billable_hr_actual)} / ${fmtMoney(job && job.cost_per_billable_hr_budgeted)}</div></div>
         </div>
         <div class="join-note">${escapeHtml((p.join && p.join.note) || "")}</div>
+        ${intelBlock}
         <div class="block">
           <span class="block-title">NetSuite jobs (${jobs.length})</span>
           <div class="table-wrap">
@@ -2370,9 +2410,99 @@
     });
 
     help.innerHTML = `<div class="answer">
-      <p class="summary">Purpose (ClinOps / Finance / RM / BD) sets the default briefing and source scope. Ask still follows the question — e.g. a GM question from ClinOps pulls NetSuite in automatically. You can also click any loaded source in the sidebar to include or exclude it. Salesforce pipeline uses StageName + Total_Ora_Net_Revenue__c (never Amount).</p>
-      <p class="caveat">Blank enrolled, GM, or Ora net $ is missing, not zero. PSM needs FSI and LSI from ora_veeva_milestone. Project number joins to ora_veeva_study.study_number — no mapping table.</p>
+      <div class="answer-head">
+        <p class="summary" style="margin:0;">Data sync status · Cosmos <code>bd-budgets</code></p>
+        <button type="button" class="btn btn-secondary" id="btnSyncStatusRefresh" ${
+          state.syncStatusBusy ? "disabled" : ""
+        }>${state.syncStatusBusy ? "Refreshing…" : "Refresh sync status"}</button>
+      </div>
+      <p class="caveat">Project numbers are <code>YY-DEPT-SEQ</code> (e.g. <code>25-150-0005</code> = year 2025, dept 150, study #5). Join NetSuite study intel to Veeva on <code>project_number</code> ↔ <code>study_number</code>. Blank enrolled / GM / Ora net $ is missing, not zero.</p>
+      ${renderSyncStatusPanel()}
+      <p class="summary" style="margin-top:1.25rem;">Purpose (ClinOps / Finance / RM / BD) sets the default briefing and source scope. Ask still follows the question — e.g. a GM question from ClinOps pulls NetSuite in automatically. You can also click any loaded source in the sidebar to include or exclude it. Salesforce pipeline uses StageName + Total_Ora_Net_Revenue__c (never Amount).</p>
     </div>`;
+    const refreshBtn = document.getElementById("btnSyncStatusRefresh");
+    if (refreshBtn) {
+      refreshBtn.onclick = () => loadSyncStatus({ force: true });
+    }
+  }
+
+  function renderSyncStatusPanel() {
+    if (state.syncStatusError && !state.syncStatus) {
+      return `<p class="caveat">${escapeHtml(state.syncStatusError)}</p>`;
+    }
+    const status = state.syncStatus;
+    if (!status) {
+      return `<p class="empty">${state.syncStatusBusy ? "Loading sync status…" : "Sync status not loaded yet."}</p>`;
+    }
+    const ns = status.netsuiteStudy || {};
+    const feeds = Array.isArray(status.feeds) ? status.feeds : [];
+    const rows = feeds
+      .map((f) => {
+        const badge = f.loaded
+          ? `<span class="source-status" style="color:var(--ora-teal-600);">live</span>`
+          : `<span class="source-status">empty</span>`;
+        return `<div class="table-row" style="grid-template-columns:1.4fr .7fr .7fr 1fr;">
+          <span><strong>${escapeHtml(f.name)}</strong><br><code>${escapeHtml(f.container || "")}</code></span>
+          <span>${Number(f.count || 0).toLocaleString()}</span>
+          <span>${escapeHtml(f.lastSyncLabel || "—")}</span>
+          <span>${badge}${f.joinKey ? `<br><span class="list-meta">${escapeHtml(f.joinKey)}</span>` : ""}</span>
+        </div>`;
+      })
+      .join("");
+    const sample = (ns.sampleProjectNumbers || []).slice(0, 5).join(", ") || "—";
+    return `<div class="table-wrap" style="margin-top:0.75rem;">
+      <div class="table-head" style="grid-template-columns:1.4fr .7fr .7fr 1fr;">
+        <span>Feed</span><span>Docs</span><span>Last sync</span><span>Status</span>
+      </div>
+      ${rows || `<div class="table-row"><span>No feeds reported</span></div>`}
+    </div>
+    <p class="list-meta" style="margin-top:0.75rem;">
+      NetSuite study intel · last sync ${escapeHtml(ns.lastSuccessfulSync || "never")}
+      · studies ${ns.studies ?? "—"} · tasks ${ns.tasks ?? "—"}
+      · sample ${escapeHtml(sample)}
+      · format ${escapeHtml(status.projectNumberFormat || "YY-DEPT-SEQ")}
+    </p>`;
+  }
+
+  async function loadSyncStatus({ force = false } = {}) {
+    if (state.syncStatusBusy) return;
+    if (state.syncStatus && !force) return;
+    state.syncStatusBusy = true;
+    state.syncStatusError = "";
+    if (state.nav === "sources") renderLists();
+    try {
+      const res = await fetch("/api/sync-status");
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error || `Sync status failed (${res.status})`);
+      state.syncStatus = body;
+      // Reflect live counts onto SOURCES loaded flags when known.
+      const byId = Object.fromEntries((body.feeds || []).map((f) => [f.id, f]));
+      const map = {
+        nsstudy: byId.ns_study,
+        netsuite: byId.ns_gm,
+        veeva: byId.veeva_study,
+        ora: byId.veeva_study,
+        salesforce: byId.salesforce,
+        ctgov: byId.ctgov,
+        trialhub: byId.trialhub,
+        insightsrm: byId.insightsrm
+      };
+      Object.entries(map).forEach(([srcId, feed]) => {
+        const s = sourceById(srcId);
+        if (!s || !feed) return;
+        s.loaded = Boolean(feed.loaded);
+        s.sync = feed.lastSyncLabel || s.sync;
+        if (typeof feed.count === "number") {
+          s.scope = `${s.scope.split("·")[0].trim()} · ${feed.count.toLocaleString()} docs`;
+        }
+      });
+    } catch (err) {
+      state.syncStatusError = String(err.message || err);
+    } finally {
+      state.syncStatusBusy = false;
+      if (state.nav === "sources") renderLists();
+      else renderSources();
+    }
   }
 
   function escapeHtml(s) {
@@ -2570,4 +2700,5 @@
   loadPipeline();
   loadRm();
   loadViewer();
+  loadSyncStatus();
 })();

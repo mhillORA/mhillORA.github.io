@@ -4,6 +4,9 @@ const { loadLivePack } = require("./veevaLive");
 /**
  * Project number ↔ live ora_veeva_study.study_number is computed at read time.
  * There is no mapping container. Match on study_number (exact, prefix, or token).
+ *
+ * Ora NetSuite study numbers are YY-DEPT-SEQ (e.g. 25-150-0005 = year 2025, dept 150, seq 0005).
+ * Study intel lives in ora_ns_study (alongside lens_ns_projects GM rows).
  */
 
 function numOrNull(v) {
@@ -76,6 +79,48 @@ const NS_SELECT =
 
 async function loadNsProjects() {
   return safeQuery(LENS.nsProjects, NS_SELECT, [{ name: "@t", value: "lens_ns_project" }]);
+}
+
+const NS_STUDY_SELECT =
+  "SELECT TOP 50 c.id, c.project_number, c.project_name, c.project_manager, c.service_line, c.project_status, " +
+  "c.start_date, c.calculated_end_date, c.total_budgeted, c.total_actual, c.total_etc, c.total_projected, " +
+  "c.realization_rate, c.percent_complete, c.inv_fee_budget, c.ptc_budget, c.invoiced_amount, " +
+  "c.revenue_recognized, c.cost_of_sales, c.gross_profit, c.gross_margin_pct, c.study_year, c.study_dept, " +
+  "c.study_seq, c.pulledAt, c.syncedAt, c._ts FROM c WHERE c.docType = @t AND c.project_number = @pn";
+
+async function loadNsStudyIntel(projectNumber) {
+  const pn = String(projectNumber || "").trim();
+  if (!pn) return [];
+  return safeQuery("ora_ns_study", NS_STUDY_SELECT, [
+    { name: "@t", value: "ora_ns_study" },
+    { name: "@pn", value: pn }
+  ]);
+}
+
+function compactStudyIntel(r) {
+  return {
+    id: r.id,
+    project_number: r.project_number || "",
+    project_name: r.project_name || "",
+    project_manager: r.project_manager || "",
+    service_line: r.service_line || "",
+    project_status: r.project_status || "",
+    study_year: r.study_year ?? null,
+    study_dept: r.study_dept ?? null,
+    study_seq: r.study_seq ?? null,
+    total_budgeted: numOrNull(r.total_budgeted),
+    total_actual: numOrNull(r.total_actual),
+    total_etc: numOrNull(r.total_etc),
+    total_projected: numOrNull(r.total_projected),
+    realization_rate: numOrNull(r.realization_rate),
+    percent_complete: numOrNull(r.percent_complete),
+    inv_fee_budget: numOrNull(r.inv_fee_budget),
+    ptc_budget: numOrNull(r.ptc_budget),
+    invoiced_amount: numOrNull(r.invoiced_amount),
+    revenue_recognized: numOrNull(r.revenue_recognized),
+    gross_margin_pct: numOrNull(r.gross_margin_pct),
+    pulledAt: r.pulledAt || r.syncedAt || null
+  };
 }
 
 async function loadStudies() {
@@ -225,36 +270,51 @@ async function getProjectBundle(projectNumber) {
     return {
       project_number: pn,
       jobs: [],
+      studyIntel: [],
       studies: [],
       sites: [],
       join: { method: "computed", matchedOn: "study_number", count: 0, note: "project_number required" }
     };
   }
 
-  const [jobs, studies] = await Promise.all([loadNsProjects(), loadStudies()]);
+  const [jobs, studies, studyIntelRaw] = await Promise.all([
+    loadNsProjects(),
+    loadStudies(),
+    loadNsStudyIntel(pn)
+  ]);
   const matchedJobs = jobs.filter((r) => normalizeId(r.project_number) === normalizeId(pn)).map(compactJob);
+  const studyIntel = (studyIntelRaw || []).map(compactStudyIntel);
   const matchedStudies = studiesForProject(studies, pn);
   const sites = await loadSitesForStudies(matchedStudies.map((s) => s.study_number));
   const kinds = [...new Set(matchedStudies.map((s) => s.match).filter(Boolean))];
 
   let note;
-  if (!matchedJobs.length && !matchedStudies.length) {
-    note = `No lens_ns_projects row and no ora_veeva_study.study_number matching ${pn}. Join is computed at read time (exact / prefix / token on study_number).`;
+  if (!matchedJobs.length && !matchedStudies.length && !studyIntel.length) {
+    note = `No lens_ns_projects / ora_ns_study row and no ora_veeva_study.study_number matching ${pn}. Join is computed at read time (exact / prefix / token on study_number). Format: YY-DEPT-SEQ.`;
   } else if (!matchedStudies.length) {
-    note = `NetSuite has this project. No live Veeva study_number equals or contains ${pn}. There is no mapping table — if Vault uses a different study id, it will not join.`;
-  } else if (!matchedJobs.length) {
-    note = `ora_veeva_study matched on study_number, but lens_ns_projects has no job for ${pn}.`;
+    note = `NetSuite has this project${studyIntel.length ? " (study intel present)" : ""}. No live Veeva study_number equals or contains ${pn}. There is no mapping table — if Vault uses a different study id, it will not join.`;
+  } else if (!matchedJobs.length && !studyIntel.length) {
+    note = `ora_veeva_study matched on study_number, but lens_ns_projects / ora_ns_study have no row for ${pn}.`;
   } else {
-    note = `Joined ${matchedJobs.length} NetSuite job${matchedJobs.length === 1 ? "" : "s"} to ${matchedStudies.length} live Veeva study row${matchedStudies.length === 1 ? "" : "s"} on project_number ↔ study_number (${kinds.join(", ") || "computed"}). No mapping table.`;
+    const bits = [];
+    if (matchedJobs.length) bits.push(`${matchedJobs.length} GM job(s)`);
+    if (studyIntel.length) bits.push(`${studyIntel.length} study intel`);
+    bits.push(`${matchedStudies.length} Veeva study row(s)`);
+    note = `Joined ${bits.join(" + ")} on project_number ↔ study_number (${kinds.join(", ") || "computed"}). YY-DEPT-SEQ. No mapping table.`;
   }
 
-  const meta = asOfMeta([...jobs.filter((r) => normalizeId(r.project_number) === normalizeId(pn)), ...studies.filter((s) => studyMatchesProject(s.study_number, pn))]);
+  const meta = asOfMeta([
+    ...jobs.filter((r) => normalizeId(r.project_number) === normalizeId(pn)),
+    ...studyIntelRaw,
+    ...studies.filter((s) => studyMatchesProject(s.study_number, pn))
+  ]);
 
   return {
     project_number: pn,
     asOf: meta.asOf,
     asOfLabel: meta.asOfLabel,
     jobs: matchedJobs,
+    studyIntel,
     studies: matchedStudies,
     sites,
     join: {

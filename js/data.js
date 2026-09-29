@@ -7,13 +7,22 @@ const SOURCES = [
   { id: "imednet", name: "iMedNet", cat: "Live EDC — not a separate feed", sync: "use live Vault", scope: "not split out", fresh: false, loaded: false },
   { id: "medidata", name: "Medidata", cat: "Live EDC — not a separate feed", sync: "use live Vault", scope: "not split out", fresh: false, loaded: false },
   { id: "insightsrm", name: "InsightsRM", cat: "Resource management", sync: "temporary Cosmos until DW", scope: "lens_rm_* actual FTE", fresh: true, loaded: true },
-  { id: "netsuite", name: "NetSuite", cat: "Project profitability", sync: "from Cosmos", scope: "lens_ns_projects", fresh: true, loaded: true }
+  { id: "netsuite", name: "NetSuite", cat: "Project profitability", sync: "from Cosmos", scope: "lens_ns_projects", fresh: true, loaded: true },
+  {
+    id: "nsstudy",
+    name: "NetSuite study intel",
+    cat: "Study KPIs · YY-DEPT-SEQ",
+    sync: "from Cosmos",
+    scope: "ora_ns_study (+ ora_ns_task)",
+    fresh: true,
+    loaded: true
+  }
 ];
 
 const WORKSPACES = [
   { id: "clinops", label: "Clinical operations", ids: ["ora", "ctgov", "trialhub"] },
   { id: "bd", label: "Business development", ids: ["salesforce", "ctgov", "trialhub"] },
-  { id: "finance", label: "Finance and delivery", ids: ["ora", "netsuite", "salesforce"] },
+  { id: "finance", label: "Finance and delivery", ids: ["ora", "netsuite", "nsstudy", "salesforce"] },
   { id: "staffing", label: "Resource management", ids: ["insightsrm"] },
   { id: "all", label: "Loaded sources", ids: SOURCES.filter((s) => s.loaded).map((s) => s.id) }
 ];
@@ -31,7 +40,7 @@ const PURPOSES = [
     label: "Finance",
     hint: "GM, delivery, project list",
     workspace: "finance",
-    ids: ["ora", "netsuite", "salesforce"]
+    ids: ["ora", "netsuite", "nsstudy", "salesforce"]
   },
   {
     id: "staffing",
@@ -58,6 +67,7 @@ const DETAIL = {
   trialhub: "ora_trialhub_trials",
   insightsrm: "lens_rm_* actual RM (until DW)",
   netsuite: "lens_ns_projects",
+  nsstudy: "ora_ns_study · YY-DEPT-SEQ join to Veeva",
   salesforce: "StageName + Total_Ora_Net_Revenue__c"
 };
 
@@ -70,6 +80,7 @@ const DOT = {
   trialhub: "#2a9084",
   insightsrm: "#273b8a",
   netsuite: "#ed1c24",
+  nsstudy: "#b91c1c",
   salesforce: "#63666b"
 };
 
