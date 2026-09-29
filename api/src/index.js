@@ -7,6 +7,7 @@ const { principalFromRequest } = require("./principal");
 const { getViewerContext, upsertPref, deletePref } = require("./userPrefs");
 const { graphStatus } = require("./graph");
 const { getSyncStatus } = require("./syncStatus");
+const { syncConfigStatus, triggerSync, triggerAll, SYNC_CATALOG } = require("./syncTrigger");
 
 /**
  * CORS for SWA ↔ Functions (same host usually skips preflight; still needed for
@@ -106,9 +107,54 @@ app.http("syncStatus", {
     if (request.method === "OPTIONS") return optionsOk(request);
     try {
       const status = await getSyncStatus();
-      return json(200, status, request);
+      const triggers = syncConfigStatus();
+      return json(200, { ...status, triggers }, request);
     } catch (err) {
       return json(503, { ok: false, error: String(err.message || err) }, request);
+    }
+  }
+});
+
+/** Trigger Buddy syncs (Veeva / SF / CT.gov) or NetSuite job webhook from Data Lens Sources. */
+app.http("syncTrigger", {
+  methods: ["GET", "POST", "OPTIONS"],
+  authLevel: "anonymous",
+  route: "sync/trigger",
+  handler: async (request) => {
+    if (request.method === "OPTIONS") return optionsOk(request);
+    if (request.method === "GET") {
+      return json(200, { ok: true, ...syncConfigStatus(), catalog: SYNC_CATALOG }, request);
+    }
+    let body = {};
+    try {
+      body = (await request.json()) || {};
+    } catch (_) {
+      body = {};
+    }
+    const feed = String(body.feed || request.query.get("feed") || "").trim();
+    const all = body.all === true || request.query.get("all") === "true";
+    try {
+      if (all) {
+        const result = await triggerAll({
+          includeNetsuite: body.includeNetsuite === true,
+          full: body.full === true
+        });
+        return json(result.ok ? 200 : 207, result, request);
+      }
+      if (!feed) {
+        return json(
+          400,
+          {
+            ok: false,
+            error: `feed required (${SYNC_CATALOG.map((c) => c.id).join(", ")}) or all:true`
+          },
+          request
+        );
+      }
+      const result = await triggerSync(feed, { full: body.full === true, body: body.body || {} });
+      return json(result.ok ? 200 : 502, result, request);
+    } catch (err) {
+      return json(500, { ok: false, error: String(err.message || err) }, request);
     }
   }
 });

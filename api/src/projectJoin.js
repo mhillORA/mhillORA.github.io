@@ -132,6 +132,8 @@ function studiesForProject(studies, projectNumber) {
   return (studies || [])
     .filter((s) => studyMatchesProject(s.study_number, projectNumber))
     .map((s) => ({
+      id: s.id || null,
+      veeva_study_id: s.id || null,
       study_number: s.study_number || "",
       sponsor: s.sponsor || "",
       indication: s.indication || "",
@@ -274,7 +276,8 @@ async function loadSitesForStudies(studyNumbers, opts = {}) {
       site_psm: s.site_psm != null ? s.site_psm : null,
       principal_investigator: s.principal_investigator || "",
       site_status: s.site_status || "",
-      ora_project_code: s.ora_project_code || ""
+      ora_project_code: s.ora_project_code || "",
+      veeva_study_id: s.veeva_study_id || null
     }));
 }
 

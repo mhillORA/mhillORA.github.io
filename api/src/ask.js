@@ -5,6 +5,8 @@ const { getViewerContext, foundryViewerSlice } = require("./userPrefs");
 const { answerRmQuestion, looksLikeRmRefinement } = require("./rmPack");
 const { loadLivePack } = require("./veevaLive");
 const { loadOpportunities, isOppOpen, pickOraNetRevenue, moneyLabel, getSfBriefing } = require("./sfPipeline");
+const { buildPaymentPosition, paymentSections, paymentSummaryLines } = require("./paymentPosition");
+const { deptCodeFromQuestion, getDepartmentBundle } = require("./deptPack");
 
 function guessKey(text, priorTurns) {
   const t = String(text || "").toLowerCase();
@@ -848,12 +850,18 @@ function buildStudyShort(question, projectNumber, bundle) {
   );
 }
 
-function buildStudyDossier(question, projectNumber, bundle, depth) {
+async function buildStudyDossier(question, projectNumber, bundle, depth) {
   const jobs = bundle.jobs || [];
   const studyIntel = bundle.studyIntel || [];
   const studies = bundle.studies || [];
   const sites = bundle.sites || [];
   const investigators = bundle.investigators || [];
+  let payment = null;
+  try {
+    payment = await buildPaymentPosition(projectNumber, bundle);
+  } catch (_) {
+    payment = null;
+  }
   const intel = studyIntel[0];
   const job = jobs[0];
   const name =
@@ -866,7 +874,9 @@ function buildStudyDossier(question, projectNumber, bundle, depth) {
   para.push(
     `${projectNumber} — ${name}. YY-DEPT-SEQ join to Veeva on project_number ↔ study_number (+ site PI).`
   );
-  if (intel) {
+  if (payment) {
+    para.push(...paymentSummaryLines(payment));
+  }  if (intel) {
     para.push(
       `NetSuite study intel: status ${intel.project_status || "—"}, PM ${intel.project_manager || "—"}, ` +
         `service line ${intel.service_line || "—"}. ` +
@@ -1064,6 +1074,9 @@ function buildStudyDossier(question, projectNumber, bundle, depth) {
       ]
     ]
   });
+  if (payment) {
+    sections.push(...paymentSections(payment));
+  }
 
   const primary = sections[0] || {
     title: "Study pack",
@@ -1080,7 +1093,7 @@ function buildStudyDossier(question, projectNumber, bundle, depth) {
       icon: "file",
       summary: para.join("\n\n"),
       chartTitle: `${depth === "dossier" ? "Full dossier" : "Long report"} · ${projectNumber}`,
-      chartNote: `${depth} · YY-DEPT-SEQ · NS + Veeva studies/sites/PIs`,
+      chartNote: `${depth} · YY-DEPT-SEQ · NS + Veeva + payment position`,
       chartType: "bar",
       bars: knownSites.slice(0, 10).map((s) => ({
         label: String(s.site || "—").slice(0, 36),
@@ -1094,19 +1107,23 @@ function buildStudyDossier(question, projectNumber, bundle, depth) {
       rows: primary.rows,
       projectKeys: primary.projectKeys || [],
       sections,
-      caveat: `${bundle.join.note} Inv fee $ is study-level NetSuite; PI names are Veeva site fields.`,
+      payment,
+      caveat: `${bundle.join.note} Payment = pricing × patients/milestones vs invoiced.`,
       trace: [
         `Built ${depth} pack for ${projectNumber}.`,
         `ora_ns_study ${studyIntel.length} · lens_ns_projects ${jobs.length} · ora_veeva_study ${studies.length} · ora_veeva_site ${sites.length} · PIs ${investigators.length}.`,
+        payment
+          ? `Payment: earned ${payment.money?.earned_estimate ?? "—"} · billed ${payment.money?.billed ?? "—"}.`
+          : "Payment pack skipped.",
         "Computed join at read time. Did not write."
       ],
-      query: `${depth} ${projectNumber} → ora_ns_study + lens_ns_projects + ora_veeva_* + PI`,
+      query: `${depth} ${projectNumber} → ora_ns_study + veeva + payment`,
       confidence: "high",
       followUps: [
         `Short answer for ${projectNumber}`,
         depth === "dossier" ? `Long answer for ${projectNumber}` : `Full dossier for ${projectNumber}`,
-        `Investigators on ${projectNumber}`,
-        `What is GM on ${projectNumber}?`
+        `Payment position for ${projectNumber}`,
+        `Investigators on ${projectNumber}`
       ]
     },
     [...studyIntel, ...jobs, ...studies, ...sites]
@@ -1409,17 +1426,103 @@ async function fromProjectContext(question, projectNumber) {
   return fromOraFactStudy(question, { projectNumber });
 }
 
+async function fromDeptContext(question, deptCode) {
+  const pack = await getDepartmentBundle(deptCode);
+  if (!pack || !pack.dept_code) return null;
+  const t = pack.totals || {};
+  const fmt = (n) => (n == null ? "—" : String(Math.round(n * 100) / 100));
+  const sections = [
+    {
+      title: `Department ${pack.dept_code} · ${pack.dept_name}`,
+      grid: "1.2fr 1fr 1fr",
+      cols: ["Metric", "Value", "Notes"],
+      rows: [
+        ["Projects", String(pack.projects || 0), "YY-DEPT-SEQ middle = dept"],
+        ["Study intel rows", String(pack.studies || 0), "ora_ns_study"],
+        ["GM jobs", String(pack.gm_jobs || 0), "lens_ns_projects"],
+        ["Budgeted hrs", fmt(t.budgeted_hours), "sum"],
+        ["Actual hrs", fmt(t.actual_hours), "sum"],
+        ["Inv fee budget", fmt(t.inv_fee_budget), "sum"],
+        ["Invoiced", fmt(t.invoiced_amount), "sum"],
+        ["Under GM", String((pack.gm && pack.gm.under_gm) || 0), "variance < 0"]
+      ]
+    }
+  ];
+  if ((pack.study_rows || []).length) {
+    sections.push({
+      title: `Studies in dept ${pack.dept_code}`,
+      grid: "0.8fr 1.3fr 0.8fr 0.6fr 0.6fr",
+      cols: ["Number", "Name", "PM", "% complete", "Inv fee"],
+      rows: pack.study_rows.slice(0, 40).map((r) => [
+        r.project_number || "—",
+        r.project_name || "—",
+        r.project_manager || "—",
+        r.percent_complete != null ? pctLabel(r.percent_complete) : "—",
+        r.inv_fee_budget != null ? String(r.inv_fee_budget) : "—"
+      ]),
+      projectKeys: pack.study_rows.slice(0, 40).map((r) => r.project_number || "")
+    });
+  }
+  if ((pack.job_rows || []).length) {
+    sections.push({
+      title: `GM jobs · dept ${pack.dept_code}`,
+      grid: "0.8fr 1.2fr 0.6fr 0.6fr 0.6fr",
+      cols: ["Number", "Project", "Budget GM", "Actual GM", "Variance"],
+      rows: pack.job_rows.slice(0, 40).map((r) => [
+        r.project_number || "—",
+        r.project_name || "—",
+        pctLabel(r.budgeted_gm_pct),
+        pctLabel(r.actual_gm_pct_prior_month),
+        pctLabel(r.gm_pct_variance)
+      ]),
+      projectKeys: pack.job_rows.slice(0, 40).map((r) => r.project_number || "")
+    });
+  }
+  const primary = sections[0];
+  return stamp(
+    {
+      q: question,
+      depth: "long",
+      needs: ["nsstudy", "netsuite"],
+      icon: "chart",
+      summary: pack.loaded
+        ? `Dept ${pack.dept_code} (${pack.dept_name}): ${pack.projects} project(s), ${pack.studies} study intel, ${pack.gm_jobs} GM job(s). PMs: ${(pack.project_managers || []).slice(0, 8).join(", ") || "—"}. ${pack.note}`
+        : pack.note,
+      chartTitle: `Department ${pack.dept_code}`,
+      chartNote: "YY-DEPT-SEQ · middle segment",
+      chartType: "bar",
+      bars: [],
+      tableTitle: primary.title,
+      grid: primary.grid,
+      cols: primary.cols,
+      rows: primary.rows,
+      sections,
+      caveat: pack.note,
+      trace: [`Rolled up ora_ns_study + lens_ns_projects where dept = ${pack.dept_code}.`],
+      query: `dept ${pack.dept_code}`,
+      confidence: pack.loaded ? "high" : "low",
+      followUps: (pack.project_numbers || []).slice(0, 3).map((pn) => `Full dossier for ${pn}`).concat([
+        `Short answer for dept ${pack.dept_code}`,
+        "Which projects are under budgeted GM?"
+      ])
+    },
+    pack.study_rows || []
+  );
+}
+
 async function answerFromCosmos(question, sources, opts) {
   getDb();
   const fromQ = String(question).match(/\b\d{2}-\d{3}-\d{4}\b/);
   const projectNumber = String((opts && opts.projectNumber) || (fromQ && fromQ[0]) || "").trim();
+  const deptCode = !projectNumber ? deptCodeFromQuestion(question) : null;
   const priorTurns = Array.isArray(opts && opts.prior) ? opts.prior : [];
   const src = new Set((sources || []).map(String));
   const rmScope = src.has("insightsrm") && !src.has("ora");
   let key = guessKey(question, priorTurns);
   if (rmScope) key = "staffing";
   let answer = null;
-  if (projectNumber && key !== "staffing") answer = await fromProjectContext(question, projectNumber);
+  if (deptCode && key !== "staffing") answer = await fromDeptContext(question, deptCode);
+  if (!answer && projectNumber && key !== "staffing") answer = await fromProjectContext(question, projectNumber);
   if (!answer && key === "staffing") answer = await fromRmStaffing(question, priorTurns);
   if (!answer && key === "staffing") answer = emptyRmAnswer(question);
   if (!answer && key === "missing_enrolled") answer = await fromOraFactStudy(question, { missingOnly: true });
@@ -1436,6 +1539,7 @@ async function answerFromCosmos(question, sources, opts) {
   if (!answer) answer = emptyAnswer(question);
   answer.sourcesUsed = sources;
   if (projectNumber) answer.projectNumber = projectNumber;
+  if (deptCode) answer.deptCode = deptCode;
 
   let viewerSlice = null;
   if (opts && opts.principal) {

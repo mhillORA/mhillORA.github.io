@@ -99,11 +99,11 @@ const ICONS = {
 };
 
 const EXAMPLE_QUESTIONS = [
-  { text: "Full dossier for 25-150-0005", icon: "file", needs: "NS + Veeva + PIs" },
+  { text: "Full dossier for 25-150-0005", icon: "file", needs: "NS + Veeva + payment" },
+  { text: "Tell me about dept 150", icon: "chart", needs: "YY-DEPT-SEQ rollup" },
   { text: "Short answer for 25-150-0005", icon: "chart", needs: "Headline pack" },
   { text: "Investigators on 25-150-0005", icon: "users", needs: "Veeva PI + inv fee rollup" },
   { text: "Which Ora dry eye studies enrolled the most subjects?", icon: "chart", needs: "Live · ora_veeva_study" },
-  { text: "Which Ora sites enrolled the most in dry eye?", icon: "users", needs: "Live · ora_veeva_site" },
   { text: "Show competing dry eye trials", icon: "globe", needs: "Certified · TrialHub + CT.gov" }
 ];
 

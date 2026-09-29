@@ -19,6 +19,8 @@
     syncStatus: null,
     syncStatusError: "",
     syncStatusBusy: false,
+    syncTriggerBusy: "",
+    syncTriggerMsg: "",
     finance: null,
     pipeline: null,
     scopeBoost: [],
@@ -2456,18 +2458,96 @@
 
     help.innerHTML = `<div class="answer">
       <div class="answer-head">
-        <p class="summary" style="margin:0;">Data sync status · Cosmos <code>bd-budgets</code></p>
+        <p class="summary" style="margin:0;">Data sync · Cosmos <code>bd-budgets</code></p>
         <button type="button" class="btn btn-secondary" id="btnSyncStatusRefresh" ${
           state.syncStatusBusy ? "disabled" : ""
-        }>${state.syncStatusBusy ? "Refreshing…" : "Refresh sync status"}</button>
+        }>${state.syncStatusBusy ? "Refreshing…" : "Refresh status"}</button>
       </div>
-      <p class="caveat">Project numbers are <code>YY-DEPT-SEQ</code> (e.g. <code>25-150-0005</code> = year 2025, dept 150, study #5). Join NetSuite study intel to Veeva on <code>project_number</code> ↔ <code>study_number</code>. Blank enrolled / GM / Ora net $ is missing, not zero.</p>
+      <p class="caveat">Run syncs here (proxies Buddy with the Copilot key on the Lens API). NetSuite study intel is the Container App job — button starts it if <code>NETSUITE_JOB_WEBHOOK</code> is set, otherwise shows the az command. Daily: schedule Buddy POSTs + the pull job.</p>
+      ${renderSyncTriggerPanel()}
       ${renderSyncStatusPanel()}
-      <p class="summary" style="margin-top:1.25rem;">Purpose (ClinOps / Finance / RM / BD) sets the default briefing and source scope. Ask still follows the question — e.g. a GM question from ClinOps pulls NetSuite in automatically. You can also click any loaded source in the sidebar to include or exclude it. Salesforce pipeline uses StageName + Total_Ora_Net_Revenue__c (never Amount).</p>
+      <p class="summary" style="margin-top:1.25rem;">Ask uses all loaded sources. Project numbers are <code>YY-DEPT-SEQ</code>. Dept asks: <code>tell me about 150</code>.</p>
     </div>`;
     const refreshBtn = document.getElementById("btnSyncStatusRefresh");
     if (refreshBtn) {
       refreshBtn.onclick = () => loadSyncStatus({ force: true });
+    }
+    help.querySelectorAll("[data-sync-feed]").forEach((btn) => {
+      btn.onclick = () => runSyncTrigger(btn.dataset.syncFeed);
+    });
+    const syncAll = document.getElementById("btnSyncAll");
+    if (syncAll) syncAll.onclick = () => runSyncTrigger("all");
+  }
+
+  function renderSyncTriggerPanel() {
+    const triggers = (state.syncStatus && state.syncStatus.triggers) || {};
+    const keyOk = triggers.copilotKeyConfigured;
+    const busy = state.syncTriggerBusy;
+    const feeds = [
+      { id: "veeva", label: "Sync Veeva" },
+      { id: "salesforce", label: "Sync Salesforce" },
+      { id: "ctgov", label: "Sync CT.gov" },
+      { id: "netsuite_study", label: "NetSuite study job" }
+    ];
+    const buttons = feeds
+      .map(
+        (f) =>
+          `<button type="button" class="btn btn-secondary" data-sync-feed="${f.id}" ${
+            busy ? "disabled" : ""
+          }>${busy === f.id ? "Running…" : f.label}</button>`
+      )
+      .join("");
+    return `<div class="block" style="margin-top:0.75rem;">
+      <span class="block-title">Run syncs</span>
+      <p class="list-meta">Buddy key on Lens API: ${
+        keyOk ? "configured" : "MISSING — set BUDDY_COPILOT_KEY on Data Lens Function App"
+      }</p>
+      <div class="gap-actions" style="margin-top:0.5rem;display:flex;flex-wrap:wrap;gap:0.5rem;">
+        ${buttons}
+        <button type="button" class="btn btn-secondary" id="btnSyncAll" ${
+          busy ? "disabled" : ""
+        }>${busy === "all" ? "Running…" : "Sync Veeva + SF + CT.gov"}</button>
+      </div>
+      ${
+        state.syncTriggerMsg
+          ? `<p class="caveat" style="margin-top:0.75rem;">${escapeHtml(state.syncTriggerMsg)}</p>`
+          : ""
+      }
+    </div>`;
+  }
+
+  async function runSyncTrigger(feed) {
+    if (state.syncTriggerBusy) return;
+    state.syncTriggerBusy = feed;
+    state.syncTriggerMsg = "";
+    if (state.nav === "sources") renderLists();
+    try {
+      const payload =
+        feed === "all"
+          ? { all: true }
+          : { feed, full: feed === "veeva" ? false : undefined };
+      const res = await fetch("/api/sync/trigger", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const body = await res.json().catch(() => ({}));
+      if (feed === "netsuite_study" && !body.ok && body.startCommand) {
+        state.syncTriggerMsg = `${body.error || "Job not started from Lens."} Cloud Shell: ${body.startCommand}`;
+      } else if (!body.ok && feed !== "all") {
+        state.syncTriggerMsg = body.error || `Sync failed (${res.status})`;
+      } else if (feed === "all") {
+        const bits = (body.results || []).map((r) => `${r.feed || r.name}: ${r.ok ? "ok" : r.error || "fail"}`);
+        state.syncTriggerMsg = bits.join(" · ") || (body.ok ? "Syncs started." : "Some syncs failed.");
+      } else {
+        state.syncTriggerMsg = `${body.name || feed}: ${body.ok ? "ok" : body.error || "done"}`;
+      }
+      await loadSyncStatus({ force: true });
+    } catch (err) {
+      state.syncTriggerMsg = String(err.message || err);
+    } finally {
+      state.syncTriggerBusy = "";
+      if (state.nav === "sources") renderLists();
     }
   }
 
