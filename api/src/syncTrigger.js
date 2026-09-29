@@ -138,7 +138,7 @@ async function proxyBuddy(path, { method = "POST", body = {} } = {}) {
       ok: false,
       url,
       error: aborted
-        ? "Lens timed out waiting for Buddy kick (~25s). Buddy may still have started — refresh sync status. If still stuck, run Sync from Buddy Data Status or curl Buddy /api/veeva/sync with x-copilot-key."
+        ? "Not a Veeva auth failure — Lens SWA cut the wait (~25s). Use Buddy → Data Status → Ingest Veeva (background). Or wait and refresh Sources; a kick may already be running."
         : String(err.message || err)
     };
   } finally {
