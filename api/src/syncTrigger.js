@@ -84,8 +84,13 @@ async function proxyBuddy(path, { method = "POST", body = {} } = {}) {
     };
   }
   const url = `${buddyBase()}${path.startsWith("/") ? path : `/${path}`}`;
+  // SWA API ~30s hard limit; Veeva/SF take minutes. Always ask Buddy to background-kick.
+  const payload =
+    method === "GET"
+      ? undefined
+      : JSON.stringify({ ...(body || {}), async: true, background: true });
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 240000);
+  const timer = setTimeout(() => ctrl.abort(), 25000);
   try {
     const res = await fetch(url, {
       method,
@@ -94,7 +99,7 @@ async function proxyBuddy(path, { method = "POST", body = {} } = {}) {
         Accept: "application/json",
         "x-copilot-key": key
       },
-      body: method === "GET" ? undefined : JSON.stringify(body || {}),
+      body: payload,
       signal: ctrl.signal
     });
     const text = await res.text();
@@ -103,6 +108,19 @@ async function proxyBuddy(path, { method = "POST", body = {} } = {}) {
       jsonBody = text ? JSON.parse(text) : {};
     } catch (_) {
       jsonBody = { raw: text.slice(0, 500) };
+    }
+    if (res.status === 202 || jsonBody.accepted === true) {
+      return {
+        ok: true,
+        accepted: true,
+        status: res.status,
+        url,
+        error: undefined,
+        message:
+          jsonBody.message ||
+          "Buddy accepted sync in background. Refresh Sources in a few minutes (Veeva may need 2–3 Sync clicks if time budget hits).",
+        body: jsonBody
+      };
     }
     if (!res.ok) {
       return {
@@ -120,7 +138,7 @@ async function proxyBuddy(path, { method = "POST", body = {} } = {}) {
       ok: false,
       url,
       error: aborted
-        ? "Sync call timed out at Lens (240s). Buddy may still be running — refresh sync status in a minute."
+        ? "Lens timed out waiting for Buddy kick (~25s). Buddy may still have started — refresh sync status. If still stuck, run Sync from Buddy Data Status or curl Buddy /api/veeva/sync with x-copilot-key."
         : String(err.message || err)
     };
   } finally {

@@ -2540,7 +2540,13 @@
         const bits = (body.results || []).map((r) => `${r.feed || r.name}: ${r.ok ? "ok" : r.error || "fail"}`);
         state.syncTriggerMsg = bits.join(" · ") || (body.ok ? "Syncs started." : "Some syncs failed.");
       } else {
-        state.syncTriggerMsg = `${body.name || feed}: ${body.ok ? "ok" : body.error || "done"}`;
+        state.syncTriggerMsg = `${body.name || feed}: ${
+          body.accepted || body.message
+            ? body.message || "started in background — refresh status shortly"
+            : body.ok
+              ? "ok"
+              : body.error || "done"
+        }`;
       }
       await loadSyncStatus({ force: true });
     } catch (err) {
