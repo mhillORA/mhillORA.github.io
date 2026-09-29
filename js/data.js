@@ -99,6 +99,7 @@ const ICONS = {
 };
 
 const EXAMPLE_QUESTIONS = [
+  { text: "Forecast fees", icon: "chart", needs: "Asks for YY-DEPT-SEQ · PTC/OOPC EAC" },
   { text: "Full dossier for 25-150-0005", icon: "file", needs: "NS + Veeva + payment" },
   { text: "Tell me about dept 150", icon: "chart", needs: "YY-DEPT-SEQ rollup" },
   { text: "Short answer for 25-150-0005", icon: "chart", needs: "Headline pack" },

@@ -39,6 +39,19 @@ function vaultIndicationLabel(raw) {
     .join(" ");
 }
 
+/** Keep Active / Inactive sites only — drop Did Not Participate and other non-participating statuses. */
+function isParticipatingSiteStatus(status) {
+  const s = String(status || "")
+    .toLowerCase()
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!s) return false;
+  if (/did not participate|non.?participat|not selected|withdrawn|rejected/.test(s)) return false;
+  if (/\bactive\b/.test(s) || /\binactive\b/.test(s)) return true;
+  return false;
+}
+
 function siteEnrollMonthsFromFsiLsi(fsiIso, lsiIso) {
   if (!fsiIso || !lsiIso) return null;
   const a = Date.parse(fsiIso);
@@ -189,6 +202,8 @@ async function buildPack() {
     const country = site.country__v || "_unknown";
     const study_number = study?.study_number || site.study_number__v || site.study_name__v || null;
     const study_name = site.study_name__v || site.study_number__v || study?.study_number || null;
+    const site_status = picklistLabel(site.site_status__v || site.status__v) || null;
+    if (!isParticipatingSiteStatus(site_status)) continue;
     sites.push({
       veeva_site_id: site.id,
       veeva_study_id: site.study__v || null,
@@ -208,7 +223,7 @@ async function buildPack() {
         picklistLabel(site.principal_investigator__v) ||
         (typeof site.principal_investigator__v === "string" ? site.principal_investigator__v : null) ||
         null,
-      site_status: picklistLabel(site.site_status__v || site.status__v) || null,
+      site_status,
       city: site.location_city__v || null,
       state: site.location_stateprovince__v || null,
       ora_project_code: site.ora_project_code__c || null,

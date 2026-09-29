@@ -2463,7 +2463,8 @@
           state.syncStatusBusy ? "disabled" : ""
         }>${state.syncStatusBusy ? "Refreshing…" : "Refresh status"}</button>
       </div>
-      <p class="caveat">Run syncs here (proxies Buddy with the Copilot key on the Lens API). NetSuite study intel is the Container App job — button starts it if <code>NETSUITE_JOB_WEBHOOK</code> is set, otherwise shows the az command. Daily: schedule Buddy POSTs + the pull job.</p>
+      <p class="caveat">Prefer <strong>Buddy → Data Status</strong> for ingest (Ingest Veeva / SF) — those buttons chunk by object and survive long runs. Lens buttons only kick Buddy in the background and often look broken because the SWA API times out around 30s. NetSuite study intel is still the Container App job.</p>
+      <p class="list-meta"><a href="https://white-river-0de1aed0f.7.azurestaticapps.net" target="_blank" rel="noopener">Open Buddy</a> · then Data Status · Ingest Veeva (new) a few times until incomplete clears.</p>
       ${renderSyncTriggerPanel()}
       ${renderSyncStatusPanel()}
       <p class="summary" style="margin-top:1.25rem;">Ask uses all loaded sources. Project numbers are <code>YY-DEPT-SEQ</code>. Dept asks: <code>tell me about 150</code>.</p>
@@ -2532,20 +2533,20 @@
         body: JSON.stringify(payload)
       });
       const body = await res.json().catch(() => ({}));
-      if (feed === "netsuite_study" && !body.ok && body.startCommand) {
+      const okish = body.ok === true || body.accepted === true || res.status === 202;
+      if (feed === "netsuite_study" && !okish && body.startCommand) {
         state.syncTriggerMsg = `${body.error || "Job not started from Lens."} Cloud Shell: ${body.startCommand}`;
-      } else if (!body.ok && feed !== "all") {
-        state.syncTriggerMsg = body.error || `Sync failed (${res.status})`;
+      } else if (!okish && feed !== "all") {
+        state.syncTriggerMsg = `${body.error || `Sync failed (${res.status})`} — use Buddy Data Status instead: https://white-river-0de1aed0f.7.azurestaticapps.net`;
       } else if (feed === "all") {
-        const bits = (body.results || []).map((r) => `${r.feed || r.name}: ${r.ok ? "ok" : r.error || "fail"}`);
-        state.syncTriggerMsg = bits.join(" · ") || (body.ok ? "Syncs started." : "Some syncs failed.");
+        const bits = (body.results || []).map(
+          (r) => `${r.feed || r.name}: ${r.ok || r.accepted ? "ok" : r.error || "fail"}`
+        );
+        state.syncTriggerMsg = bits.join(" · ") || (okish ? "Syncs kicked (background)." : "Some syncs failed — use Buddy Data Status.");
       } else {
         state.syncTriggerMsg = `${body.name || feed}: ${
-          body.accepted || body.message
-            ? body.message || "started in background — refresh status shortly"
-            : body.ok
-              ? "ok"
-              : body.error || "done"
+          body.message ||
+          (body.accepted ? "started in background — refresh status in a few minutes" : okish ? "ok" : body.error || "done")
         }`;
       }
       await loadSyncStatus({ force: true });

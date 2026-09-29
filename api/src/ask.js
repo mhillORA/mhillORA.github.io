@@ -773,6 +773,48 @@ function fmtNum(n) {
   return String(Math.round(x * 100) / 100);
 }
 
+function wantsFeeForecast(question) {
+  const t = String(question || "").toLowerCase();
+  return /(forecast\s+(fees?|ptc|oopc|inv)|fee\s+forecast|ptc\s*\/?\s*oopc\s+forecast|forecast\s+investigator|payment\s+position|earned\s+vs\s+billed)/.test(
+    t
+  );
+}
+
+function promptForForecastStudyNumber(question) {
+  return stamp(
+    {
+      q: question,
+      needs: ["nsstudy", "ora", "veeva"],
+      icon: "chart",
+      summary:
+        "Which study? Reply with the YY-DEPT-SEQ project number (e.g. 25-150-0005) and I’ll build the PTC / OOPC / investigator fee forecast.",
+      chartTitle: "Forecast fees — need study number",
+      chartNote: "Ask · pending project number",
+      chartType: "bar",
+      bars: [],
+      tableTitle: "What I’ll return",
+      grid: "1.2fr 1fr",
+      cols: ["Piece", "Source"],
+      rows: [
+        ["Investigator fees EAC", "inv fee budget/actual × patients or progress"],
+        ["Total PTC EAC", "ptc_budget / ptc_actual"],
+        ["OOPC labor / travel", "COGS payroll + non-PTC travel"],
+        ["Payment position", "pricing × enrollment vs invoiced"]
+      ],
+      caveat: "Sites in the pack are Active / Inactive only (Did Not Participate excluded).",
+      trace: ["No YY-DEPT-SEQ in the question — asked for study number before forecasting."],
+      query: "forecast fees → wait for project number",
+      confidence: "high",
+      followUps: [
+        "Forecast fees for 25-150-0005",
+        "Payment position for 25-150-0005",
+        "Full dossier for 25-150-0005"
+      ]
+    },
+    []
+  );
+}
+
 function buildStudyShort(question, projectNumber, bundle) {
   const jobs = bundle.jobs || [];
   const studyIntel = bundle.studyIntel || [];
@@ -1528,7 +1570,10 @@ async function answerFromCosmos(question, sources, opts) {
   let key = guessKey(question, priorTurns);
   if (rmScope) key = "staffing";
   let answer = null;
-  if (deptCode && key !== "staffing") answer = await fromDeptContext(question, deptCode);
+  if (wantsFeeForecast(question) && !projectNumber) {
+    answer = promptForForecastStudyNumber(question);
+  }
+  if (!answer && deptCode && key !== "staffing") answer = await fromDeptContext(question, deptCode);
   if (!answer && projectNumber && key !== "staffing") answer = await fromProjectContext(question, projectNumber);
   if (!answer && key === "staffing") answer = await fromRmStaffing(question, priorTurns);
   if (!answer && key === "staffing") answer = emptyRmAnswer(question);
