@@ -89,6 +89,35 @@ const NS_STUDY_SELECT =
   "c.revenue_recognized, c.cost_of_sales, c.gross_profit, c.gross_margin_pct, c.study_year, c.study_dept, " +
   "c.study_seq, c.pulledAt, c.syncedAt, c._ts FROM c WHERE c.docType = @t AND c.project_number = @pn";
 
+const NS_STUDY_PORTFOLIO_SELECT =
+  "SELECT TOP 500 c.id, c.project_number, c.project_name, c.project_manager, c.service_line, c.project_status, " +
+  "c.total_budgeted, c.total_actual, c.total_etc, c.total_projected, c.percent_complete, c.realization_rate, " +
+  "c.inv_fee_budget, c.inv_fee_actual, c.ptc_budget, c.ptc_actual, c.oopc_labor_actual, c.oopc_travel_actual, " +
+  "c.invoiced_amount, c.revenue_recognized, c.cost_of_sales, c.gross_profit, c.gross_margin_pct, " +
+  "c.study_year, c.study_dept, c.study_seq, c.pulledAt, c.syncedAt, c._ts " +
+  "FROM c WHERE c.docType = @t";
+
+/** True when study should appear on open fee-forecast portfolio (not financially closed). */
+function isFinanciallyOpenStudy(status) {
+  const s = String(status || "")
+    .toLowerCase()
+    .replace(/[_-]+/g, " ")
+    .trim();
+  if (/financial(ly)?\s*closed|fin\s*close|closed\s*financial/.test(s)) return false;
+  if (/\b(closed|complete|completed|cancelled|canceled|terminated|archived|inactive)\b/.test(s)) return false;
+  // ora_ns_study pull is already entitystatus = In Progress; blank/Active/In Progress stay in.
+  return true;
+}
+
+async function loadOpenStudyIntelRows() {
+  const rows = await safeQuery("ora_ns_study", NS_STUDY_PORTFOLIO_SELECT, [
+    { name: "@t", value: "ora_ns_study" }
+  ]);
+  return (rows || [])
+    .map(compactStudyIntel)
+    .filter((r) => r.project_number && isFinanciallyOpenStudy(r.project_status));
+}
+
 async function loadNsStudyIntel(projectNumber) {
   const pn = String(projectNumber || "").trim();
   if (!pn) return [];
@@ -373,5 +402,7 @@ async function getProjectBundle(projectNumber, opts = {}) {
 module.exports = {
   studyMatchesProject,
   getFinanceBriefing,
-  getProjectBundle
+  getProjectBundle,
+  loadOpenStudyIntelRows,
+  isFinanciallyOpenStudy
 };

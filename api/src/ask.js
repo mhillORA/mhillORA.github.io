@@ -1,11 +1,17 @@
 const { getDb, safeQuery, LENS, SHARED_READ } = require("./cosmos");
 const { narrateWithFoundry } = require("./foundry");
-const { getProjectBundle, studyMatchesProject } = require("./projectJoin");
+const { getProjectBundle, studyMatchesProject, loadOpenStudyIntelRows } = require("./projectJoin");
 const { getViewerContext, foundryViewerSlice } = require("./userPrefs");
 const { answerRmQuestion, looksLikeRmRefinement } = require("./rmPack");
 const { loadLivePack } = require("./veevaLive");
 const { loadOpportunities, isOppOpen, pickOraNetRevenue, moneyLabel, getSfBriefing } = require("./sfPipeline");
-const { buildPaymentPosition, paymentSections, paymentSummaryLines } = require("./paymentPosition");
+const {
+  buildPaymentPosition,
+  paymentSections,
+  paymentSummaryLines,
+  buildPortfolioFeeForecast,
+  portfolioFeeSections
+} = require("./paymentPosition");
 const { deptCodeFromQuestion, getDepartmentBundle } = require("./deptPack");
 
 function guessKey(text, priorTurns) {
@@ -780,38 +786,75 @@ function wantsFeeForecast(question) {
   );
 }
 
-function promptForForecastStudyNumber(question) {
+function wantsPortfolioFeeForecast(question) {
+  const t = String(question || "").toLowerCase();
+  if (/\b\d{2}-\d{3}-\d{4}\b/.test(t)) return false;
+  return (
+    /(all\s+active|all\s+open|portfolio|all\s+studies|every\s+study|open\s+studies|not\s+financial|financially\s+open|active\s+studies)/.test(
+      t
+    ) || wantsFeeForecast(t)
+  );
+}
+
+async function fromPortfolioFeeForecast(question) {
+  const rows = await loadOpenStudyIntelRows();
+  const pack = await buildPortfolioFeeForecast(rows);
+  const t = pack.totals || {};
+  const top = (pack.lines || []).slice(0, 8);
+  const maxEac = Math.max(
+    1,
+    ...top.map((r) => (Number(r.inv_fee_eac) || 0) + (Number(r.ptc_eac) || 0))
+  );
+  const sections = portfolioFeeSections(pack);
+  const primary = sections[0] || {
+    title: "Portfolio fee forecast",
+    grid: "1fr",
+    cols: ["Note"],
+    rows: [["No open studies in ora_ns_study"]]
+  };
   return stamp(
     {
       q: question,
-      needs: ["nsstudy", "ora", "veeva"],
+      needs: ["nsstudy"],
       icon: "chart",
-      summary:
-        "Which study? Reply with the YY-DEPT-SEQ project number (e.g. 25-150-0005) and I’ll build the PTC / OOPC / investigator fee forecast.",
-      chartTitle: "Forecast fees — need study number",
-      chartNote: "Ask · pending project number",
+      summary: pack.study_count
+        ? `Fee forecast for ${pack.study_count} open (not financially closed) studies: inv+PTC EAC ${fmtNum(
+            t.combined_eac
+          )} (inv ${fmtNum(t.inv_fee_eac)} · PTC ${fmtNum(t.ptc_eac)}). ${pack.note}`
+        : "No open studies found in ora_ns_study (pull is In Progress studies).",
+      chartTitle: "Open-study fee forecast (inv + PTC EAC)",
+      chartNote: "ora_ns_study · progress / budget curve · read-only",
       chartType: "bar",
-      bars: [],
-      tableTitle: "What I’ll return",
-      grid: "1.2fr 1fr",
-      cols: ["Piece", "Source"],
-      rows: [
-        ["Investigator fees EAC", "inv fee budget/actual × patients or progress"],
-        ["Total PTC EAC", "ptc_budget / ptc_actual"],
-        ["OOPC labor / travel", "COGS payroll + non-PTC travel"],
-        ["Payment position", "pricing × enrollment vs invoiced"]
+      bars: top.map((r) => {
+        const eac = (Number(r.inv_fee_eac) || 0) + (Number(r.ptc_eac) || 0);
+        return {
+          label: String(r.project_number || "—").slice(0, 14),
+          pct: Math.round((eac / maxEac) * 100),
+          value: fmtNum(eac),
+          color: "#052c49"
+        };
+      }),
+      tableTitle: primary.title,
+      grid: primary.grid,
+      cols: primary.cols,
+      rows: primary.rows,
+      sections,
+      portfolioForecast: pack,
+      caveat: pack.note,
+      trace: [
+        `Loaded ${rows.length} financially open ora_ns_study row(s).`,
+        pack.method,
+        `${pack.missing_actuals || 0} missing inv/PTC actuals.`
       ],
-      caveat: "Sites in the pack are Active / Inactive only (Did Not Participate excluded).",
-      trace: ["No YY-DEPT-SEQ in the question — asked for study number before forecasting."],
-      query: "forecast fees → wait for project number",
-      confidence: "high",
+      query: "forecast fees · open studies portfolio",
+      confidence: pack.study_count ? "high" : "low",
       followUps: [
-        "Forecast fees for 25-150-0005",
-        "Payment position for 25-150-0005",
-        "Full dossier for 25-150-0005"
+        ...(pack.lines || []).slice(0, 3).map((r) => `Forecast fees for ${r.project_number}`),
+        "Full dossier for 25-150-0005",
+        "Tell me about dept 150"
       ]
     },
-    []
+    pack.lines || []
   );
 }
 
@@ -1570,8 +1613,8 @@ async function answerFromCosmos(question, sources, opts) {
   let key = guessKey(question, priorTurns);
   if (rmScope) key = "staffing";
   let answer = null;
-  if (wantsFeeForecast(question) && !projectNumber) {
-    answer = promptForForecastStudyNumber(question);
+  if (wantsFeeForecast(question) && !projectNumber && wantsPortfolioFeeForecast(question)) {
+    answer = await fromPortfolioFeeForecast(question);
   }
   if (!answer && deptCode && key !== "staffing") answer = await fromDeptContext(question, deptCode);
   if (!answer && projectNumber && key !== "staffing") answer = await fromProjectContext(question, projectNumber);

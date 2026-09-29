@@ -228,6 +228,157 @@ function forecastCostLine({ label, budget, actual, progressPct, enrolled, target
   return null;
 }
 
+/**
+ * Portfolio PTC/OOPC / inv-fee EAC for open (not financially closed) studies in ora_ns_study.
+ * Uses hours % complete when present; does not fan out to Veeva per study (too slow).
+ */
+async function buildPortfolioFeeForecast(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  const lines = [];
+  let sumInvBud = 0;
+  let sumInvAct = 0;
+  let sumInvEac = 0;
+  let sumPtcBud = 0;
+  let sumPtcAct = 0;
+  let sumPtcEac = 0;
+  let sumOopcLabor = 0;
+  let sumOopcTravel = 0;
+  let withEac = 0;
+  let missingActuals = 0;
+
+  for (const r of list) {
+    const prog = num(r.percent_complete);
+    const inv = forecastCostLine({
+      label: "Investigator fees",
+      budget: r.inv_fee_budget,
+      actual: r.inv_fee_actual,
+      progressPct: prog,
+      enrolled: null,
+      targetPatients: null
+    });
+    const ptc = forecastCostLine({
+      label: "Total PTC",
+      budget: r.ptc_budget,
+      actual: r.ptc_actual,
+      progressPct: prog,
+      enrolled: null,
+      targetPatients: null
+    });
+    if (r.inv_fee_actual == null && r.ptc_actual == null) missingActuals += 1;
+    if ((inv && inv.forecast_eac != null) || (ptc && ptc.forecast_eac != null)) withEac += 1;
+
+    const invBud = money(r.inv_fee_budget) || 0;
+    const invAct = money(r.inv_fee_actual) || 0;
+    const invEac = inv?.forecast_eac != null ? inv.forecast_eac : invBud;
+    const ptcBud = money(r.ptc_budget) || 0;
+    const ptcAct = money(r.ptc_actual) || 0;
+    const ptcEac = ptc?.forecast_eac != null ? ptc.forecast_eac : ptcBud;
+    const oopcL = money(r.oopc_labor_actual) || 0;
+    const oopcT = money(r.oopc_travel_actual) || 0;
+
+    sumInvBud += invBud;
+    sumInvAct += invAct;
+    sumInvEac += invEac;
+    sumPtcBud += ptcBud;
+    sumPtcAct += ptcAct;
+    sumPtcEac += ptcEac;
+    sumOopcLabor += oopcL;
+    sumOopcTravel += oopcT;
+
+    lines.push({
+      project_number: r.project_number,
+      project_name: r.project_name || "",
+      project_status: r.project_status || "",
+      project_manager: r.project_manager || "",
+      service_line: r.service_line || "",
+      percent_complete: prog,
+      inv_fee_budget: money(r.inv_fee_budget),
+      inv_fee_actual: money(r.inv_fee_actual),
+      inv_fee_eac: inv?.forecast_eac ?? null,
+      ptc_budget: money(r.ptc_budget),
+      ptc_actual: money(r.ptc_actual),
+      ptc_eac: ptc?.forecast_eac ?? null,
+      oopc_labor_actual: money(r.oopc_labor_actual),
+      oopc_travel_actual: money(r.oopc_travel_actual),
+      method: inv?.method || ptc?.method || "none"
+    });
+  }
+
+  lines.sort((a, b) => {
+    const ae = (a.inv_fee_eac || 0) + (a.ptc_eac || 0);
+    const be = (b.inv_fee_eac || 0) + (b.ptc_eac || 0);
+    return be - ae;
+  });
+
+  return {
+    method: "open studies (ora_ns_study) · progress run-rate / budget curve — not financially closed",
+    study_count: lines.length,
+    with_eac: withEac,
+    missing_actuals: missingActuals,
+    totals: {
+      inv_fee_budget: money(sumInvBud),
+      inv_fee_actual: money(sumInvAct),
+      inv_fee_eac: money(sumInvEac),
+      ptc_budget: money(sumPtcBud),
+      ptc_actual: money(sumPtcAct),
+      ptc_eac: money(sumPtcEac),
+      oopc_labor_actual: money(sumOopcLabor),
+      oopc_travel_actual: money(sumOopcTravel),
+      combined_eac: money(sumInvEac + sumPtcEac)
+    },
+    lines,
+    note:
+      missingActuals > 0
+        ? `${missingActuals} stud${missingActuals === 1 ? "y has" : "ies have"} no PTC/inv actuals yet — EAC falls back to budget until the next NS job lands inv_fee_actual/ptc_actual.`
+        : "Open-study portfolio EAC from NetSuite budgets/actuals × hours % complete."
+  };
+}
+
+function portfolioFeeSections(pack) {
+  if (!pack) return [];
+  const t = pack.totals || {};
+  const sections = [
+    {
+      title: "Portfolio fee forecast (open studies)",
+      grid: "1.2fr 0.8fr 0.8fr",
+      cols: ["Metric", "Value", "Notes"],
+      rows: [
+        ["Open studies", String(pack.study_count || 0), "ora_ns_study · not financially closed"],
+        ["Inv fee budget / actual / EAC", `${t.inv_fee_budget ?? "—"} / ${t.inv_fee_actual ?? "—"} / ${t.inv_fee_eac ?? "—"}`, "Investigator Compensation"],
+        ["PTC budget / actual / EAC", `${t.ptc_budget ?? "—"} / ${t.ptc_actual ?? "—"} / ${t.ptc_eac ?? "—"}`, "Pass-through total"],
+        ["OOPC labor / travel (actual)", `${t.oopc_labor_actual ?? "—"} / ${t.oopc_travel_actual ?? "—"}`, "No EAC without budget"],
+        ["Combined inv+PTC EAC", t.combined_eac != null ? String(t.combined_eac) : "—", "Sum of study EACs"]
+      ]
+    },
+    {
+      title: `Study fee forecast detail (${Math.min(80, (pack.lines || []).length)} of ${pack.study_count || 0})`,
+      grid: "0.85fr 1.1fr 0.55fr 0.65fr 0.65fr 0.65fr 0.65fr 0.65fr",
+      cols: [
+        "Project",
+        "Name",
+        "% done",
+        "Inv bud",
+        "Inv EAC",
+        "PTC bud",
+        "PTC EAC",
+        "Method"
+      ],
+      rows: (pack.lines || []).slice(0, 80).map((r) => [
+        r.project_number || "—",
+        r.project_name || "—",
+        r.percent_complete != null ? `${Math.round(r.percent_complete * 1000) / 10}%` : "—",
+        r.inv_fee_budget != null ? String(r.inv_fee_budget) : "—",
+        r.inv_fee_eac != null ? String(r.inv_fee_eac) : "—",
+        r.ptc_budget != null ? String(r.ptc_budget) : "—",
+        r.ptc_eac != null ? String(r.ptc_eac) : "—",
+        r.method || "—"
+      ]),
+      projectKeys: (pack.lines || []).slice(0, 80).map((r) => r.project_number || "")
+    }
+  ];
+  return sections;
+}
+
 async function buildPaymentPosition(projectNumber, bundle) {
   const pn = String(projectNumber || "").trim();
   const intel = (bundle.studyIntel && bundle.studyIntel[0]) || null;
@@ -585,6 +736,8 @@ function paymentSummaryLines(payment) {
 
 module.exports = {
   buildPaymentPosition,
+  buildPortfolioFeeForecast,
+  portfolioFeeSections,
   paymentSections,
   paymentSummaryLines
 };
