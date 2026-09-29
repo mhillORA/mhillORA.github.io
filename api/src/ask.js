@@ -821,7 +821,7 @@ async function fromPortfolioFeeForecast(question) {
         ? `Fee forecast for ${pack.study_count} open (not financially closed) studies: inv+PTC EAC ${fmtNum(
             t.combined_eac
           )} (inv ${fmtNum(t.inv_fee_eac)} · PTC ${fmtNum(t.ptc_eac)}). ${pack.note}`
-        : "No open studies found in ora_ns_study (pull is In Progress studies).",
+        : "No open studies with investigator fee budget/actual in ora_ns_study.",
       chartTitle: "Open-study fee forecast (inv + PTC EAC)",
       chartNote: "ora_ns_study · progress / budget curve · read-only",
       chartType: "bar",

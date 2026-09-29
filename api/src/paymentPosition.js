@@ -311,7 +311,7 @@ async function buildPortfolioFeeForecast(rows) {
   });
 
   return {
-    method: "open studies (ora_ns_study) · progress run-rate / budget curve — not financially closed",
+    method: "open studies with inv fee budget/actual · progress run-rate / budget curve — not financially closed",
     study_count: lines.length,
     with_eac: withEac,
     missing_actuals: missingActuals,
@@ -329,8 +329,8 @@ async function buildPortfolioFeeForecast(rows) {
     lines,
     note:
       missingActuals > 0
-        ? `${missingActuals} stud${missingActuals === 1 ? "y has" : "ies have"} no PTC/inv actuals yet — EAC falls back to budget until the next NS job lands inv_fee_actual/ptc_actual.`
-        : "Open-study portfolio EAC from NetSuite budgets/actuals × hours % complete."
+        ? `${missingActuals} stud${missingActuals === 1 ? "y has" : "ies have"} inv fee budget but no PTC/inv actual yet — EAC uses budget/progress until the next NS job lands actuals.`
+        : "Open studies with investigator fee values · EAC from NetSuite budgets/actuals × hours % complete."
   };
 }
 
@@ -343,7 +343,7 @@ function portfolioFeeSections(pack) {
       grid: "1.2fr 0.8fr 0.8fr",
       cols: ["Metric", "Value", "Notes"],
       rows: [
-        ["Open studies", String(pack.study_count || 0), "ora_ns_study · not financially closed"],
+        ["Open studies", String(pack.study_count || 0), "inv fee budget or actual present · not financially closed"],
         ["Inv fee budget / actual / EAC", `${t.inv_fee_budget ?? "—"} / ${t.inv_fee_actual ?? "—"} / ${t.inv_fee_eac ?? "—"}`, "Investigator Compensation"],
         ["PTC budget / actual / EAC", `${t.ptc_budget ?? "—"} / ${t.ptc_actual ?? "—"} / ${t.ptc_eac ?? "—"}`, "Pass-through total"],
         ["OOPC labor / travel (actual)", `${t.oopc_labor_actual ?? "—"} / ${t.oopc_travel_actual ?? "—"}`, "No EAC without budget"],

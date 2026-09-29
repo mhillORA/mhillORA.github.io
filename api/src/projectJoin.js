@@ -115,7 +115,8 @@ async function loadOpenStudyIntelRows() {
   ]);
   return (rows || [])
     .map(compactStudyIntel)
-    .filter((r) => r.project_number && isFinanciallyOpenStudy(r.project_status));
+    .filter((r) => r.project_number && isFinanciallyOpenStudy(r.project_status))
+    .filter((r) => r.inv_fee_budget != null || r.inv_fee_actual != null);
 }
 
 async function loadNsStudyIntel(projectNumber) {
