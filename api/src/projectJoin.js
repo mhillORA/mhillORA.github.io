@@ -244,26 +244,41 @@ async function getFinanceBriefing() {
   };
 }
 
-async function loadSitesForStudies(studyNumbers) {
-  const nums = [...new Set((studyNumbers || []).map((s) => String(s || "").trim()).filter(Boolean))].slice(0, 8);
+async function loadSitesForStudies(studyNumbers, opts = {}) {
+  const maxStudies = Math.min(40, Math.max(8, Number(opts.maxStudies) || 24));
+  const maxSites = Math.min(200, Math.max(48, Number(opts.maxSites) || 120));
+  const nums = [...new Set((studyNumbers || []).map((s) => String(s || "").trim()).filter(Boolean))].slice(
+    0,
+    maxStudies
+  );
   if (!nums.length) return [];
   const want = new Set(nums.map((s) => String(s).toUpperCase()));
   const pack = await loadLivePack();
   return (pack.sites || [])
-    .filter((s) => want.has(String(s.study_number || s.study_name || "").toUpperCase()))
-    .slice(0, 96)
+    .filter((s) => {
+      const sn = String(s.study_number || s.study_name || "").toUpperCase();
+      const code = String(s.ora_project_code || "").toUpperCase();
+      return want.has(sn) || [...want].some((pn) => studyMatchesProject(sn, pn) || studyMatchesProject(code, pn));
+    })
+    .slice(0, maxSites)
     .map((s) => ({
       study_name: s.study_name || "",
+      study_number: s.study_number || "",
       site: s.org_clean || s.organization || "—",
       country: s.country || "",
+      city: s.city || "",
+      state: s.state || "",
       indication: s.indication || "",
       phase: s.phase || "",
       enrolled: enrolledOf(s),
-      site_psm: s.site_psm != null ? s.site_psm : null
+      site_psm: s.site_psm != null ? s.site_psm : null,
+      principal_investigator: s.principal_investigator || "",
+      site_status: s.site_status || "",
+      ora_project_code: s.ora_project_code || ""
     }));
 }
 
-async function getProjectBundle(projectNumber) {
+async function getProjectBundle(projectNumber, opts = {}) {
   getDb();
   const pn = String(projectNumber || "").trim();
   if (!pn || pn.length > 40) {
@@ -273,6 +288,7 @@ async function getProjectBundle(projectNumber) {
       studyIntel: [],
       studies: [],
       sites: [],
+      investigators: [],
       join: { method: "computed", matchedOn: "study_number", count: 0, note: "project_number required" }
     };
   }
@@ -285,7 +301,21 @@ async function getProjectBundle(projectNumber) {
   const matchedJobs = jobs.filter((r) => normalizeId(r.project_number) === normalizeId(pn)).map(compactJob);
   const studyIntel = (studyIntelRaw || []).map(compactStudyIntel);
   const matchedStudies = studiesForProject(studies, pn);
-  const sites = await loadSitesForStudies(matchedStudies.map((s) => s.study_number));
+  const sites = await loadSitesForStudies(
+    matchedStudies.map((s) => s.study_number).concat([pn]),
+    { maxStudies: opts.maxStudies || 24, maxSites: opts.maxSites || 120 }
+  );
+  const investigators = sites
+    .filter((s) => String(s.principal_investigator || "").trim())
+    .map((s) => ({
+      pi: s.principal_investigator,
+      site: s.site,
+      study: s.study_number || s.study_name,
+      country: s.country,
+      enrolled: s.enrolled,
+      site_psm: s.site_psm,
+      site_status: s.site_status
+    }));
   const kinds = [...new Set(matchedStudies.map((s) => s.match).filter(Boolean))];
 
   let note;
@@ -300,6 +330,8 @@ async function getProjectBundle(projectNumber) {
     if (matchedJobs.length) bits.push(`${matchedJobs.length} GM job(s)`);
     if (studyIntel.length) bits.push(`${studyIntel.length} study intel`);
     bits.push(`${matchedStudies.length} Veeva study row(s)`);
+    if (sites.length) bits.push(`${sites.length} site(s)`);
+    if (investigators.length) bits.push(`${investigators.length} PI(s)`);
     note = `Joined ${bits.join(" + ")} on project_number ↔ study_number (${kinds.join(", ") || "computed"}). YY-DEPT-SEQ. No mapping table.`;
   }
 
@@ -317,9 +349,10 @@ async function getProjectBundle(projectNumber) {
     studyIntel,
     studies: matchedStudies,
     sites,
+    investigators,
     join: {
       method: "computed",
-      matchedOn: "project_number ↔ ora_veeva_study.study_number",
+      matchedOn: "project_number ↔ ora_veeva_study.study_number (+ site PI)",
       count: matchedStudies.length,
       kinds,
       note

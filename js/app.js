@@ -7,11 +7,11 @@
       ora: true,
       ctgov: true,
       trialhub: true,
-      salesforce: false,
-      veeva: false,
+      salesforce: true,
+      veeva: true,
       imednet: false,
       medidata: false,
-      insightsrm: false,
+      insightsrm: true,
       netsuite: true,
       nsstudy: true
     },
@@ -113,20 +113,13 @@
     return "enrollment";
   }
 
-  /** Purpose sets defaults; question intent can pull in other loaded packs (e.g. GM → NetSuite on ClinOps). */
-  function intentSourceIds(question) {
-    const key = guessKey(question);
-    if (key === "netsuite") return ["netsuite", "nsstudy", "ora"];
-    if (key === "nsstudy") return ["nsstudy", "netsuite", "ora", "veeva"];
-    if (key === "pipeline") return ["salesforce"];
-    if (key === "staffing") return ["insightsrm"];
-    if (key === "competitive") return ["ctgov", "trialhub"];
-    if (key === "sites" || key === "enrollment") return ["ora", "veeva"];
-    return [];
+  /** Always all loaded feeds — do not narrow by question intent. */
+  function intentSourceIds(_question) {
+    return loadedSources().map((s) => s.id);
   }
 
   function purposeForSource(id) {
-    if (id === "netsuite") return "finance";
+    if (id === "netsuite" || id === "nsstudy") return "clinops";
     if (id === "insightsrm") return "staffing";
     if (id === "salesforce") return "bd";
     if (id === "ora" || id === "veeva") return "clinops";
@@ -207,8 +200,9 @@
   function applyPurposeSources(id) {
     const p = purposeOf(id);
     if (!p) return;
+    // Every purpose selects all loaded Cosmos sources (incl. NetSuite on ClinOps).
     SOURCES.forEach((s) => {
-      state.enabled[s.id] = s.loaded && p.ids.includes(s.id);
+      state.enabled[s.id] = !!s.loaded;
     });
     state.workspace = p.workspace;
     state.purpose = p.id;
@@ -836,10 +830,53 @@
       .map((r, ri) => {
         const pn = keys[ri] || "";
         return `<div class="table-row${pn ? " clickable" : ""}"${pn ? ` data-pn="${escapeHtml(pn)}"` : ""} style="grid-template-columns:${a.grid}">${r
-          .map((cell, i) => `<span class="${i === 0 ? "cell-strong" : i < 3 ? "cell-mono" : ""}">${cell}</span>`)
+          .map((cell, i) => `<span class="${i === 0 ? "cell-strong" : i < 3 ? "cell-mono" : ""}">${escapeHtml(String(cell))}</span>`)
           .join("")}</div>`;
       })
       .join("");
+
+    const sectionBlocks = (a.sections || [])
+      .map((sec) => {
+        const sCols = (sec.cols || []).map((c) => `<span>${escapeHtml(String(c))}</span>`).join("");
+        const sKeys = sec.projectKeys || [];
+        const sRows = (sec.rows || [])
+          .map((r, ri) => {
+            const pn = sKeys[ri] || "";
+            return `<div class="table-row${pn ? " clickable" : ""}"${
+              pn ? ` data-pn="${escapeHtml(pn)}"` : ""
+            } style="grid-template-columns:${sec.grid || "1fr"}">${r
+              .map(
+                (cell, i) =>
+                  `<span class="${i === 0 ? "cell-strong" : i < 3 ? "cell-mono" : ""}">${escapeHtml(
+                    String(cell)
+                  )}</span>`
+              )
+              .join("")}</div>`;
+          })
+          .join("");
+        return `<div class="block">
+          <span class="block-title">${escapeHtml(sec.title || "Section")}</span>
+          <div class="table-wrap">
+            <div class="table-head" style="grid-template-columns:${sec.grid || "1fr"}">${sCols}</div>
+            ${sRows || `<p class="empty">No rows.</p>`}
+          </div>
+        </div>`;
+      })
+      .join("");
+
+    const summaryHtml = escapeHtml(String(a.summary || ""))
+      .split(/\n\n+/)
+      .map((p) => `<p class="summary">${p.replace(/\n/g, "<br>")}</p>`)
+      .join("");
+
+    const depthChip =
+      a.depth === "short"
+        ? `<span class="viewer-chip">Short</span>`
+        : a.depth === "long"
+          ? `<span class="viewer-chip">Long</span>`
+          : a.depth === "dossier"
+            ? `<span class="viewer-chip">Full dossier</span>`
+            : "";
 
     const cites = (a.needs || [])
       .map((id) => sourceById(id))
@@ -851,13 +888,24 @@
 
     const trace = state.traceOpen
       ? a.trace
-          .map((t, i) => `<div class="trace-step"><span class="trace-n">${i + 1}</span><span>${t}</span></div>`)
-          .join("") + `<pre class="trace-sql">${a.query}</pre>`
+          .map((t, i) => `<div class="trace-step"><span class="trace-n">${i + 1}</span><span>${escapeHtml(String(t))}</span></div>`)
+          .join("") + `<pre class="trace-sql">${escapeHtml(String(a.query || ""))}</pre>`
       : "";
 
     const follows = (a.followUps || [])
-      .map((f) => `<button type="button" class="follow">${f}</button>`)
+      .map((f) => `<button type="button" class="follow">${escapeHtml(f)}</button>`)
       .join("");
+
+    const primaryTable =
+      sectionBlocks
+        ? ""
+        : `<div class="block">
+          <span class="block-title">${escapeHtml(a.tableTitle || "Results")}</span>
+          <div class="table-wrap">
+            <div class="table-head" style="grid-template-columns:${a.grid}">${cols}</div>
+            ${rows}
+          </div>
+        </div>`;
 
     panel.innerHTML = `
       <div class="you"><span class="you-badge">You</span><p>${escapeHtml(state.askedText)}</p></div>
@@ -867,29 +915,24 @@
       <div class="answer">
         <div class="answer-head">
           <span class="conf" style="background:${conf.bg};color:${conf.color}"><span class="conf-dot" style="background:${conf.color}"></span>${conf.label}</span>
+          ${depthChip}
           ${
             a.viewer && a.viewer.role
               ? `<span class="viewer-chip">Framed for ${escapeHtml(a.viewer.role)}</span>`
               : ""
           }
-          <span class="chart-note">${escapeHtml(a.asOfLabel || a.chartNote)}</span>
+          <span class="chart-note">${escapeHtml(a.asOfLabel || a.chartNote || "")}</span>
         </div>
-        <p class="summary">${a.summary}</p>
+        ${summaryHtml}
         <div class="block">
-          <span class="block-title">${a.chartTitle}</span>
-          ${a.bars && a.bars.length ? `<div class="chart-wrap"><canvas id="odlChart"></canvas></div><div class="bars">${bars}</div>` : `<p class="caveat">No chart — there are no known values to plot. Table still lists rows, including missing enrolled.</p>`}
+          <span class="block-title">${escapeHtml(a.chartTitle || "Chart")}</span>
+          ${a.bars && a.bars.length ? `<div class="chart-wrap"><canvas id="odlChart"></canvas></div><div class="bars">${bars}</div>` : `<p class="caveat">No chart — tables below still list every joined pack.</p>`}
         </div>
-        <div class="block">
-          <span class="block-title">${a.tableTitle}</span>
-          <div class="table-wrap">
-            <div class="table-head" style="grid-template-columns:${a.grid}">${cols}</div>
-            ${rows}
-          </div>
-        </div>
+        ${sectionBlocks || primaryTable}
         <div class="block">
           <span class="suggest-head">Where this came from</span>
           <div class="cites">${cites}</div>
-          <div class="caveat">${a.caveat}</div>
+          <div class="caveat">${escapeHtml(String(a.caveat || ""))}</div>
         </div>
         <div class="block" style="padding-top:14px">
           <button type="button" class="trace-btn" id="toggleTrace">${state.traceOpen ? "Hide how this was answered" : "Show how this was answered"}</button>
@@ -1023,21 +1066,23 @@
     const siteRows = sites.length
       ? sites
           .map(
-            (s) => `<div class="table-row" style="grid-template-columns:1.2fr 0.8fr 0.7fr 0.6fr 0.6fr">
+            (s) => `<div class="table-row" style="grid-template-columns:1.1fr 0.8fr 0.6fr 0.5fr 0.5fr 0.9fr">
               <span class="cell-strong">${escapeHtml(s.site || "—")}</span>
-              <span class="cell-mono">${escapeHtml(s.study_name || "—")}</span>
+              <span class="cell-mono">${escapeHtml(s.study_number || s.study_name || "—")}</span>
               <span>${escapeHtml(s.country || "—")}</span>
               <span class="cell-mono">${s.enrolled == null ? "—" : s.enrolled}</span>
               <span class="cell-mono">${s.site_psm == null ? "—" : s.site_psm}</span>
+              <span>${escapeHtml(s.principal_investigator || "—")}</span>
             </div>`
           )
           .join("")
       : "";
 
     const prompts = [
-      `What is GM on ${p.project_number}?`,
-      `Enrollment for ${p.project_number}`,
-      `Sites for ${p.project_number}`
+      `Full dossier for ${p.project_number}`,
+      `Short answer for ${p.project_number}`,
+      `Investigators on ${p.project_number}`,
+      `What is GM on ${p.project_number}?`
     ];
 
     panel.innerHTML = `
@@ -1082,7 +1127,7 @@
             ? `<div class="block">
           <span class="block-title">ora_veeva_site (${sites.length})</span>
           <div class="table-wrap">
-            <div class="table-head" style="grid-template-columns:1.2fr 0.8fr 0.7fr 0.6fr 0.6fr"><span>Site</span><span>Study</span><span>Country</span><span>Enrolled</span><span>Site PSM</span></div>
+            <div class="table-head" style="grid-template-columns:1.1fr 0.8fr 0.6fr 0.5fr 0.5fr 0.9fr"><span>Site</span><span>Study</span><span>Country</span><span>Enrolled</span><span>Site PSM</span><span>PI</span></div>
             ${siteRows}
           </div>
         </div>`

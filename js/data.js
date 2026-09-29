@@ -19,42 +19,45 @@ const SOURCES = [
   }
 ];
 
+/** Every purpose / workspace uses all loaded Cosmos feeds — no dept narrowing. */
+const ALL_LOADED_IDS = SOURCES.filter((s) => s.loaded).map((s) => s.id);
+
 const WORKSPACES = [
-  { id: "clinops", label: "Clinical operations", ids: ["ora", "ctgov", "trialhub"] },
-  { id: "bd", label: "Business development", ids: ["salesforce", "ctgov", "trialhub"] },
-  { id: "finance", label: "Finance and delivery", ids: ["ora", "netsuite", "nsstudy", "salesforce"] },
-  { id: "staffing", label: "Resource management", ids: ["insightsrm"] },
-  { id: "all", label: "Loaded sources", ids: SOURCES.filter((s) => s.loaded).map((s) => s.id) }
+  { id: "clinops", label: "Clinical operations", ids: ALL_LOADED_IDS.slice() },
+  { id: "bd", label: "Business development", ids: ALL_LOADED_IDS.slice() },
+  { id: "finance", label: "Finance and delivery", ids: ALL_LOADED_IDS.slice() },
+  { id: "staffing", label: "Resource management", ids: ALL_LOADED_IDS.slice() },
+  { id: "all", label: "Loaded sources", ids: ALL_LOADED_IDS.slice() }
 ];
 
 const PURPOSES = [
   {
     id: "clinops",
     label: "ClinOps",
-    hint: "Enrollment, sites, studies",
+    hint: "Enrollment, sites, studies, NetSuite",
     workspace: "clinops",
-    ids: ["ora", "ctgov", "trialhub"]
+    ids: ALL_LOADED_IDS.slice()
   },
   {
     id: "finance",
     label: "Finance",
     hint: "GM, delivery, project list",
     workspace: "finance",
-    ids: ["ora", "netsuite", "nsstudy", "salesforce"]
+    ids: ALL_LOADED_IDS.slice()
   },
   {
     id: "staffing",
     label: "RM",
     hint: "FTE, assignments, capacity",
     workspace: "staffing",
-    ids: ["insightsrm"]
+    ids: ALL_LOADED_IDS.slice()
   },
   {
     id: "bd",
     label: "Business development",
     hint: "Pipeline, registry, sponsors",
     workspace: "bd",
-    ids: ["salesforce", "ctgov", "trialhub"]
+    ids: ALL_LOADED_IDS.slice()
   }
 ];
 
@@ -96,10 +99,11 @@ const ICONS = {
 };
 
 const EXAMPLE_QUESTIONS = [
+  { text: "Full dossier for 25-150-0005", icon: "file", needs: "NS + Veeva + PIs" },
+  { text: "Short answer for 25-150-0005", icon: "chart", needs: "Headline pack" },
+  { text: "Investigators on 25-150-0005", icon: "users", needs: "Veeva PI + inv fee rollup" },
   { text: "Which Ora dry eye studies enrolled the most subjects?", icon: "chart", needs: "Live · ora_veeva_study" },
-  { text: "List Ora glaucoma studies", icon: "chart", needs: "Live · ora_veeva_study" },
   { text: "Which Ora sites enrolled the most in dry eye?", icon: "users", needs: "Live · ora_veeva_site" },
-  { text: "Which Ora studies have no enrolled count?", icon: "chart", needs: "Missing ≠ zero" },
   { text: "Show competing dry eye trials", icon: "globe", needs: "Certified · TrialHub + CT.gov" }
 ];
 

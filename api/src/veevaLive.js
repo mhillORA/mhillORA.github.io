@@ -95,7 +95,9 @@ async function buildPack() {
       LIVE.site,
       `SELECT c.id, c.study__v, c.no_subjects_enrolled__v, c.name__v, c.site_name__v,
               c.organization__clin, c.country__v, c.study_name__v, c.study_number__v,
-              c.indication__c, c.study_phase__c, c._ts
+              c.indication__c, c.study_phase__c, c.principal_investigator__v,
+              c.site_status__v, c.status__v, c.location_city__v, c.location_stateprovince__v,
+              c.ora_project_code__c, c._ts
        FROM c WHERE c.docType = @t`,
       [{ name: "@t", value: "ora_veeva_site" }]
     ),
@@ -202,6 +204,14 @@ async function buildPack() {
       fsi_trust: dates.fsi && dates.lsi ? "high" : dates.fsi || dates.lsi ? "partial" : null,
       study_number,
       study_name,
+      principal_investigator:
+        picklistLabel(site.principal_investigator__v) ||
+        (typeof site.principal_investigator__v === "string" ? site.principal_investigator__v : null) ||
+        null,
+      site_status: picklistLabel(site.site_status__v || site.status__v) || null,
+      city: site.location_city__v || null,
+      state: site.location_stateprovince__v || null,
+      ora_project_code: site.ora_project_code__c || null,
       _ts: site._ts
     });
     if (site_psm != null && site_psm > 0 && study) {

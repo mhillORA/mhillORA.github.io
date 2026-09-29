@@ -749,21 +749,451 @@ async function getBriefing() {
   };
 }
 
-async function fromProjectContext(question, projectNumber) {
-  const bundle = await getProjectBundle(projectNumber);
+/** short | long | dossier | null (inherit from question focus) */
+function answerDepth(text) {
+  const t = String(text || "").toLowerCase();
+  if (/\b(short|brief|tl;?dr|quick look|one.?liner|headline only)\b/.test(t)) return "short";
+  if (
+    /\b(dossier|full report|full readout|long answer|everything|comprehensive|deep dive|all details|massive|complete picture|full dossier)\b/.test(
+      t
+    )
+  ) {
+    return "dossier";
+  }
+  if (/\b(long|detailed|full|report on|tell me about|overview of|study report)\b/.test(t)) return "long";
+  return null;
+}
+
+function fmtNum(n) {
+  if (n == null || !Number.isFinite(Number(n))) return "—";
+  const x = Number(n);
+  if (Math.abs(x) >= 1000) return x.toLocaleString("en-US", { maximumFractionDigits: 1 });
+  return String(Math.round(x * 100) / 100);
+}
+
+function buildStudyShort(question, projectNumber, bundle) {
   const jobs = bundle.jobs || [];
   const studyIntel = bundle.studyIntel || [];
   const studies = bundle.studies || [];
   const sites = bundle.sites || [];
+  const intel = studyIntel[0];
+  const job = jobs[0];
+  const study = studies[0];
+  const name =
+    (intel && intel.project_name) || (job && job.project_name) || (study && study.study_number) || projectNumber;
+  const bits = [`${projectNumber} · ${name}`];
+  if (intel) {
+    bits.push(
+      `% complete ${intel.percent_complete != null ? pctLabel(intel.percent_complete) : "—"}`,
+      `budgeted ${fmtNum(intel.total_budgeted)} hrs`,
+      `inv fee ${fmtNum(intel.inv_fee_budget)}`
+    );
+  }
+  if (job) bits.push(`GM var ${pctLabel(gmOf(job, "gm_pct_variance"))}`);
+  if (studies.length) {
+    const enrolled = studies.reduce((s, r) => s + (r.total_enrolled || 0), 0);
+    bits.push(`${studies.length} Veeva stud${studies.length === 1 ? "y" : "ies"}`, `enrolled ${enrolled || "—"}`);
+  }
+  if (sites.length) bits.push(`${sites.length} sites`);
+  bits.push(bundle.join.note);
+
+  return stamp(
+    {
+      q: question,
+      depth: "short",
+      needs: ["nsstudy", "netsuite", "ora", "veeva"],
+      icon: "chart",
+      summary: bits.join(" · "),
+      chartTitle: `Short · ${projectNumber}`,
+      chartNote: "short answer · Cosmos join",
+      chartType: "bar",
+      bars: [],
+      tableTitle: "Key facts",
+      grid: "1fr 1fr 1fr 1fr",
+      cols: ["Field", "Value", "Field", "Value"],
+      rows: [
+        [
+          "Project",
+          name,
+          "% complete",
+          intel && intel.percent_complete != null ? pctLabel(intel.percent_complete) : "—"
+        ],
+        [
+          "Budgeted hrs",
+          intel ? fmtNum(intel.total_budgeted) : "—",
+          "GM variance",
+          job ? pctLabel(gmOf(job, "gm_pct_variance")) : "—"
+        ],
+        [
+          "Veeva studies",
+          String(studies.length),
+          "Sites",
+          String(sites.length)
+        ]
+      ],
+      caveat: "Short answer. Ask for a long answer or full dossier for every section.",
+      trace: [
+        `Short pack for ${projectNumber}: ora_ns_study + lens_ns_projects + ora_veeva_* join.`,
+        "Did not write."
+      ],
+      query: `short dossier ${projectNumber}`,
+      confidence: studies.length || studyIntel.length || jobs.length ? "high" : "medium",
+      followUps: [
+        `Full dossier for ${projectNumber}`,
+        `Long answer for ${projectNumber}`,
+        `Sites for ${projectNumber}`
+      ]
+    },
+    [...studyIntel, ...jobs, ...studies]
+  );
+}
+
+function buildStudyDossier(question, projectNumber, bundle, depth) {
+  const jobs = bundle.jobs || [];
+  const studyIntel = bundle.studyIntel || [];
+  const studies = bundle.studies || [];
+  const sites = bundle.sites || [];
+  const investigators = bundle.investigators || [];
+  const intel = studyIntel[0];
+  const job = jobs[0];
+  const name =
+    (intel && intel.project_name) || (job && job.project_name) || projectNumber;
+  const enrolledSum = studies.reduce((s, r) => s + (Number(r.total_enrolled) || 0), 0);
+  const knownSites = sites.filter((s) => s.enrolled != null);
+  const maxSiteEnroll = Math.max(1, ...knownSites.map((s) => s.enrolled));
+
+  const para = [];
+  para.push(
+    `${projectNumber} — ${name}. YY-DEPT-SEQ join to Veeva on project_number ↔ study_number (+ site PI).`
+  );
+  if (intel) {
+    para.push(
+      `NetSuite study intel: status ${intel.project_status || "—"}, PM ${intel.project_manager || "—"}, ` +
+        `service line ${intel.service_line || "—"}. ` +
+        `Hours budgeted ${fmtNum(intel.total_budgeted)} / actual ${fmtNum(intel.total_actual)} / ETC ${fmtNum(
+          intel.total_etc
+        )} / projected ${fmtNum(intel.total_projected)}. ` +
+        `% complete ${intel.percent_complete != null ? pctLabel(intel.percent_complete) : "—"}, ` +
+        `realization ${intel.realization_rate != null ? pctLabel(intel.realization_rate) : "—"}. ` +
+        `Inv fee budget ${fmtNum(intel.inv_fee_budget)}, PTC budget ${fmtNum(intel.ptc_budget)}, ` +
+        `invoiced ${fmtNum(intel.invoiced_amount)}, revenue recognized ${fmtNum(intel.revenue_recognized)}, ` +
+        `gross margin ${intel.gross_margin_pct != null ? pctLabel(intel.gross_margin_pct) : "—"}.`
+    );
+  } else {
+    para.push("No ora_ns_study row yet for this number.");
+  }
+  if (jobs.length) {
+    para.push(
+      `Profitability (${jobs.length} job row${jobs.length === 1 ? "" : "s"}): ` +
+        jobs
+          .slice(0, 6)
+          .map(
+            (r) =>
+              `${r.project_name || r.project_number} · budget GM ${pctLabel(gmOf(r, "budgeted_gm_pct"))} · ` +
+              `actual ${pctLabel(gmOf(r, "actual_gm_pct_prior_month"))} · var ${pctLabel(gmOf(r, "gm_pct_variance"))} · ` +
+              `CO ${r.change_order_status || "—"}`
+          )
+          .join("; ") +
+        "."
+    );
+  } else {
+    para.push("No lens_ns_projects GM row for this number.");
+  }
+  if (studies.length) {
+    para.push(
+      `Veeva (${studies.length} stud${studies.length === 1 ? "y" : "ies"}): total enrolled ${
+        enrolledSum || "—"
+      }. ` +
+        studies
+          .slice(0, 8)
+          .map(
+            (s) =>
+              `${s.study_number} · enrolled ${s.total_enrolled == null ? "—" : s.total_enrolled} · ` +
+              `PSM ${s.psm == null ? "—" : s.psm} · ${s.indication || "—"} · ${s.lifecycle_state || "—"} (${s.match})`
+          )
+          .join("; ") +
+        "."
+    );
+  } else {
+    para.push("No ora_veeva_study.study_number matched this project.");
+  }
+  if (investigators.length) {
+    para.push(
+      `Investigators (${investigators.length} with PI on site): ` +
+        investigators
+          .slice(0, depth === "dossier" ? 30 : 15)
+          .map((r) => `${r.pi} @ ${r.site || "—"} (${r.country || "—"}, enrolled ${r.enrolled == null ? "—" : r.enrolled})`)
+          .join("; ") +
+        (investigators.length > (depth === "dossier" ? 30 : 15) ? "…" : ".") +
+        ` Study inv fee budget ${intel && intel.inv_fee_budget != null ? fmtNum(intel.inv_fee_budget) : "—"} is NetSuite rollup, not per-PI.`
+    );
+  } else if (sites.length) {
+    para.push(
+      `Sites (${sites.length}) — no principal_investigator__v populated on these Vault site rows yet.`
+    );
+  }
+  if (sites.length) {
+    para.push(
+      `Sites (${sites.length}): ` +
+        sites
+          .slice(0, depth === "dossier" ? 24 : 12)
+          .map(
+            (s) =>
+              `${s.site || "—"} (${s.country || "—"}) enrolled ${s.enrolled == null ? "—" : s.enrolled}` +
+              (s.principal_investigator ? ` · PI ${s.principal_investigator}` : "")
+          )
+          .join("; ") +
+        (sites.length > (depth === "dossier" ? 24 : 12) ? "…" : ".")
+    );
+  }
+  para.push(bundle.join.note);
+
+  const sections = [];
+  if (intel) {
+    sections.push({
+      title: "NetSuite study intel (ora_ns_study)",
+      grid: "1.1fr 1fr 1fr 1fr",
+      cols: ["Metric", "Value", "Metric", "Value"],
+      rows: [
+        ["Project name", intel.project_name || "—", "PM", intel.project_manager || "—"],
+        ["Status", intel.project_status || "—", "Service line", intel.service_line || "—"],
+        [
+          "Year / dept / seq",
+          `${intel.study_year ?? "—"} / ${intel.study_dept ?? "—"} / ${intel.study_seq ?? "—"}`,
+          "% complete",
+          intel.percent_complete != null ? pctLabel(intel.percent_complete) : "—"
+        ],
+        ["Budgeted hrs", fmtNum(intel.total_budgeted), "Actual hrs", fmtNum(intel.total_actual)],
+        ["ETC hrs", fmtNum(intel.total_etc), "Projected hrs", fmtNum(intel.total_projected)],
+        [
+          "Realization",
+          intel.realization_rate != null ? pctLabel(intel.realization_rate) : "—",
+          "Gross margin",
+          intel.gross_margin_pct != null ? pctLabel(intel.gross_margin_pct) : "—"
+        ],
+        ["Inv fee budget", fmtNum(intel.inv_fee_budget), "PTC budget", fmtNum(intel.ptc_budget)],
+        ["Invoiced", fmtNum(intel.invoiced_amount), "Revenue recognized", fmtNum(intel.revenue_recognized)]
+      ]
+    });
+  }
+  if (jobs.length) {
+    sections.push({
+      title: `NetSuite profitability (${jobs.length})`,
+      grid: "0.8fr 1.3fr 0.6fr 0.6fr 0.6fr 0.9fr",
+      cols: ["Number", "Project", "Budget GM", "Actual GM", "Variance", "Change order"],
+      rows: jobs.map((r) => [
+        r.project_number || "—",
+        r.project_name || "—",
+        pctLabel(gmOf(r, "budgeted_gm_pct")),
+        pctLabel(gmOf(r, "actual_gm_pct_prior_month")),
+        pctLabel(gmOf(r, "gm_pct_variance")),
+        r.change_order_status || "—"
+      ]),
+      projectKeys: jobs.map((r) => r.project_number || "")
+    });
+  }
+  if (studies.length) {
+    sections.push({
+      title: `Veeva studies (${studies.length})`,
+      grid: "1fr 0.6fr 0.5fr 0.6fr 0.7fr 1fr",
+      cols: ["Study", "Enrolled", "PSM", "Match", "Lifecycle", "Indication"],
+      rows: studies.slice(0, depth === "dossier" ? 40 : 20).map((s) => [
+        s.study_number || "—",
+        s.total_enrolled == null ? "—" : String(s.total_enrolled),
+        s.psm == null ? "—" : String(s.psm),
+        s.match || "—",
+        s.lifecycle_state || "—",
+        s.indication || "—"
+      ])
+    });
+  }
+  if (investigators.length) {
+    sections.push({
+      title: `Investigators / PIs (${investigators.length})`,
+      grid: "1.1fr 1.2fr 0.8fr 0.5fr 0.5fr 0.6fr",
+      cols: ["PI", "Site", "Study", "Enrolled", "Site PSM", "Status"],
+      rows: investigators.slice(0, depth === "dossier" ? 60 : 30).map((r) => [
+        r.pi || "—",
+        r.site || "—",
+        r.study || "—",
+        r.enrolled == null ? "—" : String(r.enrolled),
+        r.site_psm == null ? "—" : String(r.site_psm),
+        r.site_status || "—"
+      ])
+    });
+  }
+  if (sites.length) {
+    sections.push({
+      title: `Veeva sites (${sites.length})`,
+      grid: "1.1fr 1fr 0.7fr 0.5fr 0.5fr 0.9fr",
+      cols: ["Site", "Study", "Country", "Enrolled", "Site PSM", "PI"],
+      rows: sites.slice(0, depth === "dossier" ? 60 : 30).map((s) => [
+        s.site || "—",
+        s.study_number || s.study_name || "—",
+        s.country || "—",
+        s.enrolled == null ? "—" : String(s.enrolled),
+        s.site_psm == null ? "—" : String(s.site_psm),
+        s.principal_investigator || "—"
+      ])
+    });
+  }
+  sections.push({
+    title: "Investigator fees",
+    grid: "1.2fr 1fr 1fr",
+    cols: ["Source", "Grain", "Value"],
+    rows: [
+      [
+        "ora_ns_study.inv_fee_budget",
+        "Study rollup (NetSuite)",
+        intel && intel.inv_fee_budget != null ? fmtNum(intel.inv_fee_budget) : "—"
+      ],
+      [
+        "ora_ns_study.ptc_budget",
+        "Study rollup (NetSuite)",
+        intel && intel.ptc_budget != null ? fmtNum(intel.ptc_budget) : "—"
+      ],
+      [
+        "ora_veeva_site.principal_investigator__v",
+        "Site PI roster (Veeva)",
+        investigators.length ? `${investigators.length} named PI(s)` : "No PI on matched sites"
+      ],
+      [
+        "Per-PI fee lines",
+        "Not in Cosmos yet",
+        "Need SuiteQL line items or Vault fee object"
+      ]
+    ]
+  });
+
+  const primary = sections[0] || {
+    title: "Study pack",
+    grid: "1fr",
+    cols: ["Note"],
+    rows: [["No Cosmos rows for this project number yet."]]
+  };
+
+  return stamp(
+    {
+      q: question,
+      depth,
+      needs: ["nsstudy", "netsuite", "ora", "veeva"],
+      icon: "file",
+      summary: para.join("\n\n"),
+      chartTitle: `${depth === "dossier" ? "Full dossier" : "Long report"} · ${projectNumber}`,
+      chartNote: `${depth} · YY-DEPT-SEQ · NS + Veeva studies/sites/PIs`,
+      chartType: "bar",
+      bars: knownSites.slice(0, 10).map((s) => ({
+        label: String(s.site || "—").slice(0, 36),
+        pct: Math.round((s.enrolled / maxSiteEnroll) * 100),
+        value: String(s.enrolled),
+        color: "#052c49"
+      })),
+      tableTitle: primary.title,
+      grid: primary.grid,
+      cols: primary.cols,
+      rows: primary.rows,
+      projectKeys: primary.projectKeys || [],
+      sections,
+      caveat: `${bundle.join.note} Inv fee $ is study-level NetSuite; PI names are Veeva site fields.`,
+      trace: [
+        `Built ${depth} pack for ${projectNumber}.`,
+        `ora_ns_study ${studyIntel.length} · lens_ns_projects ${jobs.length} · ora_veeva_study ${studies.length} · ora_veeva_site ${sites.length} · PIs ${investigators.length}.`,
+        "Computed join at read time. Did not write."
+      ],
+      query: `${depth} ${projectNumber} → ora_ns_study + lens_ns_projects + ora_veeva_* + PI`,
+      confidence: "high",
+      followUps: [
+        `Short answer for ${projectNumber}`,
+        depth === "dossier" ? `Long answer for ${projectNumber}` : `Full dossier for ${projectNumber}`,
+        `Investigators on ${projectNumber}`,
+        `What is GM on ${projectNumber}?`
+      ]
+    },
+    [...studyIntel, ...jobs, ...studies, ...sites]
+  );
+}
+
+async function fromProjectContext(question, projectNumber) {
+  const depthHint = answerDepth(question);
+  const wantDossier =
+    depthHint === "dossier" ||
+    depthHint === "long" ||
+    depthHint === "short" ||
+    !/(site|investigator|enroll|psm|screen fail|indication|lifecycle|bva|% complete|inv fee|ptc|budgeted hours|\bgm\b|gross margin|change order)/i.test(
+      String(question || "")
+    );
+  const bundle = await getProjectBundle(projectNumber, {
+    maxStudies: wantDossier ? 32 : 16,
+    maxSites: wantDossier ? 160 : 80
+  });
+  const jobs = bundle.jobs || [];
+  const studyIntel = bundle.studyIntel || [];
+  const studies = bundle.studies || [];
+  const sites = bundle.sites || [];
+  const investigators = bundle.investigators || [];
   if (!jobs.length && !studies.length && !studyIntel.length) return null;
 
   const t = String(question || "").toLowerCase();
-  const wantSites = /(site|investigator)/.test(t) && sites.length;
+  const depth = depthHint;
+  const wantSites = /(site|investigator)/.test(t) && (sites.length || investigators.length);
   const wantClinical = /(enroll|study|psm|screen fail|indication|lifecycle)/.test(t) && studies.length;
   const wantIntel =
     /(bva|% complete|percent complete|realization|inv fee|investigator fee|ptc|budgeted hours|study intel)/.test(
       t
     ) && studyIntel.length;
+  const wantGm = /(\bgm\b|gross margin|change order|profitability|budgeted gm)/.test(t) && jobs.length;
+  const focused = wantSites || wantClinical || wantIntel || wantGm;
+
+  if (depth === "short") return buildStudyShort(question, projectNumber, bundle);
+  if (depth === "dossier" || depth === "long" || !focused) {
+    return buildStudyDossier(question, projectNumber, bundle, depth || "dossier");
+  }
+
+  if (wantSites && (investigators.length || sites.length) && /investigator|\bpi\b/.test(t)) {
+    const rows = (investigators.length ? investigators : sites).slice(0, 40);
+    return stamp(
+      {
+        q: question,
+        needs: ["ora", "veeva", "nsstudy"],
+        icon: "users",
+        summary: `${investigators.length || rows.length} investigator / site row${
+          (investigators.length || rows.length) === 1 ? "" : "s"
+        } joined to ${projectNumber}. Study inv fee budget ${
+          studyIntel[0] && studyIntel[0].inv_fee_budget != null
+            ? fmtNum(studyIntel[0].inv_fee_budget)
+            : "—"
+        } (NetSuite study rollup — not per-PI line items). ${bundle.join.note}`,
+        chartTitle: `Investigators · ${projectNumber}`,
+        chartNote: "ora_veeva_site.principal_investigator__v + ora_ns_study.inv_fee_budget",
+        chartType: "bar",
+        bars: [],
+        tableTitle: "Principal investigators / sites",
+        grid: "1.1fr 1.2fr 0.8fr 0.5fr 0.5fr",
+        cols: ["PI", "Site", "Study", "Enrolled", "Status"],
+        rows: rows.map((r) => [
+          r.pi || r.principal_investigator || "—",
+          r.site || "—",
+          r.study || r.study_name || "—",
+          r.enrolled == null ? "—" : String(r.enrolled),
+          r.site_status || "—"
+        ]),
+        caveat:
+          "Investigator roster is Veeva. Inv fee $ is NetSuite study-level until SuiteQL line items exist.",
+        trace: [
+          `Joined ${projectNumber} → ora_veeva_site (PI).`,
+          `ora_ns_study.inv_fee_budget is study rollup.`
+        ],
+        query: `investigators ${projectNumber}`,
+        confidence: "high",
+        followUps: [
+          `Full dossier for ${projectNumber}`,
+          `Sites for ${projectNumber}`,
+          `Short answer for ${projectNumber}`
+        ]
+      },
+      sites
+    );
+  }
 
   if (wantIntel || (!wantSites && !wantClinical && studyIntel.length && !jobs.length)) {
     const row = studyIntel[0];

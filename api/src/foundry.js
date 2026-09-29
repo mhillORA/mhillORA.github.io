@@ -171,6 +171,11 @@ function systemPrompt(cfg) {
       "4) One-line caveat",
       "5) Next move — followUps are concrete next asks",
       "",
+      "DEPTH:",
+      "- If CONTEXT.depth is short: 2–4 sentences max. No fluff.",
+      "- If CONTEXT.depth is long or dossier: write a dense multi-paragraph brief covering NetSuite intel, GM, Veeva studies, sites, PIs, and inv fee rollup. Use CONTEXT.sections — do not invent rows.",
+      "- Inv fee $ is NetSuite study rollup; PI names are Veeva site principal_investigator. Never invent per-PI fees.",
+      "",
       "PURPOSE PACKS (only what CONTEXT contains):",
       "- ClinOps / sites: live ora_veeva_study + ora_veeva_site (+ milestone FSI→LSI for PSM). Never cite PSM without n. Null dates or enrolled → null PSM, not 0. Median of positive site PSMs only. Do not merge sites on org name alone.",
       "- BD / competitive: TrialHub + CT.gov (+ Salesforce when CONTEXT has opportunities). Public registry facts stay public; do not restate them as Ora ops revenue. Pipeline $ is Total_Ora_Net_Revenue__c only — never Amount, never 10-K.",
@@ -205,11 +210,17 @@ async function narrateWithFoundry(question, cosmosAnswer, viewerSlice, priorTurn
   const apiVersion = envSet("AZURE_OPENAI_API_VERSION") || "2024-08-01-preview";
   const context = {
     question,
+    depth: cosmosAnswer.depth || null,
     summary: cosmosAnswer.summary,
     chartTitle: cosmosAnswer.chartTitle,
     tableTitle: cosmosAnswer.tableTitle,
     cols: cosmosAnswer.cols,
-    rows: (cosmosAnswer.rows || []).slice(0, 12),
+    rows: (cosmosAnswer.rows || []).slice(0, 24),
+    sections: (cosmosAnswer.sections || []).slice(0, 8).map((s) => ({
+      title: s.title,
+      cols: s.cols,
+      rows: (s.rows || []).slice(0, 20)
+    })),
     bars: (cosmosAnswer.bars || []).slice(0, 10),
     query: cosmosAnswer.query,
     caveat: cosmosAnswer.caveat,

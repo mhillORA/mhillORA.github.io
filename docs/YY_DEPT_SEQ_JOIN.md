@@ -12,8 +12,19 @@ Ora NetSuite study numbers look like **`25-150-0005`**:
 
 - NetSuite / Cosmos study intel: `ora_ns_study.project_number`
 - Veeva live: `ora_veeva_study.study_number`
-- Exact string match — no mapping table
+- Sites / PIs: `ora_veeva_site` (match study_number or `ora_project_code__c`; PI = `principal_investigator__v`)
+- Exact / prefix / token match — no mapping table
 - GM feed `lens_ns_projects` uses the same project number family (job grain; US/AU can share a number)
+
+### Investigator fees
+
+| Field | Grain | Source |
+|-------|-------|--------|
+| `inv_fee_budget` / `ptc_budget` | Study rollup | NetSuite → `ora_ns_study` |
+| `principal_investigator__v` | Site PI name | Veeva → `ora_veeva_site` |
+| Per-PI fee lines | **Not in Cosmos yet** | Needs SuiteQL line items or Vault fee object |
+
+Ask: `Full dossier for 25-150-0005` · `Short answer for …` · `Investigators on …`
 
 ## Data Lens Data Sync Status
 
