@@ -156,6 +156,78 @@ async function loadBidPricing(projectNumber) {
 /**
  * @param {object} bundle — from getProjectBundle (jobs, studyIntel, studies, sites, investigators)
  */
+function forecastCostLine({ label, budget, actual, progressPct, enrolled, targetPatients }) {
+  const b = money(budget);
+  const a = money(actual);
+  const prog = progressPct != null && progressPct > 0 ? Math.min(1, progressPct) : null;
+  const enr = num(enrolled);
+  const tgt = num(targetPatients);
+
+  // 1) Per-patient run-rate (preferred when enrollment exists)
+  if (a != null && enr != null && enr > 0 && tgt != null && tgt > 0) {
+    const perPatient = money(a / enr);
+    const eac = money(perPatient * tgt);
+    return {
+      label,
+      method: "per_patient",
+      budget: b,
+      actual: a,
+      per_patient: perPatient,
+      forecast_eac: eac,
+      remaining: money(eac - a),
+      vs_budget: b != null ? money(eac - b) : null,
+      note: `$${perPatient}/patient × ${tgt} target`
+    };
+  }
+
+  // 2) Progress run-rate (hours % or patient % without target)
+  if (a != null && prog != null && prog >= 0.02) {
+    const eac = money(a / prog);
+    return {
+      label,
+      method: "progress_run_rate",
+      budget: b,
+      actual: a,
+      per_patient: enr != null && enr > 0 ? money(a / enr) : null,
+      forecast_eac: eac,
+      remaining: money(eac - a),
+      vs_budget: b != null ? money(eac - b) : null,
+      note: `actual ÷ ${Math.round(prog * 100)}% progress`
+    };
+  }
+
+  // 3) Budget curve to completion
+  if (b != null) {
+    const earned = prog != null ? money(b * prog) : null;
+    return {
+      label,
+      method: "budget_curve",
+      budget: b,
+      actual: a,
+      per_patient: null,
+      forecast_eac: b,
+      remaining: money(b - (a || 0)),
+      vs_budget: a != null ? money(a - (earned != null ? earned : a)) : null,
+      note: prog != null ? `budget × progress (earned≈${earned})` : "budget only — no progress yet"
+    };
+  }
+
+  if (a != null) {
+    return {
+      label,
+      method: "actual_only",
+      budget: null,
+      actual: a,
+      per_patient: enr != null && enr > 0 ? money(a / enr) : null,
+      forecast_eac: null,
+      remaining: null,
+      vs_budget: null,
+      note: "actual only — no budget/progress for EAC"
+    };
+  }
+  return null;
+}
+
 async function buildPaymentPosition(projectNumber, bundle) {
   const pn = String(projectNumber || "").trim();
   const intel = (bundle.studyIntel && bundle.studyIntel[0]) || null;
@@ -197,7 +269,11 @@ async function buildPaymentPosition(projectNumber, bundle) {
   const progressPct = patientPct != null ? patientPct : hoursPct;
 
   const invFee = money(intel?.inv_fee_budget);
+  const invFeeActual = money(intel?.inv_fee_actual);
   const ptc = money(intel?.ptc_budget);
+  const ptcActual = money(intel?.ptc_actual);
+  const oopcLabor = money(intel?.oopc_labor_actual);
+  const oopcTravel = money(intel?.oopc_travel_actual);
   const invoiced = money(intel?.invoiced_amount);
   const revenue = money(intel?.revenue_recognized);
   const cogs = money(intel?.cost_of_sales);
@@ -231,6 +307,36 @@ async function buildPaymentPosition(projectNumber, bundle) {
   const remainingToBill =
     earned != null && billed != null ? money(earned - billed) : earned != null ? earned : null;
 
+  const forecastArgs = {
+    progressPct,
+    enrolled,
+    targetPatients
+  };
+  const invForecast = forecastCostLine({
+    label: "Investigator fees",
+    budget: invFee,
+    actual: invFeeActual,
+    ...forecastArgs
+  });
+  const ptcForecast = forecastCostLine({
+    label: "Total PTC (pass-through)",
+    budget: ptc,
+    actual: ptcActual,
+    ...forecastArgs
+  });
+  const oopcLaborF = forecastCostLine({
+    label: "OOPC labor (payroll)",
+    budget: null,
+    actual: oopcLabor,
+    ...forecastArgs
+  });
+  const oopcTravelF = forecastCostLine({
+    label: "OOPC travel (non-PTC)",
+    budget: null,
+    actual: oopcTravel,
+    ...forecastArgs
+  });
+
   const paymentMs = veevaMs.filter((m) => m.payment_relevant);
   const nextTriggers = paymentMs.filter((m) => !m.complete).slice(0, 12);
   const hitTriggers = paymentMs.filter((m) => m.complete).slice(0, 20);
@@ -239,8 +345,11 @@ async function buildPaymentPosition(projectNumber, bundle) {
   if (invFee == null && ptc == null && bidTotal == null && nsMilestoneTotal == null) {
     gaps.push("No pricing pool yet (need ora_ns_study inv/PTC, Buddy bid totals, or NS milestone amounts).");
   }
+  if (invFeeActual == null && ptcActual == null) {
+    gaps.push("No PTC/OOPC actuals on ora_ns_study yet — needs runs_final with inv_fee_actual/ptc_actual (v91+).");
+  }
   if (targetPatients == null) {
-    gaps.push("No contracted patient target (Buddy HLBP/bid drivers.enrolledSubjects) — patient % uses hours % when present.");
+    gaps.push("No contracted patient target (Buddy HLBP/bid drivers.enrolledSubjects) — forecast may use hours %.");
   }
   if (enrolled == null) {
     gaps.push("No Veeva enrolled count on joined studies/sites.");
@@ -257,10 +366,15 @@ async function buildPaymentPosition(projectNumber, bundle) {
 
   return {
     project_number: pn,
-    method: "pricing × patients/milestones → earned vs billed",
+    method: "pricing × patients/milestones → earned vs billed; PTC/OOPC EAC from burn rate",
     pricing: {
       inv_fee_budget: invFee,
+      inv_fee_actual: invFeeActual,
       ptc_budget: ptc,
+      ptc_actual: ptcActual,
+      oopc_labor_actual: oopcLabor,
+      oopc_travel_actual: oopcTravel,
+      ptc_categories: intel?.ptc_categories || null,
       pricing_pool: pricingPool,
       ns_milestone_amount_total: nsMilestoneTotal,
       bid_total_fee: bidTotal,
@@ -297,10 +411,21 @@ async function buildPaymentPosition(projectNumber, bundle) {
       billed,
       remaining_to_bill: remainingToBill
     },
+    forecast: {
+      investigator_fees: invForecast,
+      ptc: ptcForecast,
+      oopc_labor: oopcLaborF,
+      oopc_travel: oopcTravelF,
+      basis: progressPct != null && enrolled != null && targetPatients != null
+        ? "per_patient_when_possible_else_progress"
+        : progressPct != null
+          ? "progress_or_budget"
+          : "budget_only"
+    },
     gaps,
     note:
       gaps.length === 0
-        ? "Payment position uses NetSuite pricing/billing + Veeva enrollment/milestones (+ Buddy bid target when present)."
+        ? "Payment + PTC/OOPC forecast from NetSuite budgets/actuals × Veeva enrollment (+ bid target when present)."
         : `Partial pack — ${gaps.length} gap(s). Still showing every field we have.`
   };
 }
@@ -321,7 +446,11 @@ function paymentSections(payment) {
       rows: [
         ["Pricing pool", p.pricing_pool != null ? String(p.pricing_pool) : "—", "Inv fee + PTC (or bid / NS milestones)"],
         ["Inv fee budget", p.inv_fee_budget != null ? String(p.inv_fee_budget) : "—", "ora_ns_study"],
+        ["Inv fee actual", p.inv_fee_actual != null ? String(p.inv_fee_actual) : "—", "Investigator Compensation (COGS)"],
         ["PTC budget", p.ptc_budget != null ? String(p.ptc_budget) : "—", "ora_ns_study"],
+        ["PTC actual", p.ptc_actual != null ? String(p.ptc_actual) : "—", "sum PTC COGS categories"],
+        ["OOPC labor", p.oopc_labor_actual != null ? String(p.oopc_labor_actual) : "—", "Payroll (non-PTC)"],
+        ["OOPC travel", p.oopc_travel_actual != null ? String(p.oopc_travel_actual) : "—", "Travel (non-PTC)"],
         ["Patients enrolled", pts.enrolled != null ? String(pts.enrolled) : "—", "ora_veeva_study / site"],
         ["Patient target", pts.target != null ? String(pts.target) : "—", "Buddy bid drivers"],
         [
@@ -384,6 +513,36 @@ function paymentSections(payment) {
     });
   }
 
+  const fc = payment.forecast || {};
+  const lines = [fc.investigator_fees, fc.ptc, fc.oopc_labor, fc.oopc_travel].filter(Boolean);
+  if (lines.length) {
+    sections.push({
+      title: "PTC / OOPC forecast (EAC)",
+      grid: "1.2fr 0.7fr 0.7fr 0.7fr 0.7fr 0.7fr 1.2fr",
+      cols: ["Line", "Budget", "Actual", "EAC forecast", "Remaining", "vs budget", "Method"],
+      rows: lines.map((f) => [
+        f.label || "—",
+        f.budget != null ? String(f.budget) : "—",
+        f.actual != null ? String(f.actual) : "—",
+        f.forecast_eac != null ? String(f.forecast_eac) : "—",
+        f.remaining != null ? String(f.remaining) : "—",
+        f.vs_budget != null ? String(f.vs_budget) : "—",
+        f.note || f.method || "—"
+      ])
+    });
+  }
+  if (p.ptc_categories && typeof p.ptc_categories === "object") {
+    const cats = Object.entries(p.ptc_categories);
+    if (cats.length) {
+      sections.push({
+        title: "PTC categories (actual)",
+        grid: "1.4fr 0.8fr",
+        cols: ["Category", "Actual"],
+        rows: cats.map(([k, v]) => [k, v != null ? String(v) : "—"])
+      });
+    }
+  }
+
   if ((payment.gaps || []).length) {
     sections.push({
       title: "Gaps for full payment math",
@@ -401,6 +560,9 @@ function paymentSummaryLines(payment) {
   const mon = payment.money || {};
   const pts = payment.patients || {};
   const p = payment.pricing || {};
+  const fc = payment.forecast || {};
+  const inv = fc.investigator_fees;
+  const ptcF = fc.ptc;
   const lines = [
     `Payment position for ${payment.project_number}: pricing pool ${
       p.pricing_pool != null ? p.pricing_pool : "—"
@@ -410,6 +572,13 @@ function paymentSummaryLines(payment) {
         mon.billed != null ? mon.billed : "—"
       }, remaining ${mon.remaining_to_bill != null ? mon.remaining_to_bill : "—"}.`
   ];
+  if (inv || ptcF) {
+    lines.push(
+      `PTC/OOPC forecast: inv fees EAC ${inv?.forecast_eac ?? "—"} (actual ${inv?.actual ?? "—"} / budget ${
+        inv?.budget ?? "—"
+      }); total PTC EAC ${ptcF?.forecast_eac ?? "—"} (actual ${ptcF?.actual ?? "—"} / budget ${ptcF?.budget ?? "—"}).`
+    );
+  }
   if (payment.note) lines.push(payment.note);
   return lines;
 }

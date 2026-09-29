@@ -885,7 +885,9 @@ async function buildStudyDossier(question, projectNumber, bundle, depth) {
         )} / projected ${fmtNum(intel.total_projected)}. ` +
         `% complete ${intel.percent_complete != null ? pctLabel(intel.percent_complete) : "—"}, ` +
         `realization ${intel.realization_rate != null ? pctLabel(intel.realization_rate) : "—"}. ` +
-        `Inv fee budget ${fmtNum(intel.inv_fee_budget)}, PTC budget ${fmtNum(intel.ptc_budget)}, ` +
+        `Inv fee budget ${fmtNum(intel.inv_fee_budget)} / actual ${fmtNum(intel.inv_fee_actual)}, ` +
+        `PTC budget ${fmtNum(intel.ptc_budget)} / actual ${fmtNum(intel.ptc_actual)}, ` +
+        `OOPC labor ${fmtNum(intel.oopc_labor_actual)} / travel ${fmtNum(intel.oopc_travel_actual)}, ` +
         `invoiced ${fmtNum(intel.invoiced_amount)}, revenue recognized ${fmtNum(intel.revenue_recognized)}, ` +
         `gross margin ${intel.gross_margin_pct != null ? pctLabel(intel.gross_margin_pct) : "—"}.`
     );
@@ -981,7 +983,9 @@ async function buildStudyDossier(question, projectNumber, bundle, depth) {
           "Gross margin",
           intel.gross_margin_pct != null ? pctLabel(intel.gross_margin_pct) : "—"
         ],
-        ["Inv fee budget", fmtNum(intel.inv_fee_budget), "PTC budget", fmtNum(intel.ptc_budget)],
+        ["Inv fee budget", fmtNum(intel.inv_fee_budget), "Inv fee actual", fmtNum(intel.inv_fee_actual)],
+        ["PTC budget", fmtNum(intel.ptc_budget), "PTC actual", fmtNum(intel.ptc_actual)],
+        ["OOPC labor", fmtNum(intel.oopc_labor_actual), "OOPC travel", fmtNum(intel.oopc_travel_actual)],
         ["Invoiced", fmtNum(intel.invoiced_amount), "Revenue recognized", fmtNum(intel.revenue_recognized)]
       ]
     });

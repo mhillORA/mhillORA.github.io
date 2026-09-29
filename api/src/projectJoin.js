@@ -84,7 +84,8 @@ async function loadNsProjects() {
 const NS_STUDY_SELECT =
   "SELECT TOP 50 c.id, c.project_number, c.project_name, c.project_manager, c.service_line, c.project_status, " +
   "c.start_date, c.calculated_end_date, c.total_budgeted, c.total_actual, c.total_etc, c.total_projected, " +
-  "c.realization_rate, c.percent_complete, c.inv_fee_budget, c.ptc_budget, c.invoiced_amount, " +
+  "c.realization_rate, c.percent_complete, c.inv_fee_budget, c.inv_fee_actual, c.ptc_budget, c.ptc_actual, " +
+  "c.oopc_labor_actual, c.oopc_travel_actual, c.ptc_categories, c.invoiced_amount, " +
   "c.revenue_recognized, c.cost_of_sales, c.gross_profit, c.gross_margin_pct, c.study_year, c.study_dept, " +
   "c.study_seq, c.pulledAt, c.syncedAt, c._ts FROM c WHERE c.docType = @t AND c.project_number = @pn";
 
@@ -115,9 +116,15 @@ function compactStudyIntel(r) {
     realization_rate: numOrNull(r.realization_rate),
     percent_complete: numOrNull(r.percent_complete),
     inv_fee_budget: numOrNull(r.inv_fee_budget),
+    inv_fee_actual: numOrNull(r.inv_fee_actual),
     ptc_budget: numOrNull(r.ptc_budget),
+    ptc_actual: numOrNull(r.ptc_actual),
+    oopc_labor_actual: numOrNull(r.oopc_labor_actual),
+    oopc_travel_actual: numOrNull(r.oopc_travel_actual),
+    ptc_categories: r.ptc_categories && typeof r.ptc_categories === "object" ? r.ptc_categories : null,
     invoiced_amount: numOrNull(r.invoiced_amount),
     revenue_recognized: numOrNull(r.revenue_recognized),
+    cost_of_sales: numOrNull(r.cost_of_sales),
     gross_margin_pct: numOrNull(r.gross_margin_pct),
     pulledAt: r.pulledAt || r.syncedAt || null
   };

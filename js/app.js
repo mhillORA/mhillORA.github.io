@@ -2584,9 +2584,15 @@
     <p class="list-meta" style="margin-top:0.75rem;">
       NetSuite study intel · last sync ${escapeHtml(ns.lastSuccessfulSync || "never")}
       · studies ${ns.studies ?? "—"} · tasks ${ns.tasks ?? "—"}
+      · last upsert studies ${ns.lastStudyUpserted ?? "—"} / tasks ${ns.lastTaskUpserted ?? "—"}
       · sample ${escapeHtml(sample)}
       · format ${escapeHtml(status.projectNumberFormat || "YY-DEPT-SEQ")}
-    </p>`;
+    </p>
+    ${
+      Number(ns.studies || 0) > 0 && Number(ns.tasks || 0) === 0
+        ? `<p class="caveat">ora_ns_task is empty — last job only upserted studies. Rebuild netsuite-pull with task chunks (v91+) and FORCE_RUN.</p>`
+        : ""
+    }`;
   }
 
   async function loadSyncStatus({ force = false } = {}) {
