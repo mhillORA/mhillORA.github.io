@@ -3891,6 +3891,46 @@
             return humanizeSiteIdSlug(siteId);
         };
 
+        /** PI display for sponsor matrix / Excel — live site first, then response stealth/display. */
+        const resolveSponsorSitePiName = (siteId, response = null) => {
+            const pick = (value) => {
+                const t = String(value || '').trim();
+                if (!t || looksLikeInternalSiteId(t)) return null;
+                if (/^site\s*\(shared\)$/i.test(t)) return null;
+                return t;
+            };
+            const live = getSiteLinkIndex().liveById.get(siteId) || (allSites || []).find((s) => s && s.id === siteId);
+            const legacy = getSiteLinkIndex().legacyById.get(siteId) || legacySitesCatalog().find((s) => s && s.id === siteId);
+            const candidates = [
+                live?.pi,
+                live?.piName,
+                [live?.piFirstName, live?.piLastName].filter(Boolean).join(' '),
+                legacy?.pi,
+                legacy?.piName,
+                response?.stealthPi,
+                response?.piName,
+                response?.pi,
+            ];
+            for (const c of candidates) {
+                const hit = pick(c);
+                if (hit) return hit;
+            }
+            // Fall back to Investigator name answer on the response when present
+            const answers = asSurveyList(response?.answers);
+            for (const a of answers) {
+                const label = String(a?.label || a?.questionLabel || '').toLowerCase();
+                const qid = String(a?.questionId || a?.id || a?.libraryQuestionId || '').toLowerCase();
+                if (
+                    /investigator.*name|investigator first and last|pi name|principal investigator/.test(label)
+                    || /investigator.*name|pi[-_]?name|ql-pi-name/.test(qid)
+                ) {
+                    const hit = pick(a?.value);
+                    if (hit) return hit;
+                }
+            }
+            return '';
+        };
+
         const formatSponsorSurveyTitle = (def, surveyId) => {
             const t = String(def?.title || '').trim();
             if (t && !looksLikeInternalSiteId(t) && !/^survey[-_]/i.test(t)) return t;
@@ -5021,15 +5061,18 @@
 
             const matrixHead = `
                 <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase sticky left-0 bg-gray-50 dark:bg-gray-700 z-10">Site</th>
+                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">PI</th>
+                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Respondent</th>
                 <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Response status</th>
-                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Complete %</th>
-                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Outcome</th>
-                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Role</th>
+                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Date</th>
+                <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase">Score %</th>
                 ${report.questions.map(q => `
                     <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-300 uppercase whitespace-nowrap" title="${escapeHtml(q.label || q.id || '')}">${escapeHtml(truncateLabel(q.label || q.id || ''))}</th>`).join('')}`;
 
             const matrixBody = report.siteRows.map(row => {
-                const when = row.when ? new Date(row.when).toLocaleDateString() : '—';
+                const when = row.when ? formatSponsorDate(row.when) : '—';
+                const scorePct = typeof row.response?.score?.pct === 'number' ? `${row.response.score.pct}%` : '—';
+                const piName = resolveSponsorSitePiName(row.siteId, row.response) || '—';
                 const cells = report.questions.map(q => {
                     const { skipped, value } = findAnswerForQuestion(row.response, q);
                     const display = skipped || !value ? '—' : (value.length > 60 ? `${value.slice(0, 59)}…` : value);
@@ -5039,16 +5082,16 @@
                     <tr class="hover:bg-gray-50 dark:hover:bg-gray-700/40">
                         <td class="px-3 py-2 text-sm font-medium text-gray-900 dark:text-gray-100 sticky left-0 bg-white dark:bg-gray-800 z-10 whitespace-nowrap">
                             <button type="button" class="view-site-details-btn hover:underline" data-site-id="${escapeHtml(row.siteId)}">${escapeHtml(row.siteName)}</button>
-                            <div class="text-[10px] text-gray-400 font-normal">${escapeHtml(when)}</div>
                         </td>
-                        <td class="px-3 py-2 text-xs whitespace-nowrap">${feasibilityAnswerSourceBadgeHtml(row.answerSource)}</td>
-                        <td class="px-3 py-2 text-xs whitespace-nowrap">${answeredPctBadgeHtml(row.answeredPct, row.completionStatus)}</td>
-                        <td class="px-3 py-2 text-xs whitespace-nowrap">${surveyOutcomeBadgeHtml(row.response, report.def)}</td>
+                        <td class="px-3 py-2 text-xs text-gray-700 dark:text-gray-300 whitespace-nowrap">${escapeHtml(piName)}</td>
                         <td class="px-3 py-2 text-xs text-gray-600 dark:text-gray-300 whitespace-nowrap">
                             ${row.response?.id
                                 ? `<button type="button" class="view-site-survey-response-btn text-indigo-600 dark:text-indigo-400 hover:underline" data-response-id="${escapeHtml(row.response.id)}">${escapeHtml(formatSiteSurveyRoleLabel(row.response.targetRole) || 'View')}</button>`
                                 : '<span class="text-gray-400">—</span>'}
                         </td>
+                        <td class="px-3 py-2 text-xs whitespace-nowrap">${feasibilityAnswerSourceBadgeHtml(row.answerSource)}</td>
+                        <td class="px-3 py-2 text-xs text-gray-600 dark:text-gray-300 whitespace-nowrap">${escapeHtml(when)}</td>
+                        <td class="px-3 py-2 text-xs whitespace-nowrap">${escapeHtml(scorePct)}</td>
                         ${cells}
                     </tr>`;
             }).join('');
@@ -5538,48 +5581,73 @@
                 dist.getColumn(5).width = 10;
 
                 const matrix = wb.addWorksheet('Site Matrix', { views: [{ state: 'frozen', xSplit: 1, ySplit: 1 }] });
+                // Column order matches ops sponsor pack markup:
+                // Site | PI | Respondent | Response status | Date | Score % | Include/Exclude | Feedback | Notes | questions… | Include/Exclude | Feedback | Notes
                 const matrixHeaders = [
                     'Site',
+                    'PI',
                     'Respondent',
                     'Response status',
                     'Date',
                     'Score %',
+                    'Include / Exclude',
+                    'Feedback',
+                    'Notes',
                     ...report.questions.map((q, i) => formatSponsorQuestionLabel(q, i)),
                     'Include / Exclude',
                     'Feedback',
-                    'Notes'
+                    'Notes',
                 ];
                 styleHeaderRow(matrix.addRow(matrixHeaders));
                 report.siteRows.forEach(row => {
                     const scorePct = typeof row.response?.score?.pct === 'number' ? row.response.score.pct : '';
                     matrix.addRow([
                         row.siteName,
+                        resolveSponsorSitePiName(row.siteId, row.response),
                         formatSponsorRoleLabel(row.response?.targetRole),
                         feasibilityAnswerSourceLabel(row.answerSource),
                         formatSponsorDate(row.when),
                         scorePct,
+                        '',
+                        '',
+                        '',
                         ...report.questions.map(q => findAnswerForQuestion(row.response, q).value || ''),
                         '',
                         '',
-                        ''
+                        '',
                     ]);
                 });
                 matrix.getColumn(1).width = 26;
-                matrix.getColumn(2).width = 14;
-                matrix.getColumn(3).width = 26;
-                matrix.getColumn(4).width = 22;
-                matrix.getColumn(5).width = 10;
-                for (let c = 6; c <= 5 + report.questions.length; c++) {
+                matrix.getColumn(2).width = 22;
+                matrix.getColumn(3).width = 14;
+                matrix.getColumn(4).width = 26;
+                matrix.getColumn(5).width = 22;
+                matrix.getColumn(6).width = 10;
+                matrix.getColumn(7).width = 14;
+                matrix.getColumn(8).width = 22;
+                matrix.getColumn(9).width = 22;
+                for (let c = 10; c <= 9 + report.questions.length; c++) {
                     matrix.getColumn(c).width = 18;
                 }
-                const matrixIncludeCol = 6 + report.questions.length;
+                const matrixFrontIncludeCol = 7;
+                const matrixBackIncludeCol = 10 + report.questions.length;
+                const dataStart = 2;
+                const dataEnd = 1 + report.siteRows.length;
                 applySponsorReviewColumns(
                     matrix,
-                    2,
-                    1 + report.siteRows.length,
-                    matrixIncludeCol,
-                    matrixIncludeCol + 1,
-                    matrixIncludeCol + 2
+                    dataStart,
+                    dataEnd,
+                    matrixFrontIncludeCol,
+                    matrixFrontIncludeCol + 1,
+                    matrixFrontIncludeCol + 2
+                );
+                applySponsorReviewColumns(
+                    matrix,
+                    dataStart,
+                    dataEnd,
+                    matrixBackIncludeCol,
+                    matrixBackIncludeCol + 1,
+                    matrixBackIncludeCol + 2
                 );
 
                 const detail = wb.addWorksheet('Detail');
