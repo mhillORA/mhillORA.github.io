@@ -17,10 +17,14 @@ async function deliverViaWebhook({ to, subject, text, html, meta, cc, attachment
     const webhook = process.env.SURVEY_EMAIL_WEBHOOK || process.env.SURVEY_NOTIFY_WEBHOOK;
     if (!webhook) return null;
 
+    // Cap webhook wait so a hung Power Automate / Logic App falls through to Graph.
+    const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = ctrl ? setTimeout(() => ctrl.abort(), 12_000) : null;
     try {
         const res = await fetch(webhook, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
+            signal: ctrl?.signal,
             body: JSON.stringify({
                 type: 'site_survey_invite',
                 to,
@@ -43,7 +47,14 @@ async function deliverViaWebhook({ to, subject, text, html, meta, cc, attachment
         }
         return { ok: true, mode: 'webhook' };
     } catch (e) {
-        return { ok: false, mode: 'webhook', error: e.message || 'webhook_failed' };
+        const aborted = e?.name === 'AbortError';
+        return {
+            ok: false,
+            mode: 'webhook',
+            error: aborted ? 'webhook_timeout' : (e.message || 'webhook_failed'),
+        };
+    } finally {
+        if (timer) clearTimeout(timer);
     }
 }
 
@@ -224,6 +235,7 @@ async function deliverSurveyEmail({ to, subject, text, html, meta, cc, attachmen
 
     const ccList = Array.isArray(cc) ? cc.filter(Boolean) : [];
     const files = Array.isArray(attachments) ? attachments : [];
+    const attempts = [];
 
     const viaWebhook = await deliverViaWebhook({
         to: recipient,
@@ -234,7 +246,11 @@ async function deliverSurveyEmail({ to, subject, text, html, meta, cc, attachmen
         cc: ccList,
         attachments: files,
     });
-    if (viaWebhook) return viaWebhook;
+    if (viaWebhook) {
+        attempts.push(viaWebhook);
+        if (viaWebhook.ok) return viaWebhook;
+        // Failed/hung webhook must not block Graph / SendGrid.
+    }
 
     const viaGraph = await deliverViaGraph({
         to: recipient,
@@ -244,7 +260,10 @@ async function deliverSurveyEmail({ to, subject, text, html, meta, cc, attachmen
         cc: ccList,
         attachments: files,
     });
-    if (viaGraph) return viaGraph;
+    if (viaGraph) {
+        attempts.push(viaGraph);
+        if (viaGraph.ok) return viaGraph;
+    }
 
     const viaSendGrid = await deliverViaSendGrid({
         to: recipient,
@@ -254,9 +273,15 @@ async function deliverSurveyEmail({ to, subject, text, html, meta, cc, attachmen
         cc: ccList,
         attachments: files,
     });
-    if (viaSendGrid) return viaSendGrid;
+    if (viaSendGrid) {
+        attempts.push(viaSendGrid);
+        if (viaSendGrid.ok) return viaSendGrid;
+    }
 
-    return { ok: false, mode: 'manual', error: 'no_email_provider' };
+    const last = attempts[attempts.length - 1];
+    return last
+        ? { ...last, attempts: attempts.map((a) => ({ mode: a.mode, ok: a.ok, error: a.error })) }
+        : { ok: false, mode: 'manual', error: 'no_email_provider' };
 }
 
 function formatInviteCloseDate(expiresAt) {

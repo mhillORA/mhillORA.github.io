@@ -2119,12 +2119,8 @@ function registerSurveySecureRoutes(app, deps) {
 
         assignment.revokedAt = undefined;
         assignment.updatedAt = now;
-        assignment.lastSentAt = now;
-        assignment.sendCount = (assignment.sendCount || 0) + 1;
+        // Keep invite in its original send cohort — never mint a new batchId on remind.
         if (reminder) {
-            assignment.lastRemindedAt = now;
-            assignment.remindCount = (assignment.remindCount || 0) + 1;
-            // Keep invite in its original send cohort — never mint a new batchId on remind.
             if (!assignment.batchSentAt) {
                 assignment.batchSentAt = assignment.createdAt || now;
             }
@@ -2142,6 +2138,8 @@ function registerSurveySecureRoutes(app, deps) {
             baseUrl,
         });
         // Persist token before email. Soft-fail: still attempt delivery if upsert flakes.
+        // Do NOT stamp lastRemindedAt / lastSentAt yet — only after a successful delivery
+        // so gateway timeouts can be confirmed via Cosmos without false positives.
         try {
             await getContainer(ASSIGNMENTS).items.upsert(assignment);
         } catch (upsertErr) {
@@ -2205,36 +2203,52 @@ function registerSurveySecureRoutes(app, deps) {
             const copy = reminder
                 ? reminderInviteCopy(copyOpts)
                 : inviteEmailCopy(copyOpts);
-            const emailDeliveries = [];
-            for (const email of emails) {
-                try {
-                    const one = await deliverSurveyEmail({
-                        to: email,
-                        cc: resendCc,
-                        subject: copy.subject,
-                        text: copy.text,
-                        html: copy.html,
-                        attachments: resendFiles,
-                        meta: {
-                            assignmentId: assignment.id,
-                            siteId: assignment.siteId,
-                            resend: !reminder,
-                            reminder: !!reminder,
-                            statusKind,
-                        },
-                    });
-                    emailDeliveries.push({ to: email, ...one });
-                } catch (mailErr) {
-                    emailDeliveries.push({
-                        to: email,
-                        ok: false,
-                        mode: 'error',
-                        error: mailErr?.message || String(mailErr),
-                    });
-                }
-            }
+            const emailDeliveries = await Promise.all(
+                emails.map(async (email) => {
+                    try {
+                        const one = await deliverSurveyEmail({
+                            to: email,
+                            cc: resendCc,
+                            subject: copy.subject,
+                            text: copy.text,
+                            html: copy.html,
+                            attachments: resendFiles,
+                            meta: {
+                                assignmentId: assignment.id,
+                                siteId: assignment.siteId,
+                                resend: !reminder,
+                                reminder: !!reminder,
+                                statusKind,
+                            },
+                        });
+                        return { to: email, ...one };
+                    } catch (mailErr) {
+                        return {
+                            to: email,
+                            ok: false,
+                            mode: 'error',
+                            error: mailErr?.message || String(mailErr),
+                        };
+                    }
+                })
+            );
             emailResult = emailDeliveries.find((d) => d.ok) || emailDeliveries[0] || emailResult;
             emailResult.deliveries = emailDeliveries;
+
+            // Stamp send/remind counters only after at least one delivery succeeded.
+            if (emailResult.ok) {
+                const stamp = new Date().toISOString();
+                assignment.updatedAt = stamp;
+                assignment.lastSentAt = stamp;
+                assignment.sendCount = (assignment.sendCount || 0) + 1;
+                assignment.lastEmailOkAt = stamp;
+                assignment.lastEmailMode = emailResult.mode || null;
+                if (reminder) {
+                    assignment.lastRemindedAt = stamp;
+                    assignment.remindCount = (assignment.remindCount || 0) + 1;
+                }
+            }
+
             try {
                 await getContainer(ASSIGNMENTS).items.upsert(assignment);
             } catch (upsertErr) {

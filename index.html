@@ -11413,6 +11413,117 @@
                 const submitBtn = form.querySelector('button[type="submit"]');
                 if (submitBtn) submitBtn.disabled = true;
                 if (errEl) { errEl.classList.add('hidden'); errEl.textContent = ''; }
+                const startedAt = Date.now();
+                const priorRemindedAt = mode === 'one' && assignmentId
+                    ? String((allSiteSurveyAssignments || []).find((a) => a.id === assignmentId)?.lastRemindedAt || '')
+                    : '';
+                const priorBatchSnapshot = mode === 'batch' && surveyId
+                    ? new Map(
+                        (allSiteSurveyAssignments || [])
+                            .filter((a) => a && a.surveyId === surveyId)
+                            .map((a) => [a.id, String(a.lastRemindedAt || '')])
+                    )
+                    : null;
+
+                const finishOneSuccess = (result) => {
+                    closeModal();
+                    showSiteSurveySendResultsModal({
+                        surveyTitle: 'Reminder sent',
+                        surveyId: result?.assignment?.surveyId,
+                        results: [{
+                            siteName: allSites.find(s => s.id === result?.assignment?.siteId)?.name || result?.assignment?.siteId,
+                            siteId: result?.assignment?.siteId,
+                            targetRole: result?.assignment?.targetRole,
+                            targetEmail: result?.targetEmail,
+                            inviteUrl: result?.inviteUrl,
+                            email: result?.email,
+                            emailDeliveries: result?.email?.deliveries,
+                        }],
+                        emailProvider: result?.emailProvider || undefined,
+                    });
+                    const emailed = !!(result?.email?.ok || (result?.email?.deliveries || []).some((d) => d.ok));
+                    showNotification(
+                        emailed ? 'Reminder emailed' : 'Reminder link created — check delivery status',
+                        emailed ? 'success' : 'info'
+                    );
+                };
+
+                const finishBatchSuccess = (result) => {
+                    closeModal();
+                    const results = Array.isArray(result?.results) ? result.results : [];
+                    showSiteSurveySendResultsModal({
+                        surveyTitle: (allSiteSurveyDefinitions || []).find(d => d.id === surveyId)?.title || surveyId,
+                        surveyId,
+                        results: results.map((r) => ({
+                            siteName: allSites.find(s => s.id === r.siteId)?.name || r.siteId,
+                            siteId: r.siteId,
+                            targetRole: (allSiteSurveyAssignments || []).find(a => a.id === r.assignmentId)?.targetRole,
+                            targetEmail: r.targetEmail,
+                            inviteUrl: r.inviteUrl,
+                            email: r.email || (r.error ? { ok: false, error: r.error } : { ok: false }),
+                            emailDeliveries: r.email?.deliveries,
+                        })),
+                        emailProvider: result?.emailProvider || undefined,
+                    });
+                    const sentN = Number(result?.sent || 0);
+                    const targetedN = Number(result?.targeted || 0);
+                    showNotification(
+                        sentN
+                            ? `Reminders emailed: ${sentN} of ${targetedN}`
+                            : `Reminders finished — ${targetedN} targeted, none emailed (check links)`,
+                        sentN ? 'success' : 'info'
+                    );
+                };
+
+                /** After gateway timeout, Cosmos lastRemindedAt is only stamped when Graph/webhook delivery succeeded. */
+                const confirmReminderViaCosmos = async () => {
+                    await new Promise((r) => setTimeout(r, 1500));
+                    const fresh = await apiService.getSiteSurveyAssignments().catch(() => null);
+                    if (!Array.isArray(fresh)) return null;
+                    allSiteSurveyAssignments = fresh;
+                    const recentEnough = (iso) => {
+                        const t = Date.parse(iso);
+                        return Number.isFinite(t) && t >= startedAt - 15_000;
+                    };
+                    if (mode === 'one' && assignmentId) {
+                        const row = fresh.find((a) => a && a.id === assignmentId);
+                        const stamp = String(row?.lastRemindedAt || row?.lastEmailOkAt || '');
+                        if (stamp && stamp !== priorRemindedAt && recentEnough(stamp)) {
+                            return {
+                                assignment: row,
+                                targetEmail: row?.targetEmail || null,
+                                inviteUrl: null,
+                                email: { ok: true, mode: row?.lastEmailMode || 'confirmed', recovered: true },
+                            };
+                        }
+                        return null;
+                    }
+                    if (mode === 'batch' && priorBatchSnapshot) {
+                        const confirmed = fresh.filter((a) => {
+                            if (!a || a.surveyId !== surveyId) return false;
+                            const stamp = String(a.lastRemindedAt || a.lastEmailOkAt || '');
+                            if (!stamp || !recentEnough(stamp)) return false;
+                            const prev = priorBatchSnapshot.get(a.id) || '';
+                            return stamp !== prev;
+                        });
+                        if (!confirmed.length) return null;
+                        return {
+                            ok: true,
+                            surveyId,
+                            targeted: confirmed.length,
+                            sent: confirmed.length,
+                            results: confirmed.map((a) => ({
+                                assignmentId: a.id,
+                                siteId: a.siteId,
+                                targetEmail: a.targetEmail,
+                                email: { ok: true, mode: a.lastEmailMode || 'confirmed', recovered: true },
+                                inviteUrl: null,
+                            })),
+                        };
+                    }
+                    return null;
+                };
+
                 try {
                     if (mode === 'batch') {
                         const result = await apiService.remindSiteSurveys({
@@ -11423,30 +11534,7 @@
                             password,
                             includeAttachments: false,
                         });
-                        closeModal();
-                        const results = Array.isArray(result?.results) ? result.results : [];
-                        showSiteSurveySendResultsModal({
-                            surveyTitle: (allSiteSurveyDefinitions || []).find(d => d.id === surveyId)?.title || surveyId,
-                            surveyId,
-                            results: results.map((r) => ({
-                                siteName: allSites.find(s => s.id === r.siteId)?.name || r.siteId,
-                                siteId: r.siteId,
-                                targetRole: (allSiteSurveyAssignments || []).find(a => a.id === r.assignmentId)?.targetRole,
-                                targetEmail: r.targetEmail,
-                                inviteUrl: r.inviteUrl,
-                                email: r.email || (r.error ? { ok: false, error: r.error } : { ok: false }),
-                                emailDeliveries: r.email?.deliveries,
-                            })),
-                            emailProvider: result?.emailProvider || undefined,
-                        });
-                        const sentN = Number(result?.sent || 0);
-                        const targetedN = Number(result?.targeted || 0);
-                        showNotification(
-                            sentN
-                                ? `Reminders emailed: ${sentN} of ${targetedN}`
-                                : `Reminders finished — ${targetedN} targeted, none emailed (check links)`,
-                            sentN ? 'success' : 'info'
-                        );
+                        finishBatchSuccess(result);
                     } else {
                         const result = await apiService.resendSiteSurvey(assignmentId, {
                             reminder: true,
@@ -11454,41 +11542,38 @@
                             password,
                             includeAttachments: false,
                         });
-                        closeModal();
-                        showSiteSurveySendResultsModal({
-                            surveyTitle: 'Reminder sent',
-                            surveyId: result?.assignment?.surveyId,
-                            results: [{
-                                siteName: allSites.find(s => s.id === result?.assignment?.siteId)?.name || result?.assignment?.siteId,
-                                siteId: result?.assignment?.siteId,
-                                targetRole: result?.assignment?.targetRole,
-                                targetEmail: result?.targetEmail,
-                                inviteUrl: result?.inviteUrl,
-                                email: result?.email,
-                                emailDeliveries: result?.email?.deliveries,
-                            }],
-                            emailProvider: result?.emailProvider || undefined,
-                        });
-                        const emailed = !!(result?.email?.ok || (result?.email?.deliveries || []).some((d) => d.ok));
-                        showNotification(
-                            emailed ? 'Reminder emailed' : 'Reminder link created — check delivery status',
-                            emailed ? 'success' : 'info'
-                        );
+                        finishOneSuccess(result);
                     }
                     allSiteSurveyAssignments = await apiService.getSiteSurveyAssignments().catch(() => allSiteSurveyAssignments);
                     if (activeTab === 'feasibility') render();
                 } catch (err) {
                     const msg = err?.message || String(err);
-                    // Gateway timeouts often fire after Graph already sent — don't scare ops with a hard fail if we can tell.
-                    const likelyTimeout = /504|502|timeout|timed out|Failed to fetch|network/i.test(msg);
+                    // Gateway timeouts often fire after Graph already sent — confirm via Cosmos stamp.
+                    const likelyTimeout = /504|502|503|timeout|timed out|Failed to fetch|network|AbortError/i.test(msg);
+                    if (likelyTimeout) {
+                        if (errEl) {
+                            errEl.textContent = 'Gateway timed out — confirming whether the reminder was delivered…';
+                            errEl.classList.remove('hidden');
+                        }
+                        showNotification('Confirming reminder delivery…', 'info');
+                        try {
+                            const recovered = await confirmReminderViaCosmos();
+                            if (recovered) {
+                                if (mode === 'batch') finishBatchSuccess(recovered);
+                                else finishOneSuccess(recovered);
+                                if (activeTab === 'feasibility') render();
+                                return;
+                            }
+                        } catch (_) { /* fall through to error UI */ }
+                    }
                     if (errEl) {
                         errEl.textContent = likelyTimeout
-                            ? `${msg} — if recipients already got mail, refresh Status; links were likely minted.`
+                            ? `${msg} — delivery not confirmed in Status yet. Refresh Status; if “reminded” just updated, mail went out.`
                             : msg;
                         errEl.classList.remove('hidden');
                     }
                     showNotification(
-                        likelyTimeout ? 'Reminder may have sent — check Status / inbox (gateway timeout).' : (msg || 'Reminder failed'),
+                        likelyTimeout ? 'Reminder not confirmed — refresh Status before retrying.' : (msg || 'Reminder failed'),
                         likelyTimeout ? 'info' : 'error'
                     );
                 } finally {
