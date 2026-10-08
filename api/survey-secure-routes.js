@@ -2325,28 +2325,44 @@ function registerSurveySecureRoutes(app, deps) {
                     };
                 }
 
-                // Never rotate here — Copy link must return the same URL that was emailed.
-                const inviteUrl = currentInviteUrl(assignment, baseUrl);
+                // Copy (default): return stored URL only.
+                // Create (body.create): mint once when missing, persist tokenRaw, keep that link.
+                const allowCreate = body?.create === true || body?.establish === true;
+                let inviteUrl = currentInviteUrl(assignment, baseUrl);
+                let established = false;
                 if (!inviteUrl) {
-                    return {
-                        status: 409,
-                        jsonBody: {
-                            ok: false,
-                            error:
-                                'This invite was sent before the original URL was saved for recovery, so it can’t be shown here. Remind / Resend will email the same link going forward once one is on file (or mint one if this invite has none).',
-                            recoverable: false,
-                            targetEmail: assignment.targetEmail || null,
-                            assignment: redactAssignment(assignment),
-                        },
-                        headers: corsHeaders(),
-                    };
+                    if (!allowCreate) {
+                        return {
+                            status: 409,
+                            jsonBody: {
+                                ok: false,
+                                recoverable: false,
+                                error:
+                                    'No saved survey URL for this invite yet. Use Create link to make one (it becomes the permanent link going forward).',
+                                targetEmail: assignment.targetEmail || null,
+                                assignment: redactAssignment(assignment),
+                            },
+                            headers: corsHeaders(),
+                        };
+                    }
+                    ({ inviteUrl } = attachInviteToken(assignment, { baseUrl }));
+                    assignment.updatedAt = new Date().toISOString();
+                    try {
+                        await getContainer(ASSIGNMENTS).items.upsert(assignment);
+                    } catch (upsertErr) {
+                        try {
+                            console.warn('invite-link create upsert failed', id, upsertErr?.message || upsertErr);
+                        } catch (_) {}
+                    }
+                    established = true;
                 }
 
                 return {
                     jsonBody: {
                         ok: true,
-                        rotated: false,
-                        recoverable: true,
+                        rotated: established,
+                        established,
+                        recoverable: !established,
                         inviteUrl,
                         targetEmail: assignment.targetEmail || null,
                         assignment: redactAssignment(assignment),

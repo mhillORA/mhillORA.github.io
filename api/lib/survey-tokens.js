@@ -91,6 +91,8 @@ function redactAssignment(doc) {
     return {
         ...safe,
         hasInviteToken: Boolean(tokenHash),
+        // Staff UI: Copy link vs Create link (raw never returned on list endpoints).
+        hasRecoverableLink: Boolean(tokenRaw || inviteToken),
         requiresPassword: Boolean(passwordHash),
         tokenPrefix: doc.tokenPrefix || undefined,
     };
