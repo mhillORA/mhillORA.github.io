@@ -2110,7 +2110,7 @@ function registerSurveySecureRoutes(app, deps) {
         },
     });
 
-    // ---------- Ops: rotate / resend token for one assignment ----------
+    // ---------- Ops: resend / remind (same invite URL — one link per assignment) ----------
     const resendOneAssignment = async ({
         assignment,
         baseUrl,
@@ -2144,11 +2144,17 @@ function registerSurveySecureRoutes(app, deps) {
             assignment.expiresAt = defaultExpiresAt(DEFAULT_TTL_DAYS);
         }
 
-        const { inviteUrl } = attachInviteToken(assignment, {
-            expiresInDays: clampExpiresInDays(body.expiresInDays || DEFAULT_TTL_DAYS),
-            baseUrl,
-        });
-        // Persist token before email. Soft-fail: still attempt delivery if upsert flakes.
+        // One link per invite: reuse the emailed token whenever we still have it.
+        // Only mint if this assignment has no recoverable token (legacy) or ops force rotate.
+        const forceRotate = body.rotate === true || body.forceNewLink === true;
+        let inviteUrl = forceRotate ? null : currentInviteUrl(assignment, baseUrl);
+        if (!inviteUrl) {
+            ({ inviteUrl } = attachInviteToken(assignment, {
+                expiresInDays: clampExpiresInDays(body.expiresInDays || DEFAULT_TTL_DAYS),
+                baseUrl,
+            }));
+        }
+        // Persist before email. Soft-fail: still attempt delivery if upsert flakes.
         // Do NOT stamp lastRemindedAt / lastSentAt yet — only after a successful delivery
         // so gateway timeouts can be confirmed via Cosmos without false positives.
         try {
@@ -2327,7 +2333,7 @@ function registerSurveySecureRoutes(app, deps) {
                         jsonBody: {
                             ok: false,
                             error:
-                                'This invite was sent before link recovery was available, so the original URL can’t be shown. Use Remind / Resend email only if you want a new link (that replaces the emailed one).',
+                                'This invite was sent before the original URL was saved for recovery, so it can’t be shown here. Remind / Resend will email the same link going forward once one is on file (or mint one if this invite has none).',
                             recoverable: false,
                             targetEmail: assignment.targetEmail || null,
                             assignment: redactAssignment(assignment),
