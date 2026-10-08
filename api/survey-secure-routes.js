@@ -2325,10 +2325,14 @@ function registerSurveySecureRoutes(app, deps) {
                     };
                 }
 
-                // Copy (default): return stored URL only.
-                // Create (body.create): mint once when missing, persist tokenRaw, keep that link.
-                const allowCreate = body?.create === true || body?.establish === true;
-                let inviteUrl = currentInviteUrl(assignment, baseUrl);
+                // Return stored URL when present.
+                // create/establish: mint if missing. rotate/forceNewLink: always mint a replacement.
+                const forceRotate = body?.rotate === true || body?.forceNewLink === true;
+                const allowCreate =
+                    forceRotate
+                    || body?.create === true
+                    || body?.establish === true;
+                let inviteUrl = forceRotate ? null : currentInviteUrl(assignment, baseUrl);
                 let established = false;
                 if (!inviteUrl) {
                     if (!allowCreate) {
