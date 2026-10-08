@@ -842,17 +842,28 @@ function buildLockedPublicPayload({ assignment, definition, siteName }) {
 
 /**
  * Attach invite token fields to a new/updated assignment (mutates doc).
- * Returns { raw, inviteUrl } for one-time client display.
+ * Persists tokenRaw for staff Copy-link recovery (stripped by redactAssignment).
+ * Public auth still uses tokenHash only. Returns { raw, inviteUrl }.
  */
 function attachInviteToken(assignment, { expiresInDays, baseUrl } = {}) {
     const { raw, hash, prefix } = mintSurveyToken();
     assignment.tokenHash = hash;
     assignment.tokenPrefix = prefix;
+    // Staff-only recoverability — never returned on list endpoints (see redactAssignment).
+    assignment.tokenRaw = raw;
     assignment.expiresAt = assignment.expiresAt || defaultExpiresAt(expiresInDays || DEFAULT_TTL_DAYS);
     assignment.allowResubmit = assignment.allowResubmit !== false;
     assignment.inviteCreatedAt = new Date().toISOString();
     const inviteUrl = baseUrl ? buildInviteUrl(baseUrl, raw) : null;
     return { raw, inviteUrl, prefix };
+}
+
+/** Rebuild the current invite URL without rotating the token. */
+function currentInviteUrl(assignment, baseUrl) {
+    const raw = String(assignment?.tokenRaw || assignment?.inviteToken || '').trim();
+    const base = String(baseUrl || '').replace(/\/$/, '');
+    if (!raw || !base) return null;
+    return buildInviteUrl(base, raw);
 }
 
 /** Mirror of Status board classification for reminder targeting. */
@@ -2272,6 +2283,76 @@ function registerSurveySecureRoutes(app, deps) {
         };
     };
 
+    // ---------- Ops: reveal current invite URL without rotating ----------
+    app.http('siteSurveyInviteLink', {
+        methods: ['POST', 'OPTIONS'],
+        authLevel: 'anonymous',
+        route: 'site-survey-assignments/{id}/invite-link',
+        handler: async (request, context) => {
+            if (request.method === 'OPTIONS') {
+                return { status: 204, headers: corsHeaders() };
+            }
+            try {
+                const id =
+                    request.params?.id ||
+                    (request.url || '').split('/').filter(Boolean).pop()?.split('?')[0];
+                const body = await request.json().catch(() => ({}));
+                const baseUrl = String(body?.baseUrl || '').replace(/\/$/, '');
+                if (!id || !baseUrl) {
+                    return {
+                        status: 400,
+                        jsonBody: { error: 'assignment id and baseUrl are required' },
+                        headers: corsHeaders(),
+                    };
+                }
+
+                let assignment = null;
+                try {
+                    const read = await getContainer(ASSIGNMENTS).item(id, id).read();
+                    assignment = read.resource;
+                } catch (_) {}
+                if (!assignment) {
+                    return {
+                        status: 404,
+                        jsonBody: { error: 'Assignment not found' },
+                        headers: corsHeaders(),
+                    };
+                }
+
+                // Never rotate here — Copy link must return the same URL that was emailed.
+                const inviteUrl = currentInviteUrl(assignment, baseUrl);
+                if (!inviteUrl) {
+                    return {
+                        status: 409,
+                        jsonBody: {
+                            ok: false,
+                            error:
+                                'This invite was sent before link recovery was available, so the original URL can’t be shown. Use Remind / Resend email only if you want a new link (that replaces the emailed one).',
+                            recoverable: false,
+                            targetEmail: assignment.targetEmail || null,
+                            assignment: redactAssignment(assignment),
+                        },
+                        headers: corsHeaders(),
+                    };
+                }
+
+                return {
+                    jsonBody: {
+                        ok: true,
+                        rotated: false,
+                        recoverable: true,
+                        inviteUrl,
+                        targetEmail: assignment.targetEmail || null,
+                        assignment: redactAssignment(assignment),
+                    },
+                    headers: corsHeaders(),
+                };
+            } catch (error) {
+                return handleError(context, error, 'site-survey-invite-link');
+            }
+        },
+    });
+
     app.http('siteSurveyResend', {
         methods: ['POST', 'OPTIONS'],
         authLevel: 'anonymous',
@@ -2628,6 +2709,7 @@ function registerSurveySecureRoutes(app, deps) {
 module.exports = {
     registerSurveySecureRoutes,
     attachInviteToken,
+    currentInviteUrl,
     redactAssignment,
     buildInviteUrl,
     NOTIFICATIONS,
