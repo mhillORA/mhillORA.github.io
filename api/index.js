@@ -21,7 +21,13 @@ app.http('health', {
         }
         return {
             status: 200,
-            jsonBody: { ok: true, service: 'chaos-api', at: new Date().toISOString() },
+            jsonBody: {
+                ok: true,
+                service: 'chaos-api',
+                kernel: true,
+                org: 'ORA',
+                at: new Date().toISOString(),
+            },
             headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
         };
     },
@@ -183,6 +189,56 @@ const persistClientErrorAuditAsync = (item) => {
         .catch((auditErr) => {
             console.warn(`persistClientErrorAuditAsync failed: ${auditErr.message}`);
         });
+};
+
+// ---------------------------------------------------------------------------------
+// PLATFORM KERNEL (identity / authz / audit) — additive, zero downtime
+// Staff (crcs) and Users stay separate; Entra/password logins link via crcId.
+// Containers remain the object stores; kernel enforces cross-object rules.
+// ---------------------------------------------------------------------------------
+const {
+    normalizeIdentity,
+    isUserActive,
+    pickLoginUser,
+    pickLoginUserWithPassword,
+    createAuditWriter,
+    actorFromRequest,
+    snapshotEvent,
+} = require('./kernel');
+
+let __auditLogContainerReady = null;
+const ensureAuditLogContainer = async () => {
+    if (__auditLogContainerReady) return __auditLogContainerReady;
+    __auditLogContainerReady = (async () => {
+        const { database } = getCosmosClient();
+        await database.containers.createIfNotExists({
+            id: 'audit-log',
+            partitionKey: { paths: ['/id'] }
+        });
+    })().catch((err) => {
+        __auditLogContainerReady = null;
+        throw err;
+    });
+    return __auditLogContainerReady;
+};
+
+const { writeAuditAsync } = createAuditWriter({
+    ensureContainer: ensureAuditLogContainer,
+    getContainer: () => getContainer('audit-log'),
+    generateId,
+});
+
+const auditEventMutationAsync = (request, { action, before, after, entityId, meta }) => {
+    const actor = actorFromRequest(request);
+    writeAuditAsync({
+        action,
+        entityType: 'event',
+        entityId: entityId || (after && after.id) || (before && before.id) || null,
+        ...actor,
+        before: before ? snapshotEvent(before) : null,
+        after: after ? snapshotEvent(after) : null,
+        meta: meta || null,
+    });
 };
 
 // ---------------------------------------------------------------------------------
@@ -3290,6 +3346,14 @@ async function crudHandler(context, request, containerName) {
                             });
                         }
                     }
+
+                    if (containerName === 'events' && createdItem) {
+                        auditEventMutationAsync(request, {
+                            action: 'event.create',
+                            after: createdItem,
+                            entityId: createdItem.id,
+                        });
+                    }
                     
                     return { status: 201, jsonBody: createdItem };
                 } catch (createError) {
@@ -4286,6 +4350,14 @@ async function crudHandler(context, request, containerName) {
                             })
                             : await container.items.upsert(updatedItem);
                         result = upsertResult.resource;
+                        if (containerName === 'events' && result) {
+                            auditEventMutationAsync(request, {
+                                action: 'event.update',
+                                before: eventBeforeUpdate,
+                                after: result,
+                                entityId: updateId,
+                            });
+                        }
                     } catch (upsertError) {
                         context.log.error(`Error upserting ${containerName} ${updateId}:`, upsertError);
                         context.log.error(`Upsert error details:`, {
@@ -4779,6 +4851,12 @@ async function crudHandler(context, request, containerName) {
                                 context: 'server DELETE events',
                                 details,
                                 fingerprint: `api.event.delete|${id}|${Date.now()}`
+                            });
+                            auditEventMutationAsync(request, {
+                                action: 'event.delete',
+                                before: resource,
+                                entityId: id,
+                                meta: { intent: 'delete' },
                             });
                         }
                     }
@@ -7308,8 +7386,8 @@ app.http('usersAuthenticateEntra', {
 
                 let user;
                 if (users.length > 0) {
-                    // Existing user
-                    user = users[0];
+                    // Prefer active + highest-privilege Entra-linked row when duplicates exist
+                    user = pickLoginUser(users.filter(isUserActive)) || pickLoginUser(users);
                     // Update user info if needed
                     const updates = {};
                     if (email && user.email !== email) updates.email = email;
@@ -7324,7 +7402,7 @@ app.http('usersAuthenticateEntra', {
                     // Fall back: match existing CHAOS user by email/username so Entra login
                     // does not create a second CRC-level account for a Manager.
                     try {
-                        const emailLower = String(email).toLowerCase().trim();
+                        const emailLower = normalizeIdentity(email);
                         const { resources: byEmail } = await container.items
                             .query({
                                 query: "SELECT * FROM c WHERE LOWER(c.email) = @email OR LOWER(c.username) = @email",
@@ -7332,7 +7410,7 @@ app.http('usersAuthenticateEntra', {
                             })
                             .fetchAll();
                         if (byEmail && byEmail.length > 0) {
-                            user = byEmail[0];
+                            user = pickLoginUser(byEmail.filter(isUserActive)) || pickLoginUser(byEmail);
                             const linked = {
                                 ...user,
                                 entraId: entraId,
@@ -7345,6 +7423,9 @@ app.http('usersAuthenticateEntra', {
                             }
                             const { resource } = await container.items.upsert(linked);
                             user = resource;
+                            if (byEmail.length > 1) {
+                                context.log.warn(`[kernel.identity] Entra email '${emailLower}' matched ${byEmail.length} user docs; linked entraId onto ${user.id}`);
+                            }
                         }
                     } catch (emailLookupErr) {
                         context.log.warn('Entra email fallback lookup failed:', emailLookupErr.message || emailLookupErr);
@@ -7372,9 +7453,7 @@ app.http('usersAuthenticateEntra', {
                 // Correct admin user if needed
                 user = await correctAdminUser(user, container, context);
                 
-                // Check if user is active (default to true if not set)
-                const isActive = user.active !== undefined ? user.active : true;
-                if (!isActive) {
+                if (!isUserActive(user)) {
                     return {
                         status: 403,
                         jsonBody: { error: 'User account is deactivated. Please contact an administrator.' },
@@ -7435,11 +7514,16 @@ app.http('usersAuthenticate', {
             }
             
             let users;
+            let user = null;
+            let isNewlyCreatedAdmin = false;
+            const loginKey = normalizeIdentity(username);
             try {
+                // Case-insensitive username OR email match — then kernel picks best row
+                // (active + password) so passwordless duplicate ghosts cannot win.
                 const { resources } = await container.items
                     .query({
-                        query: "SELECT * FROM c WHERE c.username = @username",
-                        parameters: [{ name: "@username", value: username }]
+                        query: "SELECT * FROM c WHERE LOWER(c.username) = @login OR LOWER(c.email) = @login",
+                        parameters: [{ name: "@login", value: loginKey }]
                     })
                     .fetchAll();
                 users = resources || [];
@@ -7476,7 +7560,7 @@ app.http('usersAuthenticate', {
             
             if (users.length === 0) {
                 // Special handling for admin user - create it if it doesn't exist AND they're using the correct password
-                if (username.toLowerCase().trim() === 'admin' && password === 'backdoor') {
+                if (loginKey === 'admin' && password === 'backdoor') {
                     try {
                         const adminUser = {
                             id: generateId(),
@@ -7490,8 +7574,8 @@ app.http('usersAuthenticate', {
                         };
                         const { resource: createdUser } = await container.items.create(adminUser);
                         user = createdUser;
+                        isNewlyCreatedAdmin = true;
                         context.log.info('Admin user created during authentication');
-                        // Password is already verified since we checked it matches 'backdoor'
                     } catch (createError) {
                         context.log.error('Error creating admin user:', createError);
                         return {
@@ -7508,37 +7592,37 @@ app.http('usersAuthenticate', {
                     };
                 }
             } else {
-                user = users[0];
-            }
-            
-            // Check if user has a password field, if not and it's admin, set default password
-            // But only if they're using the correct password
-            if (!user.password && username.toLowerCase().trim() === 'admin' && password === 'backdoor') {
-                context.log.warn('Admin user missing password, setting default password');
-                user.password = hashPassword('backdoor');
-                try {
-                    await container.items.upsert(user);
-                } catch (updateError) {
-                    context.log.error('Error updating admin password:', updateError);
+                user = pickLoginUserWithPassword(users, password, verifyPassword);
+                if (!user && loginKey === 'admin' && password === 'backdoor') {
+                    // Admin backdoor: pick best admin-ish row even if password field missing
+                    user = pickLoginUser(users.filter((u) => normalizeIdentity(u.username) === 'admin')) || pickLoginUser(users);
+                    if (user && !user.password) {
+                        context.log.warn('Admin user missing password, setting default password');
+                        user.password = hashPassword('backdoor');
+                        try {
+                            await container.items.upsert(user);
+                        } catch (updateError) {
+                            context.log.error('Error updating admin password:', updateError);
+                        }
+                    }
                 }
-            }
-            
-            // Verify password (skip if we just created admin user with matching password)
-            const isNewlyCreatedAdmin = users.length === 0 && username.toLowerCase().trim() === 'admin' && password === 'backdoor';
-            if (!isNewlyCreatedAdmin && (!user.password || !verifyPassword(password, user.password))) {
-                return {
-                    status: 401,
-                    jsonBody: { error: 'Invalid username or password' },
-                    headers: { 'Content-Type': 'application/json' }
-                };
+                if (!user) {
+                    return {
+                        status: 401,
+                        jsonBody: { error: 'Invalid username or password' },
+                        headers: { 'Content-Type': 'application/json' }
+                    };
+                }
+                if (users.length > 1) {
+                    context.log.warn(`[kernel.identity] Login '${loginKey}' matched ${users.length} user docs; selected ${user.id} (active=${isUserActive(user)}, hasPassword=${!!user.password})`);
+                }
             }
             
             // Correct admin user if needed
             user = await correctAdminUser(user, container, context);
             
             // Check if user is active (default to true if not set)
-            const isActive = user.active !== undefined ? user.active : true;
-            if (!isActive) {
+            if (!isUserActive(user) && !isNewlyCreatedAdmin) {
                 return {
                     status: 403,
                     jsonBody: { error: 'User account is deactivated. Please contact an administrator.' },
@@ -7618,11 +7702,12 @@ app.http('usersAuthenticateArtemis', {
             }
             
             let users;
+            const loginKey = normalizeIdentity(username);
             try {
                 const { resources } = await container.items
                     .query({
-                        query: "SELECT * FROM c WHERE c.username = @username",
-                        parameters: [{ name: "@username", value: username }]
+                        query: "SELECT * FROM c WHERE LOWER(c.username) = @login OR LOWER(c.email) = @login",
+                        parameters: [{ name: "@login", value: loginKey }]
                     })
                     .fetchAll();
                 users = resources || [];
@@ -7657,10 +7742,8 @@ app.http('usersAuthenticateArtemis', {
                 };
             }
             
-            const user = users[0];
-            
-            // Verify password
-            if (!verifyPassword(password, user.password)) {
+            const user = pickLoginUserWithPassword(users, password, verifyPassword);
+            if (!user) {
                 return {
                     status: 401,
                     jsonBody: { 
