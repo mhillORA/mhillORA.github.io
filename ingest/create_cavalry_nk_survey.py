@@ -413,8 +413,14 @@ def build_questions(rows: list[dict], lib_by_norm: dict[str, dict], lib_by_id: d
             label = item["label"] if item.get("force_lib") else (lib.get("label") or item["label"])
             if item.get("force_type"):
                 qtype = item["force_type"]
-            elif lib.get("type") and not item.get("force_lib"):
+            elif item.get("force_lib"):
+                pass  # keep inferred / force_type
+            elif lib.get("type") in ("select", "multiselect", "date", "number", "address") and qtype == "text":
+                # Adopt richer library types only when our infer stayed generic text
                 qtype = lib["type"]
+                if lib.get("options"):
+                    opts = list(lib["options"])
+            # Never let a fuzzy library hit turn a free-text Local IRB timing Q into radio
         else:
             lib_id = f"ql-{qid}"
             reuse = "new"
