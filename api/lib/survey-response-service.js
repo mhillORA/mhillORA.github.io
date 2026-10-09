@@ -140,7 +140,12 @@ function buildSiteRecordPrefill(questions, site, { coordinatorStaff = null, piSt
         'ql-coord-title': coord.title || 'Study Coordinator',
         'ql-primary-contact-role': coord.title || 'Study Coordinator',
         'ql-site-name': siteNamePrefill(site) || '',
+        // Single-field surveys get street+suite joined; split-field surveys override below
         'ql-site-address': siteAddressPrefill(site) || '',
+        'ql-site-address-2': normalized.address2 || '',
+        'ql-site-city': normalized.city || '',
+        'ql-site-state': normalized.state || '',
+        'ql-site-zip': normalized.zip || normalized.zipCode || '',
         'ql-site-phone': normalized.phone || '',
         'ql-pi-name': formatPersonNameFirstLast(normalized.pi || pi.name || '', {
             firstName: normalized.piFirstName || pi.firstName || '',
@@ -164,6 +169,16 @@ function buildSiteRecordPrefill(questions, site, { coordinatorStaff = null, piSt
     const sitePiEmail = String(byLib['ql-pi-email'] || '').trim();
     if (sitePi && sitePiEmail && !personNameMatchesEmail(sitePi, sitePiEmail)) {
         byLib['ql-pi-name'] = '';
+    }
+
+    // If this survey collects Address Line 2 separately, prefill Line 1 as street only
+    const libIdsOnSurvey = new Set(
+        (Array.isArray(questions) ? questions : [])
+            .map((q) => String(q?.libraryQuestionId || '').trim())
+            .filter(Boolean)
+    );
+    if (libIdsOnSurvey.has('ql-site-address-2')) {
+        byLib['ql-site-address'] = normalized.address1 || '';
     }
 
     const byQid = {
@@ -851,11 +866,30 @@ async function applySiteSubmittedFieldsToSite(getContainer, siteId, answers) {
 
     const patch = {};
     const street = pick('ql-site-address', 'gf_03_address', 'q_002_address');
+    const line2 = pick('ql-site-address-2');
+    const city = pick('ql-site-city');
+    const state = pick('ql-site-state');
+    const zip = pick('ql-site-zip');
     if (street) {
-        const parts = splitStreetAndUnit(street, '');
-        patch.address1 = parts.address1;
-        if (parts.address2) patch.address2 = parts.address2;
-        patch.address = parts.address1;
+        if (line2 || city || state || zip) {
+            // Split address survey — trust discrete fields
+            patch.address1 = street;
+            if (line2) patch.address2 = line2;
+            patch.address = street;
+        } else {
+            const parts = splitStreetAndUnit(street, '');
+            patch.address1 = parts.address1;
+            if (parts.address2) patch.address2 = parts.address2;
+            patch.address = parts.address1;
+        }
+    } else if (line2) {
+        patch.address2 = line2;
+    }
+    if (city) patch.city = city;
+    if (state) patch.state = state;
+    if (zip) {
+        patch.zip = zip;
+        patch.zipCode = zip;
     }
     const sitePhone = pick('ql-site-phone', 'gf_04_phone', 'q_003_phone');
     if (sitePhone) {
