@@ -5269,6 +5269,240 @@
             setTimeout(() => URL.revokeObjectURL(url), 1500);
         };
 
+        /**
+         * Answer key / codebook: every question + preset choices (radio/select/multi),
+         * or open-response mode for text/number/date/address.
+         */
+        const buildSurveyAnswerKeyRows = (survey) => {
+            const questions = Array.isArray(survey?.questions) ? survey.questions : [];
+            const qmap = new Map(questions.filter((q) => q && q.id).map((q) => [String(q.id), q]));
+            const pageTitle = new Map();
+            const pageOrder = new Map();
+            (Array.isArray(survey?.pages) ? survey.pages : []).forEach((p, pi) => {
+                const title = p?.title || p?.key || '';
+                (p?.questionIds || []).forEach((qid) => {
+                    pageTitle.set(String(qid), title);
+                    if (!pageOrder.has(String(qid))) pageOrder.set(String(qid), pi + 1);
+                });
+            });
+            const orderedIds = [];
+            const seen = new Set();
+            (Array.isArray(survey?.pages) ? survey.pages : []).forEach((p) => {
+                (p?.questionIds || []).forEach((qid) => {
+                    const id = String(qid);
+                    if (qmap.has(id) && !seen.has(id)) {
+                        orderedIds.push(id);
+                        seen.add(id);
+                    }
+                });
+            });
+            questions.forEach((q) => {
+                const id = String(q?.id || '');
+                if (id && !seen.has(id)) {
+                    orderedIds.push(id);
+                    seen.add(id);
+                }
+            });
+
+            const optionLabel = (o) => {
+                if (o && typeof o === 'object') {
+                    return String(o.label || o.value || o.text || '').trim();
+                }
+                return String(o ?? '').trim();
+            };
+            const responseMode = (q) => {
+                const t = String(q?.type || 'text').toLowerCase();
+                if (t === 'address') return 'Site Address (multipart: Street, City, State, ZIP)';
+                if (t === 'textarea') return 'Free text (long)';
+                if (t === 'text' || t === 'email') return 'Free text (short)';
+                if (t === 'number') return 'Number (open)';
+                if (t === 'date') return 'Date (open)';
+                if (t === 'radio' || t === 'yesno') return 'Radio — choose one';
+                if (t === 'select') return 'Dropdown — choose one';
+                if (t === 'multiselect' || t === 'checkboxes' || t === 'checkbox') {
+                    return 'Multi-select / checkboxes — choose all that apply';
+                }
+                if (t === 'rating' || t === 'stars' || t === 'star') return 'Star rating (1–N)';
+                return `Other (${t})`;
+            };
+            const openLabel = (t) => ({
+                text: 'Free text (short)',
+                email: 'Free text (email)',
+                textarea: 'Free text (long)',
+                number: 'Number (open)',
+                date: 'Date (open)',
+            }[t] || `Open (${t})`);
+
+            const rows = [];
+            orderedIds.forEach((qid, idx) => {
+                const q = qmap.get(qid);
+                if (!q) return;
+                const seq = idx + 1;
+                const t = String(q.type || 'text').toLowerCase();
+                const page = pageTitle.get(qid) || q.category || q.section || '';
+                const pageNo = pageOrder.get(qid) || '';
+                const show = q.logic?.showIf || null;
+                const end = q.logic?.endSurveyIf || null;
+                let branch = '';
+                if (show) {
+                    const parent = qmap.get(String(show.questionId || ''));
+                    const parentRef = parent?.docxNum || show.questionId || '';
+                    branch = `Show if #${parentRef} = ${show.equals ?? show.includes ?? ''}`.trim();
+                }
+                if (end) {
+                    branch = `${branch ? `${branch}; ` : ''}End survey if = ${end.equals ?? end.includes ?? ''}`.trim();
+                }
+                const base = {
+                    seq,
+                    page,
+                    pageNo,
+                    questionNum: q.docxNum || '',
+                    question: q.label || q.title || '',
+                    responseType: responseMode(q),
+                    branchLogic: branch,
+                    required: q.required ? 'Yes' : 'No',
+                    questionId: qid,
+                    libraryQuestionId: q.libraryQuestionId || '',
+                    help: q.help || '',
+                };
+                const opts = (Array.isArray(q.options) ? q.options : []).map(optionLabel).filter(Boolean);
+                if (['radio', 'yesno', 'select', 'multiselect', 'checkboxes', 'checkbox'].includes(t) && opts.length) {
+                    opts.forEach((choice, i) => {
+                        rows.push({ ...base, choiceIndex: i + 1, availableAnswer: choice });
+                    });
+                    return;
+                }
+                if (t === 'address') {
+                    ['Street (Line 1 + suite)', 'City', 'State', 'ZIP'].forEach((part, i) => {
+                        rows.push({ ...base, choiceIndex: i + 1, availableAnswer: `[Open field] ${part}` });
+                    });
+                    return;
+                }
+                if (t === 'rating' || t === 'stars' || t === 'star') {
+                    const maxN = Math.max(1, Math.min(10, Number(q.maxStars || q.max || opts.length || 5) || 5));
+                    for (let i = 1; i <= maxN; i++) {
+                        rows.push({ ...base, choiceIndex: i, availableAnswer: String(i) });
+                    }
+                    return;
+                }
+                rows.push({
+                    ...base,
+                    choiceIndex: 1,
+                    availableAnswer: `[${openLabel(t)}]`,
+                });
+            });
+            return rows;
+        };
+
+        const exportSurveyAnswerKeyXlsx = async (surveyOrId) => {
+            try {
+                let survey = surveyOrId;
+                if (typeof surveyOrId === 'string') {
+                    survey = (allSiteSurveyDefinitions || []).find((d) => d && d.id === surveyOrId);
+                }
+                if (!survey || !Array.isArray(survey.questions) || !survey.questions.length) {
+                    showNotification('Survey has no questions to export.', 'info');
+                    return;
+                }
+                showNotification('Building answer key…', 'info');
+                const ExcelJS = await ensureExcelJsLib();
+                const rows = buildSurveyAnswerKeyRows(survey);
+                const bySeq = new Map();
+                rows.forEach((r) => {
+                    if (!bySeq.has(r.seq)) bySeq.set(r.seq, []);
+                    bySeq.get(r.seq).push(r);
+                });
+
+                const wb = new ExcelJS.Workbook();
+                wb.creator = 'ARTEMIS';
+                wb.created = new Date();
+
+                const cover = wb.addWorksheet('Cover');
+                cover.getCell('A1').value = 'ARTEMIS Survey Answer Key';
+                cover.getCell('A1').font = { bold: true, size: 16 };
+                cover.getCell('A3').value = 'Survey ID';
+                cover.getCell('B3').value = survey.id || '';
+                cover.getCell('A4').value = 'Title';
+                cover.getCell('B4').value = survey.title || '';
+                cover.getCell('A5').value = 'Status';
+                cover.getCell('B5').value = survey.status || '';
+                cover.getCell('A6').value = 'Questions';
+                cover.getCell('B6').value = bySeq.size;
+                cover.getCell('A7').value = 'Answer-key rows';
+                cover.getCell('B7').value = rows.length;
+                cover.getCell('A8').value = 'Exported at';
+                cover.getCell('B8').value = new Date().toISOString();
+                cover.getCell('A10').value = 'How to read';
+                cover.getCell('A11').value = (
+                    'Answer Key lists one row per preset choice (radio / dropdown / multi-select). '
+                    + 'Open responses (free text, number, date) show a single row describing the response mode. '
+                    + 'Site Address is one question with four open fields (Street, City, State, ZIP). '
+                    + 'Questions Summary collapses choices onto one row per question.'
+                );
+                cover.getCell('A11').alignment = { wrapText: true, vertical: 'top' };
+                cover.mergeCells('A11:B14');
+                cover.getColumn(1).width = 22;
+                cover.getColumn(2).width = 80;
+
+                const key = wb.addWorksheet('Answer Key', { views: [{ state: 'frozen', ySplit: 1 }] });
+                const keyHeaders = [
+                    'Seq', 'Page', 'Page #', 'Q #', 'Question', 'Response type', 'Choice #',
+                    'Available answer / response mode', 'Branch logic', 'Required',
+                    'Question ID', 'Library ID', 'Help',
+                ];
+                const headerRow = key.addRow(keyHeaders);
+                headerRow.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+                headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1F4E79' } };
+                rows.forEach((r) => {
+                    key.addRow([
+                        r.seq, r.page, r.pageNo, r.questionNum, r.question, r.responseType,
+                        r.choiceIndex, r.availableAnswer, r.branchLogic, r.required,
+                        r.questionId, r.libraryQuestionId, r.help,
+                    ]);
+                });
+                [6, 18, 8, 8, 55, 28, 10, 40, 36, 10, 28, 22, 30].forEach((w, i) => {
+                    key.getColumn(i + 1).width = w;
+                });
+                key.autoFilter = { from: 'A1', to: `M${rows.length + 1}` };
+
+                const summary = wb.addWorksheet('Questions Summary', { views: [{ state: 'frozen', ySplit: 1 }] });
+                const sumHeader = summary.addRow([
+                    'Seq', 'Page', 'Q #', 'Question', 'Response type', 'Preset answers', '# choices', 'Branch logic', 'Required',
+                ]);
+                sumHeader.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+                sumHeader.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1F4E79' } };
+                [...bySeq.keys()].sort((a, b) => a - b).forEach((seq) => {
+                    const group = bySeq.get(seq) || [];
+                    const first = group[0];
+                    if (!first) return;
+                    summary.addRow([
+                        seq,
+                        first.page,
+                        first.questionNum,
+                        first.question,
+                        first.responseType,
+                        group.map((g) => g.availableAnswer).join(' | '),
+                        group.length,
+                        first.branchLogic,
+                        first.required,
+                    ]);
+                });
+                [6, 18, 8, 55, 28, 60, 10, 36, 10].forEach((w, i) => {
+                    summary.getColumn(i + 1).width = w;
+                });
+
+                const safe = String(survey.title || survey.id || 'survey')
+                    .replace(/[^a-z0-9]+/gi, '_')
+                    .replace(/^_+|_+$/g, '')
+                    .slice(0, 48) || 'survey';
+                await downloadExcelJsWorkbook(wb, `${safe}_answer_key.xlsx`);
+                showNotification('Answer key downloaded.', 'success');
+            } catch (err) {
+                console.error(err);
+                showNotification(err?.message || 'Failed to export answer key.', 'error');
+            }
+        };
+
         const applySponsorReviewColumns = (sheet, startRow, endRow, includeCol, feedbackCol, notesCol) => {
             if (endRow < startRow) return;
             const includeLetter = sheet.getColumn(includeCol).letter;
@@ -6926,6 +7160,7 @@
                             : `<button type="button" class="send-predefined-survey-btn px-2 py-1 rounded text-xs bg-gray-800 text-white" data-definition-id="${escapeHtml(d.id)}">Send</button>
                                <button type="button" class="clone-site-survey-definition-btn px-2 py-1 rounded text-xs bg-indigo-600 text-white" data-definition-id="${escapeHtml(d.id)}">Clone</button>
                                <button type="button" class="edit-site-survey-definition-btn px-2 py-1 rounded text-xs bg-gray-100 dark:bg-gray-700" data-definition-id="${escapeHtml(d.id)}">Edit</button>
+                               <button type="button" class="export-survey-answer-key-btn px-2 py-1 rounded text-xs border border-slate-400 text-slate-800 dark:text-slate-200 dark:border-slate-500" data-definition-id="${escapeHtml(d.id)}" title="Download questions with all preset answer choices (radio / multi-select) and open-response types">Answer key</button>
                                <button type="button" class="rescore-survey-all-btn px-2 py-1 rounded text-xs border border-emerald-600 text-emerald-800 dark:text-emerald-300 dark:border-emerald-700" data-definition-id="${escapeHtml(d.id)}" title="Recalculate scores for all submitted responses. Answers are not changed.">Rescore all</button>`}
                         <button type="button" class="archive-site-survey-definition-btn px-2 py-1 rounded text-xs border border-gray-300 dark:border-gray-600" data-definition-id="${escapeHtml(d.id)}" data-archive="${archived ? '0' : '1'}" title="${archived ? 'Restore to Feasibility + reports (does not delete data)' : 'Hide from Feasibility tab and reports (keeps all responses)'}">${archived ? 'Restore' : 'Hide'}</button>
                     </div>
@@ -9173,8 +9408,9 @@
                                 </div>
                                 <div id="site-survey-definition-error" class="text-sm text-red-600 dark:text-red-300 hidden"></div>
                             </div>
-                            <div class="bg-gray-50 dark:bg-gray-700 px-4 py-3 sm:px-6 flex flex-row-reverse gap-2">
+                            <div class="bg-gray-50 dark:bg-gray-700 px-4 py-3 sm:px-6 flex flex-row-reverse flex-wrap gap-2">
                                 <button type="submit" class="inline-flex justify-center rounded-md border border-transparent shadow-sm px-4 py-2 bg-indigo-600 text-base font-medium text-white hover:bg-indigo-700 sm:w-auto sm:text-sm">${isEdit ? 'Save changes' : (isClone ? 'Create clone' : 'Create')}</button>
+                                <button type="button" id="export-survey-answer-key-builder-btn" class="inline-flex justify-center rounded-md border border-slate-400 dark:border-slate-500 shadow-sm px-4 py-2 bg-white dark:bg-gray-800 text-base font-medium text-slate-800 dark:text-slate-100 hover:bg-slate-50 dark:hover:bg-gray-700 sm:w-auto sm:text-sm" title="Download questions with preset answer choices">Export answer key</button>
                                 <button type="button" data-action="cancel" class="inline-flex justify-center rounded-md border border-gray-300 dark:border-gray-500 shadow-sm px-4 py-2 bg-white dark:bg-gray-800 text-base font-medium text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-600 sm:w-auto sm:text-sm">Cancel</button>
                             </div>
                         </form>
@@ -9182,6 +9418,25 @@
                 </div>
             `;
             showModal(modalHTML);
+
+            document.getElementById('export-survey-answer-key-builder-btn')?.addEventListener('click', () => {
+                const form = document.getElementById('site-survey-definition-form');
+                const title = form?.querySelector('[name="title"]')?.value?.trim() || existingDefinition?.title || 'Survey';
+                const status = form?.querySelector('[name="status"]')?.value || existingDefinition?.status || 'draft';
+                const questions = Array.isArray(window.__siteSurveyBuilderQuestions)
+                    ? window.__siteSurveyBuilderQuestions
+                    : (existingDefinition?.questions || []);
+                const pages = (typeof rebuildDefinitionPages === 'function')
+                    ? rebuildDefinitionPages(questions)
+                    : (existingDefinition?.pages || []);
+                exportSurveyAnswerKeyXlsx({
+                    id: existingDefinition?.id || 'draft-survey',
+                    title,
+                    status,
+                    questions,
+                    pages,
+                });
+            });
 
             const refreshScoringZoneBar = () => {
                 const host = document.getElementById('scoring-zone-bar-host');
@@ -18928,6 +19183,11 @@
                 const defId = cloneSurveyBtn.getAttribute('data-definition-id');
                 const def = (allSiteSurveyDefinitions || []).find(d => d.id === defId);
                 if (def) createSiteSurveyDefinitionModal(def, { clone: true });
+            }
+            const exportAnswerKeyBtn = e.target.closest('.export-survey-answer-key-btn');
+            if (exportAnswerKeyBtn) {
+                const defId = exportAnswerKeyBtn.getAttribute('data-definition-id');
+                exportSurveyAnswerKeyXlsx(defId);
             }
             const sendPredefinedBtn = e.target.closest('.send-predefined-survey-btn');
             if (sendPredefinedBtn) {
