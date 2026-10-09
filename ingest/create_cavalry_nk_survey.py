@@ -155,8 +155,8 @@ def load_rows():
 
 def expand_site_address_fields(rows: list[dict]) -> list[dict]:
     """
-    Cavalry workbook has one 'Full Site Address' cell — expand to profile-shaped fields:
-    Address Line 1, Address Line 2, City, State, ZIP. Site Phone renumbers 3c → 3g.
+    Keep workbook numbering (3b = address, 3c = phone).
+    One Site Address question with type=address: street (Line1+2 combined) + city + state + zip sections.
     """
     out = []
     for item in rows:
@@ -165,49 +165,17 @@ def expand_site_address_fields(rows: list[dict]) -> list[dict]:
             "full site address" in n
             or (item["num"] == "3b" and "address" in n and "email" not in n)
         ):
-            comment = item.get("comment") or ""
-            out.extend(
-                [
-                    {
-                        "cat": "Admin",
-                        "num": "3b",
-                        "label": "Address Line 1",
-                        "comment": comment,
-                        "force_lib": "ql-site-address",
-                    },
-                    {
-                        "cat": "Admin",
-                        "num": "3c",
-                        "label": "Address Line 2",
-                        "comment": "Suite / unit (optional)",
-                        "force_lib": "ql-site-address-2",
-                    },
-                    {
-                        "cat": "Admin",
-                        "num": "3d",
-                        "label": "City",
-                        "comment": "",
-                        "force_lib": "ql-site-city",
-                    },
-                    {
-                        "cat": "Admin",
-                        "num": "3e",
-                        "label": "State",
-                        "comment": "",
-                        "force_lib": "ql-site-state",
-                    },
-                    {
-                        "cat": "Admin",
-                        "num": "3f",
-                        "label": "ZIP",
-                        "comment": "",
-                        "force_lib": "ql-site-zip",
-                    },
-                ]
+            out.append(
+                {
+                    "cat": "Admin",
+                    "num": "3b",  # unchanged number
+                    "label": "Site Address",
+                    "comment": item.get("comment")
+                    or "Street (including suite), city, state, and ZIP",
+                    "force_lib": "ql-site-address",
+                    "force_type": "address",
+                }
             )
-            continue
-        if item["cat"] == "Admin" and item["num"] == "3c" and "phone" in n:
-            out.append({**item, "num": "3g"})
             continue
         out.append(item)
     return out
@@ -414,13 +382,9 @@ def attach_parents(rows: list[dict]) -> list[dict]:
     return out
 
 
-# Canonical address library ids (created on apply if missing).
+# Canonical Site Address library id (compound street+city+state+zip in the survey UI).
 ADDRESS_LIB_SEED = {
-    "ql-site-address": {"label": "Address Line 1", "type": "text", "category": "Site Profile"},
-    "ql-site-address-2": {"label": "Address Line 2", "type": "text", "category": "Site Profile"},
-    "ql-site-city": {"label": "City", "type": "text", "category": "Site Profile"},
-    "ql-site-state": {"label": "State", "type": "text", "category": "Site Profile"},
-    "ql-site-zip": {"label": "ZIP", "type": "text", "category": "Site Profile"},
+    "ql-site-address": {"label": "Site Address", "type": "address", "category": "Site Profile"},
 }
 
 
@@ -446,16 +410,17 @@ def build_questions(rows: list[dict], lib_by_norm: dict[str, dict], lib_by_id: d
         if lib:
             lib_id = lib["id"]
             reuse = "exact_library"
-            # Prefer our survey label for address parts; keep library label as fallback
             label = item["label"] if item.get("force_lib") else (lib.get("label") or item["label"])
-            if lib.get("type") and not item.get("force_lib"):
+            if item.get("force_type"):
+                qtype = item["force_type"]
+            elif lib.get("type") and not item.get("force_lib"):
                 qtype = lib["type"]
-            else:
-                qtype = "text" if item.get("force_lib") else qtype
         else:
             lib_id = f"ql-{qid}"
             reuse = "new"
             label = item["label"]
+            if item.get("force_type"):
+                qtype = item["force_type"]
 
         q = {
             "id": qid,
@@ -471,6 +436,8 @@ def build_questions(rows: list[dict], lib_by_norm: dict[str, dict], lib_by_id: d
             "help": item["comment"] or "",
             "cavalryReuse": reuse,
         }
+        if qtype == "address":
+            q["addressParts"] = ["street", "city", "state", "zip"]
 
         # Wire follow-ups to parent (category page stays the same)
         parent = item.get("parent")
@@ -633,31 +600,33 @@ def main() -> None:
         print(f"Wrote preview {out}")
         return
 
-    # Ensure split-address library ids exist (do not overwrite ql-site-address GF label)
+    # Canonical Site Address library question (type=address → multipart UI)
     lib_upserts = 0
     for lib_id, seed in ADDRESS_LIB_SEED.items():
-        if lib_id == "ql-site-address" and lib_id in lib_by_id:
-            continue
-        if lib_id in lib_by_id and lib_id != "ql-site-address":
-            # refresh label/type for our discrete address parts
-            pass
+        prev = lib_by_id.get(lib_id) or {}
         lib_doc = {
+            **prev,
             "id": lib_id,
             "label": seed["label"],
-            "type": seed.get("type") or "text",
+            "type": seed.get("type") or "address",
             "options": [],
-            "required": False,
-            "category": seed.get("category") or "Site Profile",
-            "help": "",
+            "required": bool(prev.get("required")),
+            "category": seed.get("category") or prev.get("category") or "Site Profile",
+            "help": prev.get("help")
+            or "Street (Line 1 + suite combined), city, state, and ZIP in one question.",
             "status": "active",
-            "createdAt": (lib_by_id.get(lib_id) or {}).get("createdAt") or ts,
+            "createdAt": prev.get("createdAt") or ts,
             "updatedAt": ts,
-            "source": SOURCE,
-            "tags": ["site-profile", "address", "cavalry"],
+            "source": prev.get("source") or SOURCE,
+            "tags": list(
+                dict.fromkeys(
+                    list(prev.get("tags") or []) + ["site-profile", "address", "site-address"]
+                )
+            ),
+            "addressParts": ["street", "city", "state", "zip"],
         }
-        if lib_id != "ql-site-address" or lib_id not in lib_by_id:
-            lib_c.upsert_item(lib_doc)
-            lib_upserts += 1
+        lib_c.upsert_item(lib_doc)
+        lib_upserts += 1
 
     for q in questions:
         if q.get("cavalryReuse") == "exact_library":
