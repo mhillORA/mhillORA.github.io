@@ -55,6 +55,8 @@ def response_mode(q: dict) -> str:
     t = str(q.get("type") or "text").lower()
     if t == "address":
         return "Site Address (multipart: Street, City, State, ZIP)"
+    if t == "trial_history":
+        return "Trial History (repeating rows: Phase, enrollment dates, patients)"
     if t in OPEN_TYPES:
         return OPEN_TYPES[t]
     if t in ("radio", "yesno"):
@@ -158,6 +160,34 @@ def build_rows(survey: dict) -> list[dict]:
                         "responseType": response_mode(q),
                         "choiceIndex": i,
                         "availableAnswer": f"[Open field] {part}",
+                        "branchLogic": branch,
+                        "required": "Yes" if q.get("required") else "No",
+                        "help": q.get("help") or "",
+                    }
+                )
+        elif t == "trial_history":
+            for i, part in enumerate(
+                [
+                    "Phase — Phase 1 | Phase 1/2 | Phase 2 | Phase 2/3 | Phase 3 | Phase 4 | Other (required)",
+                    "Enrollment start (month/year)",
+                    "Enrollment end (month/year)",
+                    "# patients enrolled (required)",
+                    "[Repeating] Site may add multiple trial rows",
+                ],
+                1,
+            ):
+                rows.append(
+                    {
+                        "seq": seq,
+                        "page": p_title.get(qid) or q.get("category") or "",
+                        "pageOrder": p_idx.get(qid, 999) + 1,
+                        "questionNum": q.get("docxNum") or "",
+                        "questionId": qid,
+                        "libraryQuestionId": q.get("libraryQuestionId") or "",
+                        "question": q.get("label") or q.get("title") or "",
+                        "responseType": response_mode(q),
+                        "choiceIndex": i,
+                        "availableAnswer": part,
                         "branchLogic": branch,
                         "required": "Yes" if q.get("required") else "No",
                         "help": q.get("help") or "",
