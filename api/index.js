@@ -730,8 +730,12 @@ const validateSurveyQuestionLibrarySchema = (data) => {
         errors.push('label (question text) is required');
     }
     const type = String(data.type || 'text').toLowerCase();
-    if (!['text', 'textarea', 'number', 'date', 'select', 'radio', 'multiselect'].includes(type)) {
-        errors.push('type must be text, textarea, number, date, select, radio, or multiselect');
+    const allowedLibTypes = [
+        'text', 'textarea', 'number', 'date', 'select', 'radio', 'multiselect',
+        'rating', 'address', 'trial_history',
+    ];
+    if (!allowedLibTypes.includes(type)) {
+        errors.push(`type must be one of: ${allowedLibTypes.join(', ')}`);
     }
     data.type = type;
     data.label = String(data.label).trim();

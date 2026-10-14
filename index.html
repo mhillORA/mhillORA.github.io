@@ -8748,16 +8748,26 @@
             loadPrivacyAudit();
         };
 
-        /** Help under a question is opt-in only — never show DOCX type notes. */
+        /** Help under a question is opt-in only — strip DOCX/SurveyMonkey type notes, keep real guidance. */
         const meaningfulQuestionHelp = (raw) => {
             const t = String(raw ?? '').replace(/\s+/g, ' ').trim();
             if (!t) return '';
             const n = t.toLowerCase().replace(/[–—]/g, '-').replace(/^question type:\s*/, '');
+            // Exact / near-exact type labels only — do NOT strip real help that happens to mention "street" etc.
             if (/^shown (when|only when)\b/.test(n)) return '';
             if (/^(select all that apply\.?\s*)+(shown (when|only when).*)?$/.test(n)) return '';
-            if (/^(yes\s*\/\s*no|short response|long response|multi-?select|single select|range select|numeric entry|date|rating)\b/.test(n)) return '';
+            if (/^(yes\s*\/\s*no|short response|long response|multi-?select|single select|range select|numeric entry|date|rating)(\s*[—\-:].*)?$/.test(n)
+                && n.length < 80) return '';
             if (/^(select all that apply)\.?$/.test(n)) return '';
             return t;
+        };
+
+        /** Read help from the builder DOM without wiping user-entered guidance. */
+        const readBuilderHelpValue = (raw) => {
+            const t = String(raw ?? '').replace(/\s+/g, ' ').trim();
+            if (!t) return '';
+            // Only drop known junk type-notes; keep everything else (incl. Street Address guidance).
+            return meaningfulQuestionHelp(t) || t;
         };
 
         const createLibraryQuestionModal = (existing = null) => {
@@ -9049,10 +9059,26 @@
                         && coerceOptionList(q.options).length && coerceOptionList(q.options).length <= 8)
                         ? coerceOptionList(q.options)
                         : keepOpts;
+                    const keepHelp = readBuilderHelpValue(q.help || canon.help || '');
+                    // Persist survey help onto the library item when the survey has guidance the library lacks
+                    if (keepHelp && keepHelp !== String(canon.help || '').trim()) {
+                        try {
+                            const updated = await apiService.updateSiteSurveyQuestionLibraryItem(canon.id, {
+                                ...stripCosmosMeta(canon),
+                                id: canon.id,
+                                help: keepHelp,
+                                updatedAt: new Date().toISOString(),
+                            });
+                            byId.set(canon.id, updated);
+                            const li = lib.findIndex((x) => x && x.id === canon.id);
+                            if (li >= 0) lib[li] = updated;
+                        } catch (_) { /* non-fatal — survey help still saved on definition */ }
+                    }
                     out.push({
                         ...q,
                         type: keepType,
                         options: safeOpts,
+                        help: keepHelp || undefined,
                         libraryQuestionId: (canon.id === 'ql-site-equipment-inventory' && safeOpts.length <= 8)
                             ? (q.libraryQuestionId && q.libraryQuestionId !== 'ql-site-equipment-inventory' ? q.libraryQuestionId : null)
                             : libraryQuestionId,
@@ -10057,12 +10083,28 @@
                     } else {
                         endSurveyIf = selfType === 'multiselect' ? { includes: '' } : { equals: '' };
                     }
-                    // Preserve show-through comments id — builder UI has no control for it yet;
+                    // Preserve show-through comments / Other-specify id — builder UI has no control for it yet;
                     // wiping it on save hid the comments box on ReBUILD not-interested path.
                     const prevEnd = selfQ?.logic?.endSurveyIf;
-                    const throughQid = String(
+                    let throughQid = String(
                         prevEnd?.showThroughQuestionId || prevEnd?.requireFilledQuestionId || ''
                     ).trim();
+                    // Auto-detect immediate Other (please specify) follow-up when ending early
+                    if (!throughQid && endSurveyIf && selfQ?.id) {
+                        const qsMem = window.__siteSurveyBuilderQuestions || [];
+                        const selfIdx = qsMem.findIndex((q) => q && q.id === selfQ.id);
+                        const nextQ = selfIdx >= 0 ? qsMem[selfIdx + 1] : null;
+                        const nextShow = nextQ?.logic?.showIf;
+                        const nextParent = String(nextShow?.questionId || '');
+                        const nextTrigger = String(nextShow?.includes || nextShow?.equals || '').trim().toLowerCase();
+                        if (
+                            nextQ?.id
+                            && nextParent === String(selfQ.id)
+                            && (nextTrigger === 'other' || /^other\b/.test(nextTrigger) || /please specify/i.test(String(nextQ.label || '')))
+                        ) {
+                            throughQid = String(nextQ.id);
+                        }
+                    }
                     if (throughQid && endSurveyIf) {
                         endSurveyIf.showThroughQuestionId = throughQid;
                     }
@@ -10130,7 +10172,7 @@
                     const prevScoring = Array.isArray(q.scoringOptions) ? q.scoringOptions : [];
 
                     q.label = (card.querySelector(`input[name="q_label_${idx}"]`)?.value || '').trim();
-                    q.help = meaningfulQuestionHelp(card.querySelector(`input[name="q_help_${idx}"]`)?.value || '');
+                    q.help = readBuilderHelpValue(card.querySelector(`input[name="q_help_${idx}"]`)?.value || '');
                     q.type = readBuilderTypeFromCard(card, idx, prevType);
                     q.required = card.querySelector(`#q_required_${idx}`)?.checked !== false;
                     q.category = (card.querySelector(`input[name="q_category_${idx}"]`)?.value || 'General').trim() || 'General';
@@ -10404,6 +10446,7 @@
                                 || any.includes(o) || any.includes('other');
                         };
                         const alreadyFollow = qs.find((q, qi) => qi > idx && isOtherTrigger(q));
+                        let followId = alreadyFollow?.id || '';
                         if (alreadyFollow) {
                             // Keep branching wired to the real Other option text; refresh label for export context
                             if (isMulti) {
@@ -10414,11 +10457,13 @@
                             if (!/please specify/i.test(String(alreadyFollow.label || '')) || /^if other|^please specify/i.test(String(alreadyFollow.label || '').trim())) {
                                 alreadyFollow.label = followLabel;
                             }
+                            followId = alreadyFollow.id;
                         } else {
+                            followId = `q_${Date.now().toString(36)}_other`;
                             const follow = {
-                                id: `q_${Date.now().toString(36)}_other`,
+                                id: followId,
                                 label: followLabel,
-                                help: 'Shown when Other is selected on the previous question.',
+                                help: '',
                                 type: 'text',
                                 required: true,
                                 options: [],
@@ -10437,6 +10482,16 @@
                                 libraryQuestionId: null,
                             };
                             qs.splice(idx + 1, 0, follow);
+                        }
+                        // If parent ends the survey on any answer (incl. Other), keep the specify box visible first
+                        if (followId && parent.logic?.endSurveyIf && typeof parent.logic.endSurveyIf === 'object') {
+                            parent.logic = {
+                                ...parent.logic,
+                                endSurveyIf: {
+                                    ...parent.logic.endSurveyIf,
+                                    showThroughQuestionId: followId,
+                                },
+                            };
                         }
                         window.__siteSurveyBuilderQuestions = qs;
                         renderBuilder();
@@ -11017,6 +11072,19 @@
                                 <div>
                                     <h2 class="text-xl font-bold text-gray-900 dark:text-gray-100">Send Site Survey</h2>
                                     <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Select a template and sites. Each site will get a unique, secure link to complete the survey. Prior site answers will be prefilled prior to the surveys being completed and sites will have the ability to confirm/update responses as needed.</p>
+                                    <div class="mt-3 rounded-md border border-indigo-200 dark:border-indigo-800 bg-indigo-50/60 dark:bg-indigo-950/30 px-3 py-2.5 space-y-2">
+                                        <div class="flex flex-wrap items-center justify-between gap-2">
+                                            <div>
+                                                <div class="text-sm font-semibold text-indigo-900 dark:text-indigo-100">Send settings template</div>
+                                                <p class="text-[11px] text-indigo-800/80 dark:text-indigo-200/70">Save study/email/role defaults on this survey so the next wave only needs new sites.</p>
+                                            </div>
+                                            <div class="flex flex-wrap gap-2">
+                                                <button type="button" id="send-template-load-btn" class="px-2.5 py-1 rounded-md border border-indigo-300 dark:border-indigo-600 bg-white dark:bg-gray-800 text-xs font-medium text-indigo-800 dark:text-indigo-100 hover:bg-indigo-50 dark:hover:bg-gray-700">Load saved</button>
+                                                <button type="button" id="send-template-save-btn" class="px-2.5 py-1 rounded-md bg-indigo-600 text-white text-xs font-medium hover:bg-indigo-700">Save to survey</button>
+                                            </div>
+                                        </div>
+                                        <p id="send-template-status" class="text-[11px] text-indigo-900/70 dark:text-indigo-200/70">No saved send settings for this survey yet.</p>
+                                    </div>
                                 </div>
                                 ${noDefs ? `<div class="p-3 rounded-md bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 text-sm text-amber-900 dark:text-amber-100">Create a survey template first (New Site Survey).</div>` : ''}
                                 ${noSites ? `<div class="p-3 rounded-md bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 text-sm text-amber-900 dark:text-amber-100">No sites loaded.</div>` : ''}
@@ -11348,14 +11416,192 @@
                 refreshSelectedSiteCount();
             };
 
+            const sendTemplateStatusEl = document.getElementById('send-template-status');
+            const readSendTemplateFromForm = () => {
+                if (!form) return null;
+                const includeGf = form.querySelector('input[name="includeGeneralFeasibility"]:checked')?.value !== 'no';
+                return {
+                    studyCode: String(form.studyCode?.value || '').trim(),
+                    studyTitle: String(form.studyTitle?.value || '').trim(),
+                    batchLabel: String(form.batchLabel?.value || '').trim(),
+                    batchStarred: !!form.batchStarred?.checked,
+                    emailSubject: String(form.emailSubject?.value || '').trim(),
+                    emailBody: String(form.emailBody?.value || ''),
+                    emailPassword: String(form.emailPassword?.value || '').trim(),
+                    emailCc: String(form.emailCc?.value || '').trim(),
+                    expiresInDays: Math.max(1, Math.min(365, parseInt(form.expiresInDays?.value || '30', 10) || 30)),
+                    roles: {
+                        coordinator: !!form.role_coordinator?.checked,
+                        pi: !!form.role_pi?.checked,
+                        contact: !!form.role_contact?.checked,
+                    },
+                    includeGeneralFeasibility: includeGf,
+                    sendEmail: !!form.sendEmail?.checked,
+                    savedAt: new Date().toISOString(),
+                };
+            };
+            const applySendTemplateToForm = (tpl, { markTouched = true } = {}) => {
+                if (!form || !tpl || typeof tpl !== 'object') return false;
+                const setTouched = (el) => {
+                    if (el && markTouched) el.dataset.touched = '1';
+                };
+                if (tpl.studyCode != null && form.studyCode) {
+                    form.studyCode.value = String(tpl.studyCode);
+                    setTouched(form.studyCode);
+                }
+                if (tpl.studyTitle != null && form.studyTitle) {
+                    form.studyTitle.value = String(tpl.studyTitle);
+                    setTouched(form.studyTitle);
+                }
+                if (tpl.batchLabel != null && form.batchLabel) form.batchLabel.value = String(tpl.batchLabel);
+                if (form.batchStarred) form.batchStarred.checked = tpl.batchStarred !== false;
+                if (tpl.emailSubject != null && form.emailSubject) {
+                    form.emailSubject.value = String(tpl.emailSubject);
+                    setTouched(form.emailSubject);
+                }
+                if (tpl.emailBody != null && form.emailBody) form.emailBody.value = String(tpl.emailBody);
+                if (tpl.emailPassword != null && form.emailPassword) form.emailPassword.value = String(tpl.emailPassword);
+                if (tpl.emailCc != null && form.emailCc) form.emailCc.value = String(tpl.emailCc);
+                if (tpl.expiresInDays != null && form.expiresInDays) {
+                    form.expiresInDays.value = String(Math.max(1, Math.min(365, Number(tpl.expiresInDays) || 30)));
+                    refreshCloseDatePreview();
+                }
+                if (tpl.roles && typeof tpl.roles === 'object') {
+                    if (form.role_coordinator) form.role_coordinator.checked = !!tpl.roles.coordinator;
+                    if (form.role_pi) form.role_pi.checked = !!tpl.roles.pi;
+                    if (form.role_contact) form.role_contact.checked = !!tpl.roles.contact;
+                }
+                if (typeof tpl.includeGeneralFeasibility === 'boolean') {
+                    const yes = form.querySelector('input[name="includeGeneralFeasibility"][value="yes"]');
+                    const no = form.querySelector('input[name="includeGeneralFeasibility"][value="no"]');
+                    if (yes && no) {
+                        yes.checked = tpl.includeGeneralFeasibility;
+                        no.checked = !tpl.includeGeneralFeasibility;
+                    }
+                }
+                if (typeof tpl.sendEmail === 'boolean' && form.sendEmail) {
+                    form.sendEmail.checked = tpl.sendEmail;
+                }
+                return true;
+            };
+            const getSurveySendTemplate = (sid) => {
+                const def = (allSiteSurveyDefinitions || []).find((d) => d && d.id === sid)
+                    || allDefs.find((d) => d && d.id === sid);
+                const tpl = def?.sendTemplate;
+                return tpl && typeof tpl === 'object' ? tpl : null;
+            };
+            const refreshSendTemplateStatus = () => {
+                if (!sendTemplateStatusEl) return;
+                const sid = form?.querySelector('[name="surveyId"]')?.value || '';
+                if (!sid) {
+                    sendTemplateStatusEl.textContent = 'Choose a survey to load or save send settings.';
+                    return;
+                }
+                const tpl = getSurveySendTemplate(sid);
+                if (!tpl) {
+                    sendTemplateStatusEl.textContent = 'No saved send settings for this survey yet.';
+                    return;
+                }
+                const when = tpl.savedAt ? (() => {
+                    try { return new Date(tpl.savedAt).toLocaleString(); } catch (_) { return tpl.savedAt; }
+                })() : 'unknown time';
+                const bits = [
+                    tpl.studyCode || null,
+                    tpl.includeGeneralFeasibility ? 'GF on' : 'GF off',
+                    tpl.roles?.coordinator ? 'SC' : null,
+                    tpl.roles?.pi ? 'PI' : null,
+                    tpl.roles?.contact ? 'Contact' : null,
+                ].filter(Boolean);
+                sendTemplateStatusEl.textContent = `Saved ${when}${bits.length ? ` · ${bits.join(' · ')}` : ''}. Loads automatically when you pick this survey.`;
+            };
+            const loadSendTemplateForSurvey = ({ force = false } = {}) => {
+                const sid = form?.querySelector('[name="surveyId"]')?.value || '';
+                const tpl = getSurveySendTemplate(sid);
+                refreshSendTemplateStatus();
+                if (!tpl) return false;
+                // Auto-load once per survey pick unless forced via button
+                if (!force && form?.dataset?.sendTemplateApplied === sid) return false;
+                applySendTemplateToForm(tpl, { markTouched: true });
+                if (form) form.dataset.sendTemplateApplied = sid;
+                refreshSendTemplateStatus();
+                return true;
+            };
+            document.getElementById('send-template-load-btn')?.addEventListener('click', () => {
+                const sid = form?.querySelector('[name="surveyId"]')?.value || '';
+                if (!sid) {
+                    showNotification('Choose a survey first.', 'info');
+                    return;
+                }
+                if (!getSurveySendTemplate(sid)) {
+                    showNotification('No saved send settings on this survey yet. Configure fields, then Save to survey.', 'info');
+                    refreshSendTemplateStatus();
+                    return;
+                }
+                loadSendTemplateForSurvey({ force: true });
+                showNotification('Loaded saved send settings.', 'success');
+            });
+            document.getElementById('send-template-save-btn')?.addEventListener('click', async () => {
+                const sid = form?.querySelector('[name="surveyId"]')?.value || '';
+                const errEl = document.getElementById('site-survey-assignment-error');
+                if (errEl) errEl.classList.add('hidden');
+                if (!sid) {
+                    showNotification('Choose a survey first.', 'info');
+                    return;
+                }
+                const tpl = readSendTemplateFromForm();
+                if (!tpl) return;
+                const btn = document.getElementById('send-template-save-btn');
+                try {
+                    if (btn) btn.disabled = true;
+                    // Re-read full definition so a lean cache entry cannot wipe questions on PUT
+                    const freshList = asSurveyList(await apiService.getSiteSurveyDefinitions().catch(() => []));
+                    const prev = freshList.find((d) => d && d.id === sid)
+                        || (allSiteSurveyDefinitions || []).find((d) => d && d.id === sid);
+                    if (!prev || !Array.isArray(prev.questions) || !prev.questions.length) {
+                        throw new Error('Could not load the full survey before saving send settings. Try again.');
+                    }
+                    const payload = {
+                        ...stripCosmosMeta(prev),
+                        id: sid,
+                        questions: prev.questions,
+                        pages: prev.pages,
+                        sendTemplate: tpl,
+                        updatedAt: new Date().toISOString(),
+                    };
+                    const updated = await apiService.updateSiteSurveyDefinition(sid, payload);
+                    allSiteSurveyDefinitions = (allSiteSurveyDefinitions || []).map((d) => (
+                        d && d.id === sid ? { ...d, ...updated, questions: prev.questions, pages: prev.pages, sendTemplate: tpl } : d
+                    ));
+                    if (!(allSiteSurveyDefinitions || []).some((d) => d && d.id === sid)) {
+                        allSiteSurveyDefinitions = [...(allSiteSurveyDefinitions || []), { ...prev, sendTemplate: tpl }];
+                    }
+                    if (form) form.dataset.sendTemplateApplied = sid;
+                    refreshSendTemplateStatus();
+                    showNotification('Send settings saved on this survey template.', 'success');
+                } catch (err) {
+                    console.error(err);
+                    if (errEl) {
+                        errEl.textContent = err.message || 'Failed to save send settings';
+                        errEl.classList.remove('hidden');
+                    }
+                    showNotification(err.message || 'Failed to save send settings', 'error');
+                } finally {
+                    if (btn) btn.disabled = false;
+                }
+            });
+
             const refreshSendScoringNote = () => {
                 const note = document.getElementById('send-survey-scoring-note');
                 const gfNote = document.getElementById('send-gf-auto-note');
                 const sid = form?.querySelector('[name="surveyId"]')?.value || '';
                 const isGf = sid === 'survey-general-feasibility' || sid === 'survey-general-feasibility-short';
                 if (gfNote) gfNote.classList.toggle('hidden', !sid || isGf);
-                refreshSendSubjectHint();
+                // Prefer saved send template for this survey; fall back to light study-code hints
+                if (!loadSendTemplateForSurvey({ force: false })) {
+                    refreshSendSubjectHint();
+                }
                 refreshSendSiteList();
+                refreshSendTemplateStatus();
                 if (!note) return;
                 if (!sid) {
                     note.innerHTML = '';
@@ -11370,7 +11616,10 @@
                 }
             };
             refreshSendScoringNote();
-            form?.querySelector('[name="surveyId"]')?.addEventListener('change', refreshSendScoringNote);
+            form?.querySelector('[name="surveyId"]')?.addEventListener('change', () => {
+                if (form) delete form.dataset.sendTemplateApplied;
+                refreshSendScoringNote();
+            });
             const onDefaultRoleChange = () => {
                 siteTargetRolesMap.clear();
                 refreshSendSubjectHint();
@@ -17936,7 +18185,12 @@
                     let questions = builderQs.map((q, idx) => {
                         const card = questionsRoot.querySelector(`[data-q-card="${idx}"]`);
                         const label = (card?.querySelector(`input[name="q_label_${idx}"]`)?.value || q.label || '').trim();
-                        const help = (card?.querySelector(`input[name="q_help_${idx}"]`)?.value || q.help || '').trim();
+                        // Prefer live DOM help, then synced memory — never drop Street Address / address guidance
+                        const help = readBuilderHelpValue(
+                            card?.querySelector(`input[name="q_help_${idx}"]`)?.value
+                            || q.help
+                            || ''
+                        );
                         // Prefer post-sync memory (hardened) over a fragile DOM re-read
                         const type = normalizeSurveyQuestionType(q.type || card?.querySelector(`select[name="q_type_${idx}"]`)?.value || 'text');
                         const required = card?.querySelector(`#q_required_${idx}`)?.checked !== false;
@@ -18206,6 +18460,10 @@
                             source: prev.source,
                             sourcePlatform: prev.sourcePlatform,
                             sourceTab: prev.sourceTab,
+                            // Keep send-settings template when editing questions
+                            sendTemplate: prev.sendTemplate && typeof prev.sendTemplate === 'object'
+                                ? prev.sendTemplate
+                                : undefined,
                             createdAt: prev.createdAt || new Date().toISOString(),
                             updatedAt: new Date().toISOString()
                         });
