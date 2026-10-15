@@ -59,6 +59,13 @@ const {
     MAX_BYTES,
 } = require('./lib/survey-attachments');
 const { ensureRebuildInterestBranching } = require('./lib/rebuild-interest-branch');
+const {
+    DEFAULT_WELCOME_COPY,
+    publicWelcomeCopy,
+    readWelcomeCopyDoc,
+    upsertWelcomeCopyDoc,
+    ensureWelcomeCopySeeded,
+} = require('./lib/survey-welcome-copy');
 
 const ASSIGNMENTS = 'site-survey-assignments';
 const DEFINITIONS = 'site-survey-definitions';
@@ -736,6 +743,7 @@ function buildPublicPayload({
     coordinatorStaff = null,
     piStaff = null,
     attachments = [],
+    welcomeCopy = null,
 }) {
     const qList = Array.isArray(questions) ? questions : definition?.questions;
     const sitePrefill = buildSiteRecordPrefill(qList, siteDoc, {
@@ -810,6 +818,7 @@ function buildPublicPayload({
         hasPrior,
         alreadySubmitted: status === 'submitted',
         delta: delta || null,
+        welcomeCopy: publicWelcomeCopy(welcomeCopy || DEFAULT_WELCOME_COPY),
     };
 }
 
@@ -1028,6 +1037,13 @@ function registerSurveySecureRoutes(app, deps) {
                 attachmentDocs = [];
             }
 
+            let welcomeCopy = null;
+            try {
+                welcomeCopy = await readWelcomeCopyDoc(getContainer);
+            } catch (_) {
+                welcomeCopy = DEFAULT_WELCOME_COPY;
+            }
+
             return {
                 jsonBody: buildPublicPayload({
                     assignment,
@@ -1041,6 +1057,7 @@ function registerSurveySecureRoutes(app, deps) {
                     coordinatorStaff,
                     piStaff,
                     attachments: attachmentDocs,
+                    welcomeCopy,
                 }),
                 headers: corsHeaders(),
             };
@@ -2774,6 +2791,13 @@ function registerSurveySecureRoutes(app, deps) {
                     draftAnswers: null,
                 };
 
+                let welcomeCopy = null;
+                try {
+                    welcomeCopy = await readWelcomeCopyDoc(getContainer);
+                } catch (_) {
+                    welcomeCopy = DEFAULT_WELCOME_COPY;
+                }
+
                 const payload = buildPublicPayload({
                     assignment: fakeAssignment,
                     definition,
@@ -2787,6 +2811,7 @@ function registerSurveySecureRoutes(app, deps) {
                     coordinatorStaff,
                     piStaff,
                     attachments: [],
+                    welcomeCopy,
                 });
                 payload.preview = true;
                 payload.alreadySubmitted = false;
@@ -2796,6 +2821,51 @@ function registerSurveySecureRoutes(app, deps) {
                 return { jsonBody: payload, headers: corsHeaders() };
             } catch (error) {
                 return handleError(context, error, 'site-survey-preview');
+            }
+        },
+    });
+
+    // ---------- Ops: global Experienced / New-to-Ora welcome cards ----------
+    app.http('siteSurveyWelcomeCopy', {
+        methods: ['GET', 'PUT', 'OPTIONS'],
+        authLevel: 'anonymous',
+        route: 'site-survey-welcome-copy',
+        handler: async (request, context) => {
+            if (request.method === 'OPTIONS') {
+                return { status: 204, headers: corsHeaders() };
+            }
+            try {
+                if (request.method === 'GET') {
+                    try {
+                        await ensureWelcomeCopySeeded(getContainer);
+                    } catch (_) { /* still serve defaults */ }
+                    const doc = await readWelcomeCopyDoc(getContainer, { bypassCache: true });
+                    return {
+                        status: 200,
+                        jsonBody: doc,
+                        headers: corsHeaders(),
+                    };
+                }
+                if (request.method === 'PUT') {
+                    const body = await request.json().catch(() => ({}));
+                    const operator =
+                        body?.operator ||
+                        readHeader(request, 'X-Artemis-Operator') ||
+                        'unknown';
+                    const saved = await upsertWelcomeCopyDoc(getContainer, body, { operator });
+                    return {
+                        status: 200,
+                        jsonBody: saved,
+                        headers: corsHeaders(),
+                    };
+                }
+                return {
+                    status: 405,
+                    jsonBody: { error: 'Method not allowed' },
+                    headers: corsHeaders(),
+                };
+            } catch (error) {
+                return handleError(context, error, 'site-survey-welcome-copy');
             }
         },
     });
