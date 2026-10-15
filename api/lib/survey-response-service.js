@@ -143,6 +143,9 @@ function buildSiteRecordPrefill(questions, site, { coordinatorStaff = null, piSt
         // Plain street(+suite) for legacy text questions; compound JSON used when q.type === 'address'
         'ql-site-address': siteAddressPrefill(site) || '',
         'ql-site-phone': normalized.phone || '',
+        'ql-site-city': normalized.city || '',
+        'ql-site-state': normalized.state || '',
+        'ql-site-zip': normalized.zip || normalized.zipCode || '',
         'ql-pi-name': formatPersonNameFirstLast(normalized.pi || pi.name || '', {
             firstName: normalized.piFirstName || pi.firstName || '',
             lastName: normalized.piLastName || pi.lastName || '',
@@ -177,6 +180,19 @@ function buildSiteRecordPrefill(questions, site, { coordinatorStaff = null, piSt
         'gf_04_phone': byLib['ql-site-phone'],
         'gf_07_investigator-1': byLib['ql-pi-name'],
         'gf_09_inv-1-email': byLib['ql-pi-email'],
+        // Cavalry NK identity questions (same site-profile fields; belt-and-suspenders with library ids)
+        'cav_adm-3a_site-name': byLib['ql-site-name'],
+        'cav_adm-3b_full-site-address-city-state-postal-code-suite-n': byLib['ql-site-address'],
+        'cav_adm-3c_site-phone-number': byLib['ql-site-phone'],
+        'cav_adm-4a_principal-investigator-s-pi-first-last-name': byLib['ql-pi-name'],
+        'cav_adm-4b_pi-phone-number': byLib['ql-pi-phone'],
+        'cav_adm-4c_pi-email-address': byLib['ql-pi-email'],
+        'cav_adm-5a_site-coordinator-first-last-name': byLib['ql-coord-name'],
+        'cav_adm-5b_site-coordinator-email-address': byLib['ql-coord-email'],
+        'cav_adm-5c_site-coordinator-phone-number': byLib['ql-coord-phone'],
+        q_mv1af5bd_cp2x: byLib['ql-site-city'],
+        q_mv1ah439_18ck: byLib['ql-site-state'],
+        q_mv1af5bd_rrgf: byLib['ql-site-zip'],
     };
 
     const labelHints = [
@@ -197,7 +213,7 @@ function buildSiteRecordPrefill(questions, site, { coordinatorStaff = null, piSt
             value: byLib['ql-primary-contact-role'],
         },
         {
-            test: (n) => n.includes('investigator phone'),
+            test: (n) => n.includes('investigator phone') || n === 'pi phone number',
             value: byLib['ql-pi-phone'],
         },
         {
@@ -211,6 +227,54 @@ function buildSiteRecordPrefill(questions, site, { coordinatorStaff = null, piSt
         {
             test: (n) => (n.includes('contracting') && n.includes('phone')) || n.includes('budgeting contact phone'),
             value: byLib['ql-contracts-phone'],
+        },
+        // Cavalry / site-profile identity labels (same aliases used historically)
+        {
+            test: (n) => n === 'site name' || n.includes('site legal name') || n.includes('official site name'),
+            value: byLib['ql-site-name'],
+        },
+        {
+            test: (n) => n.includes('site street address') || n.includes('full site address') || n === 'street address',
+            value: byLib['ql-site-address'],
+        },
+        {
+            test: (n) => n === 'city' || n.startsWith('city /') || n.startsWith('city/'),
+            value: byLib['ql-site-city'],
+        },
+        {
+            test: (n) => n === 'state' || n.startsWith('state /') || n.startsWith('state/'),
+            value: byLib['ql-site-state'],
+        },
+        {
+            test: (n) => n === 'zip' || n.startsWith('zip/') || n.startsWith('zip ') || n.includes('postal code'),
+            value: byLib['ql-site-zip'],
+        },
+        {
+            test: (n) => n.includes('site phone'),
+            value: byLib['ql-site-phone'],
+        },
+        {
+            test: (n) => (n.includes('principal investigator') && n.includes('name'))
+                || n.includes('pi first') || n === 'pi name' || n.includes('investigator name'),
+            value: byLib['ql-pi-name'],
+        },
+        {
+            test: (n) => n.includes('pi email') || n.includes('investigator email'),
+            value: byLib['ql-pi-email'],
+        },
+        {
+            test: (n) => (n.includes('site coordinator') && n.includes('name'))
+                || (n.includes('study coordinator') && n.includes('name'))
+                || n === 'coordinator name',
+            value: byLib['ql-coord-name'],
+        },
+        {
+            test: (n) => n.includes('coordinator email') || n.includes('study coordinator email'),
+            value: byLib['ql-coord-email'],
+        },
+        {
+            test: (n) => n.includes('coordinator phone') || n.includes('study coordinator phone'),
+            value: byLib['ql-coord-phone'],
         },
     ];
 

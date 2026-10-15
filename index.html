@@ -1186,6 +1186,21 @@
                 });
             }
 
+            /** Persist send-template attachments (returns { attachments, attachmentIds }). */
+            async uploadSurveyAttachments({ surveyId, attachments } = {}) {
+                let operator = 'unknown';
+                try {
+                    const raw = sessionStorage.getItem('artemis.session.user');
+                    const u = raw ? JSON.parse(raw) : null;
+                    if (u?.username) operator = u.username;
+                } catch (_) {}
+                return this.request('/site-survey-upload-attachments', {
+                    method: 'POST',
+                    headers: this.privacyHeaders(),
+                    body: JSON.stringify({ surveyId, attachments, operator })
+                });
+            }
+
             /** Name / star a send cohort (updates every invite sharing that batchId). */
             async updateSurveyBatchMeta({ batchId, batchLabel, batchStarred } = {}) {
                 const body = { batchId };
@@ -11417,6 +11432,52 @@
             };
 
             const sendTemplateStatusEl = document.getElementById('send-template-status');
+            // Saved send-template attachment ids (file inputs cannot be prefilled).
+            // Hang on the form so the document-level submit handler can reuse them.
+            let pendingTemplateAttachmentIds = [];
+            let pendingTemplateAttachmentMeta = [];
+            const syncPendingAttachmentsToForm = () => {
+                if (!form) return;
+                form.__pendingAttachmentIds = [...pendingTemplateAttachmentIds];
+                form.__pendingAttachmentMeta = pendingTemplateAttachmentMeta.map((a) => ({ ...a }));
+            };
+            const refreshPendingAttachmentList = () => {
+                const attList = document.getElementById('send-survey-attachment-list');
+                const attInput = document.getElementById('send-survey-attachments');
+                if (!attList) return;
+                const live = [...(attInput?.files || [])];
+                if (live.length) {
+                    attList.textContent = live
+                        .map((f) => `${f.name} (${Math.max(1, Math.round(f.size / 1024))} KB)`)
+                        .join(' · ');
+                    return;
+                }
+                if (pendingTemplateAttachmentMeta.length) {
+                    attList.textContent = `Saved on template: ${pendingTemplateAttachmentMeta
+                        .map((a) => a.fileName || a.name || a.id)
+                        .filter(Boolean)
+                        .join(' · ')}`;
+                    return;
+                }
+                attList.textContent = '';
+            };
+            const readFileAsAttachment = (file) => new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => {
+                    const result = String(reader.result || '');
+                    const contentBase64 = result.includes('base64,')
+                        ? result.split('base64,')[1]
+                        : result;
+                    resolve({
+                        fileName: file.name,
+                        contentType: file.type || 'application/octet-stream',
+                        size: file.size,
+                        contentBase64,
+                    });
+                };
+                reader.onerror = () => reject(new Error(`Could not read ${file.name}`));
+                reader.readAsDataURL(file);
+            });
             const readSendTemplateFromForm = () => {
                 if (!form) return null;
                 const includeGf = form.querySelector('input[name="includeGeneralFeasibility"]:checked')?.value !== 'no';
@@ -11437,6 +11498,17 @@
                     },
                     includeGeneralFeasibility: includeGf,
                     sendEmail: !!form.sendEmail?.checked,
+                    attachmentIds: pendingTemplateAttachmentIds.length
+                        ? [...pendingTemplateAttachmentIds]
+                        : undefined,
+                    attachments: pendingTemplateAttachmentMeta.length
+                        ? pendingTemplateAttachmentMeta.map((a) => ({
+                            id: a.id,
+                            fileName: a.fileName || a.name,
+                            contentType: a.contentType,
+                            size: a.size,
+                        }))
+                        : undefined,
                     savedAt: new Date().toISOString(),
                 };
             };
@@ -11482,6 +11554,14 @@
                 if (typeof tpl.sendEmail === 'boolean' && form.sendEmail) {
                     form.sendEmail.checked = tpl.sendEmail;
                 }
+                pendingTemplateAttachmentIds = Array.isArray(tpl.attachmentIds)
+                    ? tpl.attachmentIds.map(String).filter(Boolean)
+                    : (Array.isArray(tpl.attachments) ? tpl.attachments.map((a) => a?.id).filter(Boolean) : []);
+                pendingTemplateAttachmentMeta = Array.isArray(tpl.attachments)
+                    ? tpl.attachments.filter((a) => a && (a.id || a.fileName))
+                    : [];
+                syncPendingAttachmentsToForm();
+                refreshPendingAttachmentList();
                 return true;
             };
             const getSurveySendTemplate = (sid) => {
@@ -11505,12 +11585,16 @@
                 const when = tpl.savedAt ? (() => {
                     try { return new Date(tpl.savedAt).toLocaleString(); } catch (_) { return tpl.savedAt; }
                 })() : 'unknown time';
+                const attCount = Array.isArray(tpl.attachmentIds)
+                    ? tpl.attachmentIds.length
+                    : (Array.isArray(tpl.attachments) ? tpl.attachments.length : 0);
                 const bits = [
                     tpl.studyCode || null,
                     tpl.includeGeneralFeasibility ? 'GF on' : 'GF off',
                     tpl.roles?.coordinator ? 'SC' : null,
                     tpl.roles?.pi ? 'PI' : null,
                     tpl.roles?.contact ? 'Contact' : null,
+                    attCount ? `${attCount} file${attCount === 1 ? '' : 's'}` : null,
                 ].filter(Boolean);
                 sendTemplateStatusEl.textContent = `Saved ${when}${bits.length ? ` · ${bits.join(' · ')}` : ''}. Loads automatically when you pick this survey.`;
             };
@@ -11553,6 +11637,36 @@
                 const btn = document.getElementById('send-template-save-btn');
                 try {
                     if (btn) btn.disabled = true;
+                    // Upload newly selected files so they persist on the template
+                    const attInput = document.getElementById('send-survey-attachments');
+                    const liveFiles = [...(attInput?.files || [])];
+                    if (liveFiles.length > 5) throw new Error('At most 5 attachments per template.');
+                    if (liveFiles.length) {
+                        const uploaded = await apiService.uploadSurveyAttachments({
+                            surveyId: sid,
+                            attachments: await Promise.all(liveFiles.map(readFileAsAttachment)),
+                        });
+                        pendingTemplateAttachmentIds = Array.isArray(uploaded?.attachmentIds)
+                            ? uploaded.attachmentIds.map(String).filter(Boolean)
+                            : (uploaded?.attachments || []).map((a) => a.id).filter(Boolean);
+                        pendingTemplateAttachmentMeta = Array.isArray(uploaded?.attachments)
+                            ? uploaded.attachments
+                            : [];
+                        tpl.attachmentIds = pendingTemplateAttachmentIds.length
+                            ? [...pendingTemplateAttachmentIds]
+                            : undefined;
+                        tpl.attachments = pendingTemplateAttachmentMeta.length
+                            ? pendingTemplateAttachmentMeta.map((a) => ({
+                                id: a.id,
+                                fileName: a.fileName || a.name,
+                                contentType: a.contentType,
+                                size: a.size,
+                            }))
+                            : undefined;
+                        if (attInput) attInput.value = '';
+                        syncPendingAttachmentsToForm();
+                        refreshPendingAttachmentList();
+                    }
                     // Re-read full definition so a lean cache entry cannot wipe questions on PUT
                     const freshList = asSurveyList(await apiService.getSiteSurveyDefinitions().catch(() => []));
                     const prev = freshList.find((d) => d && d.id === sid)
@@ -11640,18 +11754,16 @@
                 refreshSendSiteList();
             });
             const attInput = document.getElementById('send-survey-attachments');
-            const attList = document.getElementById('send-survey-attachment-list');
             attInput?.addEventListener('change', () => {
-                const files = [...(attInput.files || [])];
-                if (!attList) return;
-                if (!files.length) {
-                    attList.textContent = '';
-                    return;
+                // New file picks replace pending template attachments for this session
+                if ([...(attInput.files || [])].length) {
+                    pendingTemplateAttachmentIds = [];
+                    pendingTemplateAttachmentMeta = [];
+                    syncPendingAttachmentsToForm();
                 }
-                attList.textContent = files
-                    .map((f) => `${f.name} (${Math.max(1, Math.round(f.size / 1024))} KB)`)
-                    .join(' · ');
+                refreshPendingAttachmentList();
             });
+            syncPendingAttachmentsToForm();
             document.getElementById('survey-send-select-all')?.addEventListener('click', () => {
                 document.querySelectorAll('#site-survey-assignment-form input[name="siteIds"]').forEach((cb) => {
                     cb.checked = true;
@@ -18591,7 +18703,7 @@
                     const files = [...(fileInput?.files || [])];
                     if (files.length > 5) throw new Error('At most 5 attachments per send.');
 
-                    const readFileAsAttachment = (file) => new Promise((resolve, reject) => {
+                    const readFileAsAttachmentSend = (file) => new Promise((resolve, reject) => {
                         const reader = new FileReader();
                         reader.onload = () => {
                             const result = String(reader.result || '');
@@ -18608,10 +18720,16 @@
                         reader.onerror = () => reject(new Error(`Could not read ${file.name}`));
                         reader.readAsDataURL(file);
                     });
-
                     const attachments = files.length
-                        ? await Promise.all(files.map(readFileAsAttachment))
+                        ? await Promise.all(files.map(readFileAsAttachmentSend))
                         : [];
+                    // Prefer freshly picked files; otherwise reuse ids saved on the send template
+                    const pendingIds = Array.isArray(form.__pendingAttachmentIds)
+                        ? form.__pendingAttachmentIds.map(String).filter(Boolean)
+                        : [];
+                    const reuseAttachmentIds = (!attachments.length && pendingIds.length)
+                        ? pendingIds
+                        : undefined;
 
                     const submitBtn = form.querySelector('button[type="submit"]');
                     if (submitBtn) submitBtn.disabled = true;
@@ -18633,6 +18751,7 @@
                         cc,
                         password,
                         attachments,
+                        attachmentIds: reuseAttachmentIds,
                         baseUrl: window.location.origin
                     });
 

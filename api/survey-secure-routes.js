@@ -1414,6 +1414,58 @@ function registerSurveySecureRoutes(app, deps) {
     });
 
     // ---------- Ops: bulk send ----------
+    // Upload attachments for a survey send-template (persist once; reuse via attachmentIds on send)
+    app.http('siteSurveyUploadAttachments', {
+        methods: ['POST', 'OPTIONS'],
+        authLevel: 'anonymous',
+        route: 'site-survey-upload-attachments',
+        handler: async (request, context) => {
+            if (request.method === 'OPTIONS') {
+                return { status: 204, headers: corsHeaders() };
+            }
+            try {
+                const body = await request.json();
+                const surveyId = String(body?.surveyId || '').trim() || null;
+                const operator =
+                    body?.operator ||
+                    readHeader(request, 'X-Artemis-Operator') ||
+                    'unknown';
+                const incoming = normalizeIncomingAttachments(body?.attachments || []);
+                if (!incoming.length) {
+                    return {
+                        status: 400,
+                        jsonBody: { error: 'No attachments provided' },
+                        headers: corsHeaders(),
+                    };
+                }
+                const attachmentMeta = await persistAttachments(
+                    getContainer,
+                    getCosmosClient,
+                    generateId,
+                    incoming,
+                    { surveyId, operator, batchId: body?.batchId || null }
+                );
+                return {
+                    status: 200,
+                    jsonBody: {
+                        attachments: attachmentMeta,
+                        attachmentIds: attachmentMeta.map((a) => a.id),
+                    },
+                    headers: corsHeaders(),
+                };
+            } catch (error) {
+                if (error?.message && /attachment|file|size|type/i.test(error.message)) {
+                    return {
+                        status: 400,
+                        jsonBody: { error: error.message },
+                        headers: corsHeaders(),
+                    };
+                }
+                return handleError(context, error, 'site-survey-upload-attachments');
+            }
+        },
+    });
+
     app.http('siteSurveySend', {
         methods: ['POST', 'OPTIONS'],
         authLevel: 'anonymous',
@@ -1480,6 +1532,16 @@ function registerSurveySecureRoutes(app, deps) {
                             attachmentMeta.map((a) => a.id)
                         );
                         emailFiles = emailAttachmentPayload(docs);
+                    } else {
+                        // Reuse attachments previously saved on the survey send template
+                        const reuseIds = Array.isArray(body?.attachmentIds)
+                            ? body.attachmentIds.map(String).filter(Boolean).slice(0, MAX_FILES)
+                            : [];
+                        if (reuseIds.length) {
+                            const docs = await loadAttachmentDocs(getContainer, reuseIds);
+                            attachmentMeta = publicAttachmentMeta(docs);
+                            emailFiles = emailAttachmentPayload(docs);
+                        }
                     }
                 } catch (attErr) {
                     return {
