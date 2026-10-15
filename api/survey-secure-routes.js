@@ -752,15 +752,19 @@ function buildPublicPayload({
     // 3) cross-survey / prior submissions from the site (wins over our seed)
     // 4) same-survey prior submission
     // 5) in-progress draft (respondent always wins)
-    const prefillRaw = {
+    // Seed from site + prior surveys, then strip street-compound bleed and respondent
+    // form-filler fields. Draft answers apply last so an in-progress save can keep
+    // what the current person already typed for their own name/phone/email.
+    const prefillSeed = finalizeStreetOnlyPrefill(qList, {
         ...(definition?.defaultValues || {}),
         ...sitePrefill,
         ...crossPrefill,
         ...answersToPrefillMap(prior?.answers),
+    });
+    const prefill = {
+        ...prefillSeed,
         ...answersToPrefillMap(draftAnswers || assignment.draftAnswers),
     };
-    // Street-only fields must not keep compound "street, city, ST zip" from older surveys
-    const prefill = finalizeStreetOnlyPrefill(qList, prefillRaw);
     const hasPrior =
         Boolean(prior) ||
         Boolean(assignment.draftAnswers?.length) ||

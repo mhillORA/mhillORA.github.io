@@ -70,12 +70,41 @@ function reshapePrefillValueForQuestion(q, rawValue) {
     return val;
 }
 
-/** Post-merge: strip city/state/zip bleed from street-only text fields. */
+/**
+ * Form-filler / respondent identity — must stay blank until the person completing
+ * this invite fills them in (do not carry prior respondents across surveys).
+ */
+function isRespondentFormFillerQuestion(q) {
+    const lib = resolveQuestionLibraryId(q) || String(q?.libraryQuestionId || '');
+    if (
+        lib === 'ql-gf-00-name'
+        || lib === 'ql-form-filler-phone'
+        || lib === 'ql-form-filler-email'
+        || lib === 'ql-form-filler-role'
+        || lib === 'ql-gf-01-date-of-response'
+    ) {
+        return true;
+    }
+    const lab = normalizePrefillLabel(q?.label || q?.title)
+        || normalizeQuestionLabel(q?.label || q?.title);
+    if (!lab) return false;
+    if (/\bof respondent\b/.test(lab)) return true;
+    if (lab === 'first last name of respondent' || lab === 'first and last name of respondent') return true;
+    if (lab === 'name of respondent' || lab === 'respondent name') return true;
+    if (lab === 'date' || lab === 'date of response') return true;
+    return false;
+}
+
+/** Post-merge: street-only reshape + drop respondent/form-filler seeds. */
 function finalizeStreetOnlyPrefill(questions, prefillMap) {
     const map = prefillMap && typeof prefillMap === 'object' ? { ...prefillMap } : {};
     for (const q of Array.isArray(questions) ? questions : []) {
         const qid = String(q?.id || '');
         if (!qid || map[qid] == null) continue;
+        if (isRespondentFormFillerQuestion(q)) {
+            delete map[qid];
+            continue;
+        }
         map[qid] = reshapePrefillValueForQuestion(q, map[qid]);
         if (!String(map[qid] || '').trim()) delete map[qid];
     }
@@ -140,6 +169,8 @@ function buildPrefillMapForQuestions(questions, responseList, { preferRole } = {
     for (const q of qs) {
         const qid = String(q?.id || '');
         if (!qid || map[qid] != null) continue;
+        // Never cross-fill who is completing this invite
+        if (isRespondentFormFillerQuestion(q)) continue;
         const rawLib = q?.libraryQuestionId ? String(q.libraryQuestionId) : '';
         const libId = resolveQuestionLibraryId(q) || rawLib;
         const norm = normalizePrefillLabel(q?.label || q?.title)
