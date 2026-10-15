@@ -25,6 +25,7 @@ const {
     answersToPrefillMap,
     buildPrefillMapForQuestions,
     buildSiteRecordPrefill,
+    finalizeStreetOnlyPrefill,
     findLatestLiveResponse,
     findSiteRoleLiveResponses,
     findSiteLiveResponses,
@@ -751,13 +752,15 @@ function buildPublicPayload({
     // 3) cross-survey / prior submissions from the site (wins over our seed)
     // 4) same-survey prior submission
     // 5) in-progress draft (respondent always wins)
-    const prefill = {
+    const prefillRaw = {
         ...(definition?.defaultValues || {}),
         ...sitePrefill,
         ...crossPrefill,
         ...answersToPrefillMap(prior?.answers),
         ...answersToPrefillMap(draftAnswers || assignment.draftAnswers),
     };
+    // Street-only fields must not keep compound "street, city, ST zip" from older surveys
+    const prefill = finalizeStreetOnlyPrefill(qList, prefillRaw);
     const hasPrior =
         Boolean(prior) ||
         Boolean(assignment.draftAnswers?.length) ||

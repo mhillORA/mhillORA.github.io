@@ -133,29 +133,147 @@ const GF_LIB_FALLBACK_TO_BIBLE = {
     'ql-gf-28-483-year': 'ql-gf-26-past-fda-audits',
 };
 
+/**
+ * Monday / SurveyMonkey / ephemeral libraryQuestionIds → shared canonical ids.
+ * Applied even when the answer already has a libraryQuestionId set (critical for
+ * Cavalry ↔ Viatris exact-wording matches that used different auto-generated libs).
+ */
+const ALIAS_LIB_TO_CANON = {
+    // --- Viatris NK admin / identity (exact wording vs Cavalry) ---
+    mu0gw9orfunfqyleef8: 'ql-gf-01-date-of-response', // Date
+    mu0gw9vo0o6xrvosd80l: 'ql-gf-00-name', // First & Last Name of Respondent
+    mu0gwa0cuun9ee5icql: 'ql-form-filler-phone', // Phone Number of Respondent
+    mu0guch5bdg27ycuq4b: 'ql-form-filler-role', // Title/Position of Respondent
+    mu0gwa5weiuuti4877t: 'ql-form-filler-email', // Email Address of Respondent
+    mu0gu9w0zymitcvs22q: 'ql-site-name',
+    mu0gwaebizei5rwir4: 'ql-site-phone',
+    mu0gwajryxwzn8m679: 'ql-pi-name',
+    mu0gwanjb5ikjnnf3c: 'ql-pi-email',
+    mu0gucycg5k7t2uspo7: 'ql-pi-credentials',
+    mu0gwarkbuv6jfvqobp: 'ql-pi-specialty',
+    mu0gwavqvi7hasnvu4h: 'ql-coord-name',
+    mu0gud9kauwt1gyyhiw: 'ql-coord-email',
+    mu0gwb8opdil52l29bk: 'ql-coord-phone',
+    // --- Viatris NK equipment / assessments (near or exact vs Cavalry) ---
+    mu0gwdeg5bhhifg002w: 'ql-schirmer-tear-samples', // Schirmer tear strips
+    mu0gwdi9qs6674tix9o: 'ql-capillary-tear-samples', // capillary tube
+    mu0gwe41qnlmt48u0cj: 'ql-mackie-criteria-nk', // Mackie Criteria
+    mu0gwecdqd48s87a3uj: 'ql-cochet-bonnet-esthesiometer', // Cochet-Bonnet Yes/No
+    mu0gwei63fqpp8ni3xw: 'ql-slit-lamp-camera', // slit-lamp camera Yes/No
+    mu0gwelz2v6byi4f6ya: 'ql-slit-lamp-camera-model', // make/model
+    mu0gwd9yonjtyfl5k1: 'ql-phlebotomist-lab-samples',
+    // --- Cavalry ephemeral / study-local libs → same shared canon ---
+    mv18s0px3f4048jf944: 'ql-gf-01-date-of-response',
+    mv18s0u9s7bxfzrpcvo: 'ql-gf-00-name',
+    mv18s0zu3xz9mzeaumy: 'ql-form-filler-phone',
+    mv18s4ccdoj74hdz29: 'ql-form-filler-role',
+    mv18s4llvgh0fnl9b59: 'ql-form-filler-email',
+    mv18s5pl0rzv0opxgvp: 'ql-pi-credentials',
+    mv18s5uw50b03ksbnde: 'ql-pi-specialty',
+    mv18s6swdzfcjih81zo: 'ql-slit-lamp-camera',
+    'ql-cav_stu-3_has-your-site-collected-tear-samples-using-schir': 'ql-schirmer-tear-samples',
+    'ql-cav_stu-2_are-your-pi-and-or-sub-investigators-familiar-wi': 'ql-mackie-criteria-nk',
+    'ql-cav_stu-4a_the-protocol-requires-corneal-sensitivity-to-be-': 'ql-cochet-bonnet-esthesiometer',
+    'ql-cav_lab-1a_does-your-site-have-a-certified-phlebotomist-or-': 'ql-phlebotomist-lab-samples',
+};
+
+/** Stronger label normalize for cross-survey matching (hyphens / apostrophes). */
+function normalizeBridgeLabel(label) {
+    return String(label || '')
+        .trim()
+        .toLowerCase()
+        .replace(/[\u2018\u2019\u201c\u201d`]/g, "'")
+        .replace(/schirmer['']?s/g, 'schirmers')
+        .replace(/aesthesiometer/g, 'esthesiometer')
+        .replace(/slit-lamp/g, 'slit lamp')
+        .replace(/[^a-z0-9]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+/**
+ * Concept fingerprints for near-equivalent wording (Schirmer / Mackie / slit lamp…).
+ * Only fires when the label clearly names the same assessment.
+ */
+function resolveConceptLibraryId(label) {
+    const n = normalizeBridgeLabel(label);
+    if (!n) return '';
+    if (n.includes('schirmer') && n.includes('tear')) return 'ql-schirmer-tear-samples';
+    if (n.includes('capillary') && n.includes('tear')) return 'ql-capillary-tear-samples';
+    if (n.includes('mackie') && (n.includes('keratitis') || n.includes('keratopathy') || n.includes('criteria'))) {
+        return 'ql-mackie-criteria-nk';
+    }
+    // Cochet-Bonnet / corneal esthesiometer Yes-No (not filament follow-ups)
+    if (!n.includes('filament') && !n.includes('replacement') && !n.includes('order more')) {
+        const cochetDevice = n.includes('cochet') && n.includes('bonnet');
+        const esthesioDevice = (n.includes('esthesiometer') || n.includes('asthesiometer'))
+            && (n.includes('corneal') || n.includes('sensation') || n.includes('sensitivity'));
+        if ((cochetDevice || esthesioDevice)
+            && (n.includes('have') || n.includes('does your site') || n.includes('measure corneal'))) {
+            return 'ql-cochet-bonnet-esthesiometer';
+        }
+    }
+    if (n.includes('as oct') && n.includes('make') && n.includes('model')) {
+        return 'ql-as-oct-make-model';
+    }
+    if (n.includes('slit lamp') && n.includes('make') && n.includes('model')) {
+        return 'ql-slit-lamp-camera-model';
+    }
+    if (n.includes('slit lamp camera') && (n.startsWith('does your site have') || n.includes('have a slit'))) {
+        return 'ql-slit-lamp-camera';
+    }
+    if (n.includes('phlebotomist') && n.includes('lab sample')) return 'ql-phlebotomist-lab-samples';
+    if (n === 'site name' || n === 'site legal name' || n === 'institution name') return 'ql-site-name';
+    if (n === 'site phone number' || n === 'site phone') return 'ql-site-phone';
+    if (n.includes('principal investigator') && n.includes('first') && n.includes('last')) return 'ql-pi-name';
+    if (n === 'pi phone number' || n === 'pi phone') return 'ql-pi-phone';
+    if (n === 'pi email address' || n === 'pi email') return 'ql-pi-email';
+    if (n === 'pi credentials') return 'ql-pi-credentials';
+    if (n === 'pi specialty focus' || n.startsWith('pi specialty')) return 'ql-pi-specialty';
+    if (n.includes('site coordinator') && n.includes('first') && n.includes('last')) return 'ql-coord-name';
+    if (n.includes('site coordinator') && n.includes('email')) return 'ql-coord-email';
+    if (n.includes('site coordinator') && n.includes('phone')) return 'ql-coord-phone';
+    if (n === 'first last name of respondent' || n === 'first and last name of respondent') return 'ql-gf-00-name';
+    if (n === 'email address of respondent') return 'ql-form-filler-email';
+    if (n.startsWith('phone number of respondent')) return 'ql-form-filler-phone';
+    if (n === 'title position of respondent' || n === 'title / position of respondent') return 'ql-form-filler-role';
+    return '';
+}
+
+function canonicalizeLibraryId(libId) {
+    const lib = String(libId || '');
+    if (!lib) return '';
+    return ALIAS_LIB_TO_CANON[lib] || lib;
+}
+
 function resolveSourceLibraryId(a) {
     const qid = String(a?.questionId ?? a?.id ?? '');
-    const lib = String(a?.libraryQuestionId || '');
-    if (lib) return lib;
+    const rawLib = String(a?.libraryQuestionId || '');
+    if (rawLib) {
+        const canon = canonicalizeLibraryId(rawLib);
+        if (canon) return canon;
+    }
     if (qid && GF_OLD_QID_TO_LIB[qid]) return GF_OLD_QID_TO_LIB[qid];
+    if (qid && ALIAS_LIB_TO_CANON[qid]) return ALIAS_LIB_TO_CANON[qid];
     if (qid.startsWith('q_015_please-indicate-the-types-of-ophthalmic')) {
         return 'ql-gf-20-please-indicate-the-types-of-ophthalmic-studies-your-sit';
     }
-    const lab = String(a?.label || a?.title || '')
-        .trim()
-        .toLowerCase()
-        .replace(/\s+/g, ' ');
+    const labRaw = String(a?.label || a?.title || '');
+    const lab = labRaw.trim().toLowerCase().replace(/\s+/g, ' ');
     if (lab && GF_OLD_LABEL_TO_LIB[lab]) return GF_OLD_LABEL_TO_LIB[lab];
     if (lab.startsWith('please indicate the types of ophthalmic studies')) {
         return 'ql-gf-20-please-indicate-the-types-of-ophthalmic-studies-your-sit';
     }
+    const byConcept = resolveConceptLibraryId(labRaw);
+    if (byConcept) return byConcept;
     return '';
 }
 
 function applyBibleFallback(libId) {
     const lib = String(libId || '');
     if (!lib) return '';
-    return GF_LIB_FALLBACK_TO_BIBLE[lib] || lib;
+    const canon = canonicalizeLibraryId(lib);
+    return GF_LIB_FALLBACK_TO_BIBLE[canon] || canon;
 }
 
 function resolveGfBridgeLibraryId(a) {
@@ -192,6 +310,10 @@ module.exports = {
     GF_OLD_QID_TO_LIB,
     GF_OLD_LABEL_TO_LIB,
     GF_LIB_FALLBACK_TO_BIBLE,
+    ALIAS_LIB_TO_CANON,
+    normalizeBridgeLabel,
+    resolveConceptLibraryId,
+    canonicalizeLibraryId,
     resolveSourceLibraryId,
     resolveGfBridgeLibraryId,
     applyBibleFallback,

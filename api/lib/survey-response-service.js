@@ -24,6 +24,64 @@ function resolveStoredAnswerLibraryId(a) {
     return resolveGfBridgeLibraryId(a);
 }
 
+function resolveQuestionLibraryId(q) {
+    const {
+        canonicalizeLibraryId,
+        resolveConceptLibraryId,
+    } = require('./gf-question-bridges');
+    const raw = String(q?.libraryQuestionId || '');
+    const canon = canonicalizeLibraryId(raw) || raw;
+    if (canon) return canon;
+    return resolveConceptLibraryId(q?.label || q?.title) || '';
+}
+
+/** Prefill label match: punctuation / hyphen / Schirmer's variants collapse. */
+function normalizePrefillLabel(label) {
+    const { normalizeBridgeLabel } = require('./gf-question-bridges');
+    return normalizeBridgeLabel(label);
+}
+
+function isStreetOnlyAddressQuestion(q) {
+    const lab = String(q?.label || q?.title || '').toLowerCase();
+    const lib = resolveQuestionLibraryId(q);
+    if (String(q?.type || '').toLowerCase() === 'address') return false;
+    if (/street\s*address|site\s*street/.test(lab)) return true;
+    // Cavalry (and similar) use ql-site-address on a street-only text field
+    // while city/state/zip are separate questions.
+    if (lib === 'ql-site-address' && !/city|state|zip|postal|full\s*site\s*address/.test(lab)) {
+        return /address|street/.test(lab);
+    }
+    return false;
+}
+
+function reshapePrefillValueForQuestion(q, rawValue) {
+    const val = String(rawValue ?? '').trim();
+    if (!val) return '';
+    if (isStreetOnlyAddressQuestion(q)) {
+        const { parseCompositeAddress } = require('./site-field-map');
+        const looksCompound = /,/.test(val) || /\b[A-Z]{2}\b/.test(val) || /\b\d{5}(?:-\d{4})?\b/.test(val);
+        if (looksCompound) {
+            const parsed = parseCompositeAddress(val);
+            if (parsed.street && (parsed.city || parsed.state || parsed.zip)) {
+                return parsed.street;
+            }
+        }
+    }
+    return val;
+}
+
+/** Post-merge: strip city/state/zip bleed from street-only text fields. */
+function finalizeStreetOnlyPrefill(questions, prefillMap) {
+    const map = prefillMap && typeof prefillMap === 'object' ? { ...prefillMap } : {};
+    for (const q of Array.isArray(questions) ? questions : []) {
+        const qid = String(q?.id || '');
+        if (!qid || map[qid] == null) continue;
+        map[qid] = reshapePrefillValueForQuestion(q, map[qid]);
+        if (!String(map[qid] || '').trim()) delete map[qid];
+    }
+    return map;
+}
+
 function readBridgedAnswerValue(a) {
     const raw = readAnswerValue(a);
     if (!raw) return '';
@@ -82,8 +140,10 @@ function buildPrefillMapForQuestions(questions, responseList, { preferRole } = {
     for (const q of qs) {
         const qid = String(q?.id || '');
         if (!qid || map[qid] != null) continue;
-        const libId = q?.libraryQuestionId ? String(q.libraryQuestionId) : '';
-        const norm = normalizeQuestionLabel(q?.label || q?.title);
+        const rawLib = q?.libraryQuestionId ? String(q.libraryQuestionId) : '';
+        const libId = resolveQuestionLibraryId(q) || rawLib;
+        const norm = normalizePrefillLabel(q?.label || q?.title)
+            || normalizeQuestionLabel(q?.label || q?.title);
 
         for (const resp of responses) {
             const answers = Array.isArray(resp?.answers) ? resp.answers : [];
@@ -95,24 +155,38 @@ function buildPrefillMapForQuestions(questions, responseList, { preferRole } = {
                     (a) =>
                         answerIsFilled(a) &&
                         (String(a.libraryQuestionId || '') === libId ||
+                            String(a.libraryQuestionId || '') === rawLib ||
                             String(a.questionId ?? '') === libId ||
                             resolveStoredAnswerLibraryId(a) === libId)
                 );
             }
             if (!found && norm) {
-                found = answers.find(
-                    (a) => answerIsFilled(a) && normalizeQuestionLabel(a.label) === norm
-                );
+                found = answers.find((a) => {
+                    if (!answerIsFilled(a)) return false;
+                    const an = normalizePrefillLabel(a.label) || normalizeQuestionLabel(a.label);
+                    return an && an === norm;
+                });
+            }
+            // Concept fingerprint: Schirmer / Mackie / slit-lamp near-wording
+            if (!found && libId) {
+                const { resolveConceptLibraryId } = require('./gf-question-bridges');
+                found = answers.find((a) => {
+                    if (!answerIsFilled(a)) return false;
+                    const concept = resolveConceptLibraryId(a.label || a.title);
+                    return concept && concept === libId;
+                });
             }
             if (found) {
                 const bridged = readBridgedAnswerValue(found);
                 if (!bridged) continue;
-                if (isJunkPrefillValue(bridged, {
+                const shaped = reshapePrefillValueForQuestion(q, bridged);
+                if (!shaped) continue;
+                if (isJunkPrefillValue(shaped, {
                     label: q?.label || q?.title || found.label,
                     libraryQuestionId: libId || found.libraryQuestionId,
                     type: q?.type || found.type,
                 })) continue;
-                map[qid] = bridged;
+                map[qid] = shaped;
                 break;
             }
         }
@@ -355,8 +429,11 @@ function isJunkPrefillValue(value, { label = '', libraryQuestionId = '', type = 
         || (/\d{4}-\d{2}-\d{2}/.test(s) && s.includes('00:00:00'));
     const isDateQ = typ === 'date' || /\bdate\b|dob|birth|when did/.test(lab);
     if (looksDate && !isDateQ) return true;
-    const identity = /name|contact|coordinator|investigator|email|phone|title|role|institution/.test(`${lab} ${lib}`);
-    if (identity && /^(yes|no)$/i.test(s)) return true;
+    // Identity *fields* (name/email/phone) must not eat Yes/No — but assessment
+    // questions that merely mention "investigator" (Mackie, experience, etc.) are fine.
+    const identityField = /(?:\bname\b|\bemail\b|\bphone\b|\btitle\b|\brole\b|institution|coordinator.*name|investigator.*name|contact.*name)/.test(`${lab} ${lib}`)
+        && !/familiar|criteria|mackie|schirmer|cochet|esthesiometer|asthesiometer|slit\s*lamp|phlebotom|experience|does your site|are your|have a device|tear sample/.test(lab);
+    if (identityField && /^(yes|no)$/i.test(s)) return true;
     if (/please specify|if other|describe|which system|manufacturer|make\/?model|catalog/.test(lab)
         && /^(yes|no)$/i.test(s)) return true;
     // IRB type is Central/Local — bare Yes or study notes are pack bleed
@@ -1144,6 +1221,9 @@ module.exports = {
     readAnswerValue,
     buildPrefillMapForQuestions,
     buildSiteRecordPrefill,
+    finalizeStreetOnlyPrefill,
+    reshapePrefillValueForQuestion,
+    resolveQuestionLibraryId,
     mergeAnswers,
     scoreAnswers,
     applyEarlyExitDisposition,
