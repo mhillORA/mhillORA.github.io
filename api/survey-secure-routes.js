@@ -255,6 +255,10 @@ function meaningfulQuestionHelp(raw) {
     const t = String(raw ?? '').replace(/\s+/g, ' ').trim();
     if (!t) return undefined;
     const n = t.toLowerCase().replace(/[–—]/g, '-').replace(/^question type:\s*/, '');
+    // Internal Ora drafting notes must never reach respondents
+    if (/^ora\s*[-–—:]/.test(n) || /\bis there a drop[\s-]*down\b/.test(n) || /\bwill this be a drop[\s-]*down\b/.test(n)) {
+        return undefined;
+    }
     if (/^shown (when|only when)\b/.test(n)) return undefined;
     if (/^(select all that apply\.?\s*)+(shown (when|only when).*)?$/.test(n)) return undefined;
     if (/^(yes\s*\/\s*no|short response|long response|multi-?select|single select|range select|numeric entry|date|rating)\b/.test(n)) {

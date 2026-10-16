@@ -1096,6 +1096,10 @@
                 return this.request('/site-survey-definitions');
             }
 
+            async getSiteSurveyDefinition(id) {
+                return this.request(`/site-survey-definitions/${encodeURIComponent(id)}`);
+            }
+
             /** Global Experienced / New-to-Ora welcome cards (not per survey). */
             async getSurveyWelcomeCopy() {
                 return this.request('/site-survey-welcome-copy');
@@ -8679,9 +8683,21 @@
                                 <span id="welcome-save-status" class="text-xs text-gray-500 dark:text-gray-400"></span>
                             </div>
                         </div>
+                        <div class="pt-4 border-t border-gray-200 dark:border-gray-700 space-y-3" id="survey-question-helpers-editor">
+                            <div>
+                                <div class="text-sm font-semibold text-gray-900 dark:text-gray-100">Question helpers (shown under fields)</div>
+                                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">Edit respondent-facing help text without opening the survey builder. Blank = no helper shown on the invite.</p>
+                            </div>
+                            <div id="survey-question-helpers-list" class="space-y-3"></div>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <button type="button" id="question-helpers-save-btn" class="px-3 py-1.5 rounded-md bg-indigo-600 text-white text-xs font-medium">Save question helpers</button>
+                                <span id="question-helpers-save-status" class="text-xs text-gray-500 dark:text-gray-400"></span>
+                            </div>
+                        </div>
                     </div>`;
                 if (footerEl) footerEl.textContent = 'Global settings for all live survey invites.';
                 wireSurveyWelcomeEditor();
+                wireSurveyQuestionHelpersEditor();
             } else if (commsPanel === 'privacy') {
                 body.innerHTML = `
                     <div class="space-y-3 px-1 text-sm">
@@ -8837,6 +8853,99 @@
             });
         };
 
+        /** Editable respondent helpers surfaced in Settings (avoids hunting the builder). */
+        const SURVEY_QUESTION_HELPER_FIELDS = [
+            {
+                surveyId: 'survey-cavalry-nk-feasibility',
+                surveyLabel: 'Cavalry NK feasibility',
+                questionId: 'cav_irb-5b_if-yes-please-list-the-languages',
+                fieldLabel: 'Please list the languages',
+            },
+        ];
+
+        const wireSurveyQuestionHelpersEditor = () => {
+            const root = document.getElementById('survey-question-helpers-editor');
+            const listEl = document.getElementById('survey-question-helpers-list');
+            if (!root || !listEl || root.dataset.bound === '1') return;
+            root.dataset.bound = '1';
+
+            const statusEl = document.getElementById('question-helpers-save-status');
+            const defsById = new Map();
+
+            const renderRows = () => {
+                listEl.innerHTML = SURVEY_QUESTION_HELPER_FIELDS.map((f) => {
+                    const def = defsById.get(f.surveyId);
+                    const q = (def?.questions || []).find((x) => String(x.id) === f.questionId);
+                    const help = q ? String(q.help || q.context || q.description || '') : '';
+                    const missing = !q;
+                    return `
+                        <div class="rounded-md border border-gray-200 dark:border-gray-700 p-3 space-y-2" data-helper-survey="${escapeHtml(f.surveyId)}" data-helper-qid="${escapeHtml(f.questionId)}">
+                            <div class="text-xs font-semibold text-gray-800 dark:text-gray-200">${escapeHtml(f.fieldLabel)}</div>
+                            <div class="text-[11px] text-gray-500 dark:text-gray-400">${escapeHtml(f.surveyLabel)}${missing ? ' · question not found on definition' : ''}</div>
+                            <label class="block text-xs font-medium text-gray-700 dark:text-gray-300">Help text under question
+                                <textarea class="helper-help-input mt-1 w-full rounded-md border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 px-3 py-2 text-sm" rows="2" maxlength="500" ${missing ? 'disabled' : ''} placeholder="Optional — leave blank to hide on invites">${escapeHtml(help)}</textarea>
+                            </label>
+                        </div>`;
+                }).join('');
+            };
+
+            const load = async () => {
+                if (statusEl) statusEl.textContent = 'Loading…';
+                const ids = [...new Set(SURVEY_QUESTION_HELPER_FIELDS.map((f) => f.surveyId))];
+                for (const id of ids) {
+                    try {
+                        const def = await apiService.getSiteSurveyDefinition(id);
+                        defsById.set(id, def);
+                    } catch (err) {
+                        console.error(err);
+                        defsById.delete(id);
+                    }
+                }
+                renderRows();
+                if (statusEl) statusEl.textContent = defsById.size ? 'Loaded from live survey definitions.' : 'Could not load survey definition(s).';
+            };
+
+            document.getElementById('question-helpers-save-btn')?.addEventListener('click', async () => {
+                const btn = document.getElementById('question-helpers-save-btn');
+                try {
+                    if (btn) btn.disabled = true;
+                    if (statusEl) statusEl.textContent = 'Saving…';
+                    let saved = 0;
+                    for (const card of listEl.querySelectorAll('[data-helper-survey]')) {
+                        const surveyId = card.getAttribute('data-helper-survey');
+                        const qid = card.getAttribute('data-helper-qid');
+                        const nextHelp = String(card.querySelector('.helper-help-input')?.value || '').trim();
+                        const def = defsById.get(surveyId);
+                        if (!def || !Array.isArray(def.questions)) continue;
+                        const idx = def.questions.findIndex((x) => String(x.id) === qid);
+                        if (idx < 0) continue;
+                        def.questions[idx] = {
+                            ...def.questions[idx],
+                            help: nextHelp || '',
+                        };
+                        const updated = await apiService.updateSiteSurveyDefinition(surveyId, {
+                            ...def,
+                            questions: def.questions,
+                            updatedAt: new Date().toISOString(),
+                        });
+                        defsById.set(surveyId, updated || def);
+                        saved += 1;
+                    }
+                    renderRows();
+                    if (statusEl) statusEl.textContent = saved ? `Saved ${saved} helper(s).` : 'Nothing to save.';
+                    showNotification(saved ? 'Question helpers saved.' : 'No helpers updated', saved ? 'success' : 'info');
+                } catch (err) {
+                    console.error(err);
+                    if (statusEl) statusEl.textContent = err.message || 'Save failed';
+                    showNotification(err.message || 'Failed to save question helpers', 'error');
+                } finally {
+                    if (btn) btn.disabled = false;
+                }
+            });
+
+            load();
+        };
+
         const wireFeasibilityPrivacyTools = () => {
             const privacyResult = document.getElementById('privacy-ops-result');
             const showPrivacyResult = (obj) => {
@@ -8925,6 +9034,8 @@
             const t = String(raw ?? '').replace(/\s+/g, ' ').trim();
             if (!t) return '';
             const n = t.toLowerCase().replace(/[–—]/g, '-').replace(/^question type:\s*/, '');
+            // Internal Ora drafting notes (never show as respondent help)
+            if (/^ora\s*[-–—:]/.test(n) || /\bis there a drop[\s-]*down\b/.test(n) || /\bwill this be a drop[\s-]*down\b/.test(n)) return '';
             // Exact / near-exact type labels only — do NOT strip real help that happens to mention "street" etc.
             if (/^shown (when|only when)\b/.test(n)) return '';
             if (/^(select all that apply\.?\s*)+(shown (when|only when).*)?$/.test(n)) return '';
