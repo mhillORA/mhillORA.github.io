@@ -9,7 +9,7 @@ const DEFAULT_WELCOME_COPY = {
     experienced: {
         title: 'Sites experienced with Ora',
         body:
-            "Welcome back — and thank you for your continued partnership. Because your site has worked with Ora before, we've already completed most of this form for you using information from your prior studies. Simply review what we have on file, confirm it's still accurate, and answer a few study-specific questions at the end.",
+            "Welcome back — and thank you for your continued partnership. Because your site has worked with Ora before, we've already completed most of this form for you using information from your prior feasibility surveys. Simply review what we have on file, confirm it's still accurate, and answer a few study-specific questions at the end.",
         durationNote: 'This should take about 15 minutes.',
     },
     newToOra: {
